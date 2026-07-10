@@ -45,11 +45,15 @@ pub fn add_m2m(
         )));
     }
 
+    // Write the config entry before touching the keychain: if the secrets write below fails,
+    // the config still points at an alias with no stored credentials, which is a self-describing
+    // and re-runnable state ("no credentials stored for '<alias>'; run account add"). The
+    // reverse order can leave secrets under an alias the config never learns about.
+    write_account_entry(config_path, alias, account_id, AuthFlow::M2m)?;
     store.set(alias, &secrets)?;
     // Re-registering an alias must not leave a stale cached bearer token from the previous
     // credentials being served until it expires or 401s.
     store.delete_token(alias)?;
-    write_account_entry(config_path, alias, account_id, AuthFlow::M2m)?;
     Ok(json!({"alias": alias, "accountId": account_id, "flow": "m2m"}))
 }
 
@@ -192,6 +196,11 @@ fn store_auth_code_account(
     client_id: &str,
     token: &TokenResponse,
 ) -> Result<Value, CliError> {
+    // Write the config entry before touching the keychain: if the secrets write below fails,
+    // the config still points at an alias with no stored credentials, which is a self-describing
+    // and re-runnable state ("no credentials stored for '<alias>'; run account add"). The
+    // reverse order can leave secrets under an alias the config never learns about.
+    write_account_entry(config_path, alias, account_id, AuthFlow::AuthCode)?;
     store.set(
         alias,
         &AccountSecrets::AuthCode {
@@ -214,7 +223,6 @@ fn store_auth_code_account(
             expires_at_epoch: now_epoch + token.expires_in,
         },
     )?;
-    write_account_entry(config_path, alias, account_id, AuthFlow::AuthCode)?;
     Ok(json!({"alias": alias, "accountId": account_id, "flow": "auth-code"}))
 }
 
@@ -222,6 +230,84 @@ fn store_auth_code_account(
 mod tests {
     use super::*;
     use crate::secrets::MemoryStore;
+
+    /// Always fails `set`, to prove the config entry is written before the keychain write is
+    /// attempted — so a keychain failure leaves a self-describing, re-runnable state instead of
+    /// orphaned secrets under an alias the config never learns about.
+    #[derive(Default)]
+    struct FailingSecretStore;
+
+    impl SecretStore for FailingSecretStore {
+        fn get(&self, _alias: &str) -> Result<Option<AccountSecrets>, CliError> {
+            Ok(None)
+        }
+        fn set(&self, _alias: &str, _secrets: &AccountSecrets) -> Result<(), CliError> {
+            Err(CliError::Auth("keychain unavailable".into()))
+        }
+        fn delete(&self, _alias: &str) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn get_token(&self, _alias: &str) -> Result<Option<CachedToken>, CliError> {
+            Ok(None)
+        }
+        fn set_token(&self, _alias: &str, _token: &CachedToken) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn delete_token(&self, _alias: &str) -> Result<(), CliError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_m2m_writes_config_entry_before_keychain_secrets() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let key_path = temp_dir.path().join("key.pem");
+        let key_pem = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let store = FailingSecretStore;
+
+        let error = add_m2m(
+            &config_path,
+            &store,
+            "prod",
+            "1234567",
+            "CID",
+            "KID",
+            &key_path,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CliError::Auth(_)));
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config.accounts["prod"].account_id, "1234567",
+            "config entry must be written even though the secrets write failed"
+        );
+    }
+
+    #[test]
+    fn store_auth_code_account_writes_config_entry_before_keychain_secrets() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let store = FailingSecretStore;
+        let token = TokenResponse {
+            access_token: "ACCESS1".into(),
+            expires_in: 3600,
+            refresh_token: Some("REFRESH1".into()),
+        };
+
+        let error =
+            store_auth_code_account(&config_path, &store, "dev", "1234567_SB1", "CID", &token)
+                .unwrap_err();
+
+        assert!(matches!(error, CliError::Auth(_)));
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config.accounts["dev"].account_id, "1234567_SB1",
+            "config entry must be written even though the secrets write failed"
+        );
+    }
 
     #[test]
     fn store_auth_code_account_persists_secrets_token_and_config() {
