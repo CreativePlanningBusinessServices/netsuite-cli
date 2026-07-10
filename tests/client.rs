@@ -11,25 +11,27 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[derive(Default)]
 struct FakeTokens {
-    minted: AtomicU32,
+    invalidations: AtomicU32,
 }
 
 impl TokenProvider for FakeTokens {
     fn access_token<'life>(
         &'life self,
     ) -> Pin<Box<dyn Future<Output = Result<String, CliError>> + Send + 'life>> {
-        let count = self.minted.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move { Ok(format!("TOKEN_{count}")) })
+        let invalidation_count = self.invalidations.load(Ordering::SeqCst);
+        Box::pin(async move { Ok(format!("TOKEN_{invalidation_count}")) })
     }
-    fn invalidate(&self) {}
+    fn invalidate(&self) {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn client(server: &MockServer) -> NsClient {
-    NsClient::new(
-        reqwest::Client::new(),
-        server.uri(),
-        Arc::new(FakeTokens::default()),
-    )
+    client_with_tokens(server, Arc::new(FakeTokens::default()))
+}
+
+fn client_with_tokens(server: &MockServer, tokens: Arc<FakeTokens>) -> NsClient {
+    NsClient::new(reqwest::Client::new(), server.uri(), tokens)
 }
 
 #[tokio::test]
@@ -152,9 +154,31 @@ async fn retries_once_with_fresh_token_on_401() {
         .mount(&server)
         .await;
 
-    let response = client(&server)
+    let tokens = Arc::new(FakeTokens::default());
+    let response = client_with_tokens(&server, tokens.clone())
         .request(reqwest::Method::GET, "/auth", &[], &[], None)
         .await
         .unwrap();
     assert_eq!(response.status, 200);
+    assert_eq!(tokens.invalidations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn gives_up_after_exhausting_all_attempts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/always-limited"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .request(reqwest::Method::GET, "/always-limited", &[], &[], None)
+        .await
+        .unwrap_err();
+    match error {
+        CliError::Api { status, .. } => assert_eq!(status, 429),
+        other => panic!("expected Api error, got {other:?}"),
+    }
 }

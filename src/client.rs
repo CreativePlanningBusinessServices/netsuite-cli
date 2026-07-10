@@ -71,7 +71,7 @@ impl NsClient {
             })?;
             let status = response.status();
 
-            if status.as_u16() == 401 && !reauthorized {
+            if status.as_u16() == 401 && !reauthorized && attempt < MAX_ATTEMPTS {
                 self.tokens.invalidate();
                 reauthorized = true;
                 continue;
