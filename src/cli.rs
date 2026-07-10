@@ -5,15 +5,14 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::commands::describe::MetadataFormat;
-use crate::commands::{self, account, describe, job, raw, record, restlet, suiteql};
+use crate::commands::{
+    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, update,
+};
 use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
 use crate::error::CliError;
 use crate::output;
 use crate::secrets::{AccountSecrets, KeyringStore, SecretStore};
-
-/// Task 12 will make this configurable; hardcoded for now.
-const METADATA_CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Parser)]
 #[command(
@@ -98,6 +97,32 @@ pub enum Command {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// Check for or install the latest release from GitHub
+    #[command(after_help = "Examples:\n  netsuite-cli update --check\n  netsuite-cli update")]
+    Update {
+        /// Only report whether a newer release is available; do not install it
+        #[arg(long)]
+        check: bool,
+    },
+    /// Get or set persisted CLI configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Print a config value, or the whole effective config when no key is given
+    #[command(
+        after_help = "Examples:\n  netsuite-cli config get\n  netsuite-cli config get cache_ttl_hours"
+    )]
+    Get { key: Option<String> },
+    /// Persist a config value
+    #[command(
+        after_help = "Examples:\n  netsuite-cli config set default_account prod\n  netsuite-cli config set cache_ttl_hours 48"
+    )]
+    Set { key: String, value: String },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -399,13 +424,15 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             let cache_dir = crate::config::default_cache_dir()
                 .join("metadata")
                 .join(&context.alias);
+            let config = Config::load(&crate::config::default_config_path())?;
+            let cache_ttl = Duration::from_secs(config.cache_ttl_hours.unwrap_or(24) * 3600);
             describe::describe_type(
                 &context.client,
                 record_type,
                 *format,
                 &cache_dir,
                 *refresh,
-                METADATA_CACHE_TTL,
+                cache_ttl,
             )
             .await
         }
@@ -479,6 +506,14 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 JobAction::Result { job_id, task } => {
                     job::result(&context.client, job_id, task.clone()).await
                 }
+            }
+        }
+        Command::Update { check } => update::run(*check).await,
+        Command::Config { action } => {
+            let config_path = crate::config::default_config_path();
+            match action {
+                ConfigAction::Get { key } => config_cmd::get(&config_path, key.as_deref()),
+                ConfigAction::Set { key, value } => config_cmd::set(&config_path, key, value),
             }
         }
     }

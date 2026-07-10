@@ -10,6 +10,8 @@ pub struct Config {
     pub default_account: Option<String>,
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountEntry>,
+    #[serde(default)]
+    pub cache_ttl_hours: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

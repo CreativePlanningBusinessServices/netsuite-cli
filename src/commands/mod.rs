@@ -1,10 +1,12 @@
 pub mod account;
+pub mod config_cmd;
 pub mod describe;
 pub mod job;
 pub mod raw;
 pub mod record;
 pub mod restlet;
 pub mod suiteql;
+pub mod update;
 
 use std::io::Read;
 
