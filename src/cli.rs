@@ -125,11 +125,14 @@ pub enum ConfigAction {
     Set { key: String, value: String },
 }
 
+/// Methods accepted by `raw` and `job submit` — NetSuite's REST endpoints (record/v1, async/v1,
+/// etc.) accept PATCH for partial updates, including as the method behind an async job submit.
 #[derive(Clone, Copy, clap::ValueEnum)]
 pub enum HttpMethodArg {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
@@ -139,7 +142,30 @@ impl HttpMethodArg {
             HttpMethodArg::Get => reqwest::Method::GET,
             HttpMethodArg::Post => reqwest::Method::POST,
             HttpMethodArg::Put => reqwest::Method::PUT,
+            HttpMethodArg::Patch => reqwest::Method::PATCH,
             HttpMethodArg::Delete => reqwest::Method::DELETE,
+        }
+    }
+}
+
+/// Methods accepted by `restlet call` — NetSuite RESTlets only ever dispatch to
+/// onRequest/GET/PUT/POST/DELETE entry points; there is no onPatch, so PATCH is intentionally
+/// not offered here (unlike `HttpMethodArg`, which backs `raw`/`job submit`).
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum RestletMethodArg {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+impl RestletMethodArg {
+    fn to_method(self) -> reqwest::Method {
+        match self {
+            RestletMethodArg::Get => reqwest::Method::GET,
+            RestletMethodArg::Post => reqwest::Method::POST,
+            RestletMethodArg::Put => reqwest::Method::PUT,
+            RestletMethodArg::Delete => reqwest::Method::DELETE,
         }
     }
 }
@@ -156,7 +182,7 @@ pub enum RestletAction {
         deploy: String,
         /// Required; no default, to avoid surprising an agent about side effects
         #[arg(long, value_enum)]
-        method: HttpMethodArg,
+        method: RestletMethodArg,
         /// Repeatable key=value param sent as a query parameter; RESTlets read these
         /// via request.parameters for GET/DELETE (use --data for POST/PUT bodies)
         #[arg(long = "param")]

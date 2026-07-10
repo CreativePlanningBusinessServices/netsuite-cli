@@ -92,6 +92,29 @@ async fn raw_run_forwards_method_query_headers_body_and_returns_response_json() 
 }
 
 #[tokio::test]
+async fn raw_run_forwards_patch_method_and_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/services/rest/record/v1/customer/1234"))
+        .and(body_json(serde_json::json!({"email": "new@acme.example"})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let result = raw::run(
+        &client_for(&server),
+        reqwest::Method::PATCH,
+        "/services/rest/record/v1/customer/1234",
+        &[],
+        &[],
+        Some(serde_json::json!({"email": "new@acme.example"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, serde_json::json!({"status": 204, "location": null}));
+}
+
+#[tokio::test]
 async fn raw_run_returns_status_and_location_when_body_is_not_json() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
