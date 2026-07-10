@@ -15,6 +15,7 @@ pub struct AccountContext {
     pub alias: String,
     pub account_id: String,
     pub client: NsClient,
+    pub restlet_base: String,
 }
 
 pub fn context_for(alias_flag: Option<&str>) -> Result<AccountContext, CliError> {
@@ -31,6 +32,7 @@ pub fn context_for(alias_flag: Option<&str>) -> Result<AccountContext, CliError>
     );
     Ok(AccountContext {
         alias,
+        restlet_base: account::restlet_base(&entry.account_id),
         account_id: entry.account_id.clone(),
         client,
     })

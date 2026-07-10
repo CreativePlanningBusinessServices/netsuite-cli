@@ -5,7 +5,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use crate::commands::describe::MetadataFormat;
-use crate::commands::{self, account, describe, record, suiteql};
+use crate::commands::{self, account, describe, job, raw, record, restlet, suiteql};
 use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
 use crate::error::CliError;
@@ -70,6 +70,101 @@ pub enum Command {
         format: MetadataFormat,
         #[arg(long)]
         refresh: bool,
+    },
+    /// Call a deployed RESTlet (script + deploy id)
+    Restlet {
+        #[command(subcommand)]
+        action: RestletAction,
+    },
+    /// Send an arbitrary request to any NetSuite REST endpoint
+    #[command(
+        after_help = "Examples:\n  netsuite-cli raw GET /services/rest/record/v1/customer/1\n  netsuite-cli raw POST /services/rest/record/v1/customer --data '{\"companyName\":\"Acme\"}'"
+    )]
+    Raw {
+        #[arg(value_enum)]
+        method: HttpMethodArg,
+        path: String,
+        /// Repeatable key=value query parameter
+        #[arg(long = "query")]
+        query: Vec<String>,
+        /// Repeatable 'Name: value' header
+        #[arg(long = "header")]
+        header: Vec<String>,
+        #[arg(long)]
+        data: Option<String>,
+    },
+    /// Submit and track asynchronous (Prefer: respond-async) requests
+    Job {
+        #[command(subcommand)]
+        action: JobAction,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum HttpMethodArg {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+impl HttpMethodArg {
+    fn to_method(self) -> reqwest::Method {
+        match self {
+            HttpMethodArg::Get => reqwest::Method::GET,
+            HttpMethodArg::Post => reqwest::Method::POST,
+            HttpMethodArg::Put => reqwest::Method::PUT,
+            HttpMethodArg::Delete => reqwest::Method::DELETE,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+pub enum RestletAction {
+    #[command(
+        after_help = "Examples:\n  netsuite-cli restlet call --script 482 --deploy 1 --method GET --param customerId=42\n  netsuite-cli restlet call --script 482 --deploy 1 --method POST --data '{\"foo\":\"bar\"}'"
+    )]
+    Call {
+        #[arg(long)]
+        script: String,
+        #[arg(long)]
+        deploy: String,
+        /// Required; no default, to avoid surprising an agent about side effects
+        #[arg(long, value_enum)]
+        method: HttpMethodArg,
+        /// Repeatable key=value param (query for GET/DELETE, ignored for POST/PUT bodies)
+        #[arg(long = "param")]
+        param: Vec<String>,
+        #[arg(long)]
+        data: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum JobAction {
+    #[command(
+        after_help = "Example: netsuite-cli job submit POST /services/rest/record/v1/customer --data '{\"companyName\":\"Acme\"}' --idempotency-key 8f14e-uuid"
+    )]
+    Submit {
+        #[arg(value_enum)]
+        method: HttpMethodArg,
+        path: String,
+        #[arg(long)]
+        data: Option<String>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    #[command(after_help = "Example: netsuite-cli job status 9001")]
+    Status { job_id: String },
+    #[command(after_help = "Example: netsuite-cli job tasks 9001")]
+    Tasks { job_id: String },
+    #[command(
+        after_help = "Example: netsuite-cli job result 9001 --task 9001.1\nWithout --task, the job's tasks are listed and used only if there is exactly one."
+    )]
+    Result {
+        job_id: String,
+        #[arg(long)]
+        task: Option<String>,
     },
 }
 
@@ -312,6 +407,78 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 METADATA_CACHE_TTL,
             )
             .await
+        }
+        Command::Restlet { action } => {
+            let context = context_for(cli.account.as_deref())?;
+            match action {
+                RestletAction::Call {
+                    script,
+                    deploy,
+                    method,
+                    param,
+                    data,
+                } => {
+                    let params = commands::parse_key_value_pairs(param, "--param")?;
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    restlet::call(
+                        &context.client,
+                        &context.restlet_base,
+                        script,
+                        deploy,
+                        method.to_method(),
+                        &params,
+                        body,
+                    )
+                    .await
+                }
+            }
+        }
+        Command::Raw {
+            method,
+            path,
+            query,
+            header,
+            data,
+        } => {
+            let context = context_for(cli.account.as_deref())?;
+            let query_pairs = commands::parse_key_value_pairs(query, "--query")?;
+            let header_pairs = commands::parse_header_pairs(header)?;
+            let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+            raw::run(
+                &context.client,
+                method.to_method(),
+                path,
+                &query_pairs,
+                &header_pairs,
+                body,
+            )
+            .await
+        }
+        Command::Job { action } => {
+            let context = context_for(cli.account.as_deref())?;
+            match action {
+                JobAction::Submit {
+                    method,
+                    path,
+                    data,
+                    idempotency_key,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    job::submit(
+                        &context.client,
+                        method.to_method(),
+                        path,
+                        body,
+                        idempotency_key.clone(),
+                    )
+                    .await
+                }
+                JobAction::Status { job_id } => job::status(&context.client, job_id).await,
+                JobAction::Tasks { job_id } => job::tasks(&context.client, job_id).await,
+                JobAction::Result { job_id, task } => {
+                    job::result(&context.client, job_id, task.clone()).await
+                }
+            }
         }
     }
 }

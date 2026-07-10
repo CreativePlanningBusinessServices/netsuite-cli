@@ -1,6 +1,9 @@
 pub mod account;
 pub mod describe;
+pub mod job;
+pub mod raw;
 pub mod record;
+pub mod restlet;
 pub mod suiteql;
 
 use std::io::Read;
@@ -24,6 +27,39 @@ pub fn read_data_arg(raw: &str) -> Result<Value, CliError> {
     };
     serde_json::from_str(&text)
         .map_err(|parse_error| CliError::Usage(format!("--data is not valid JSON: {parse_error}")))
+}
+
+/// Parses repeated `--param`/`--query key=value` flags; used by the restlet and raw commands.
+pub fn parse_key_value_pairs(
+    pairs: &[String],
+    flag_name: &str,
+) -> Result<Vec<(String, String)>, CliError> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                CliError::Usage(format!(
+                    "{flag_name} must be in key=value form, got '{pair}'"
+                ))
+            })?;
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Parses repeated `--header 'Name: value'` flags for the raw command.
+pub fn parse_header_pairs(pairs: &[String]) -> Result<Vec<(String, String)>, CliError> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (name, value) = pair.split_once(':').ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--header must be in 'Name: value' form, got '{pair}'"
+                ))
+            })?;
+            Ok((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
 }
 
 #[cfg(test)]
