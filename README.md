@@ -13,12 +13,13 @@ Basecamp task: https://basecamp.com/2808802/projects/8218129/todos/518729835
 ## Install
 
 Download the archive for your platform from the [Releases page](https://github.com/CreativePlanningBusinessServices/netsuite-cli/releases),
-unzip it, and put `netsuite-cli` (or `netsuite-cli.exe` on Windows) on your `PATH`. Releases are
+unzip it, and put `netsuite-cli` (or `netsuite-cli.exe` on Windows) on your `PATH`. Asset names use
+the release's `v`-prefixed git tag (e.g. tag `v0.1.0`), not the bare crate version. Releases are
 published for:
 
-- `netsuite-cli-<version>-aarch64-apple-darwin.zip` (Apple Silicon Mac)
-- `netsuite-cli-<version>-x86_64-apple-darwin.zip` (Intel Mac)
-- `netsuite-cli-<version>-x86_64-pc-windows-msvc.zip` (Windows)
+- `netsuite-cli-v0.1.0-aarch64-apple-darwin.zip` (Apple Silicon Mac)
+- `netsuite-cli-v0.1.0-x86_64-apple-darwin.zip` (Intel Mac)
+- `netsuite-cli-v0.1.0-x86_64-pc-windows-msvc.zip` (Windows)
 
 Once installed, `netsuite-cli update` checks GitHub Releases for a newer version and installs it
 in place — see [Updating](#updating).
@@ -60,6 +61,7 @@ call needs it via `--client-id`.
    ```bash
    # EC P-256 (recommended — smaller assertions, faster to sign)
    openssl req -new -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+     -pkeyopt ec_param_enc:named_curve \
      -keyout key.pem -out cert.pem -nodes -days 730
 
    # RSA-PSS 4096, if EC isn't acceptable in your environment
