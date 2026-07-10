@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, record};
+use crate::commands::{self, record, suiteql};
 use crate::context::context_for;
 use crate::error::CliError;
 use crate::output;
@@ -29,6 +29,19 @@ pub enum Command {
     Record {
         #[command(subcommand)]
         action: RecordAction,
+    },
+    /// Run a SuiteQL query (POST query/v1/suiteql with Prefer: transient)
+    #[command(
+        after_help = "Example: netsuite-cli suiteql \"SELECT id, entityid FROM customer\" --all"
+    )]
+    Suiteql {
+        query: String,
+        #[arg(long)]
+        limit: Option<u64>,
+        #[arg(long)]
+        offset: Option<u64>,
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -178,6 +191,15 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                     record::delete(&context.client, record_type, id).await
                 }
             }
+        }
+        Command::Suiteql {
+            query,
+            limit,
+            offset,
+            all,
+        } => {
+            let context = context_for(cli.account.as_deref())?;
+            suiteql::run(&context.client, query, *limit, *offset, *all).await
         }
     }
 }

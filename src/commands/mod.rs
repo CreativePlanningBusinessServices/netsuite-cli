@@ -1,4 +1,5 @@
 pub mod record;
+pub mod suiteql;
 
 use std::io::Read;
 
