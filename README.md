@@ -69,6 +69,12 @@ call needs it via `--client-id`.
      -nodes -days 730 -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:-1
    ```
 
+   **On Windows, use an EC P-256 key** (already the recommended default everywhere): `account add
+   --flow m2m` stores credentials in Windows Credential Manager, which rejects blobs over ~2560
+   bytes (UTF-16-encoded), and a serialized RSA-4096 PEM comfortably exceeds that. `netsuite-cli`
+   detects this and fails with a usage error rather than a cryptic keychain error; EC P-256 keys
+   stay well under the limit on every platform.
+
    Both commands prompt for a subject (organization/common name, etc.) — any values are fine,
    NetSuite doesn't validate them. `key.pem` never leaves your machine; only `cert.pem` is
    uploaded.

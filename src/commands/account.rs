@@ -30,16 +30,35 @@ pub fn add_m2m(
     })?;
     validate_m2m_key(client_id, cert_id, &private_key_pem)?;
 
-    store.set(
-        alias,
-        &AccountSecrets::M2m {
-            client_id: client_id.to_string(),
-            cert_id: cert_id.to_string(),
-            private_key_pem,
-        },
-    )?;
+    let secrets = AccountSecrets::M2m {
+        client_id: client_id.to_string(),
+        cert_id: cert_id.to_string(),
+        private_key_pem,
+    };
+    let serialized_secrets = serde_json::to_string(&secrets).expect("serializable");
+    if cfg!(windows) && exceeds_windows_credential_limit(serialized_secrets.len()) {
+        return Err(CliError::Usage(format!(
+            "this M2M credential is {} bytes serialized, which exceeds Windows Credential \
+             Manager's ~2560-byte (UTF-16) blob limit; use an EC P-256 key instead of RSA \
+             (see README's M2M certificate section)",
+            serialized_secrets.len()
+        )));
+    }
+
+    store.set(alias, &secrets)?;
     write_account_entry(config_path, alias, account_id, AuthFlow::M2m)?;
     Ok(json!({"alias": alias, "accountId": account_id, "flow": "m2m"}))
+}
+
+/// Windows Credential Manager (the backend `keyring` uses on Windows) rejects credential blobs
+/// whose UTF-16 encoding exceeds 2560 bytes. Serialized `AccountSecrets` JSON is ASCII/UTF-8, so
+/// bytes and UTF-16 code units are close enough that this margin (2500) catches RSA-4096 PEMs
+/// (~3.4KB serialized) well before they'd hit the real ceiling, while EC P-256 PEMs stay clear.
+/// Pure and platform-independent so it's testable on every target; callers gate the resulting
+/// error on `cfg!(windows)` since macOS Keychain and Linux secret-service have no such limit.
+fn exceeds_windows_credential_limit(serialized_len: usize) -> bool {
+    const WINDOWS_CREDENTIAL_BLOB_LIMIT_BYTES: usize = 2500;
+    serialized_len > WINDOWS_CREDENTIAL_BLOB_LIMIT_BYTES
 }
 
 pub async fn add_auth_code(
@@ -252,5 +271,73 @@ mod tests {
 
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.default_account.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn exceeds_windows_credential_limit_thresholds_at_2500_bytes() {
+        assert!(!exceeds_windows_credential_limit(2500));
+        assert!(exceeds_windows_credential_limit(2501));
+        assert!(!exceeds_windows_credential_limit(0));
+    }
+
+    /// A real (throwaway, never used against any NetSuite account) RSA-4096 PKCS8 key so
+    /// `validate_m2m_key`'s signing check passes and the test reaches the size pre-check.
+    /// Serializes to well over the 2500-byte threshold once wrapped in AccountSecrets JSON.
+    const OVERSIZED_RSA_4096_PEM: &str = "-----BEGIN PRIVATE KEY-----\n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\ngznu7ktsVpeg+gKQidVqlgpLTXeaA4E=\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    #[cfg(windows)]
+    fn add_m2m_rejects_oversized_rsa_key_on_windows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let key_path = temp_dir.path().join("key.pem");
+        std::fs::write(&key_path, OVERSIZED_RSA_4096_PEM).unwrap();
+        let store = MemoryStore::default();
+
+        let error = add_m2m(
+            &config_path,
+            &store,
+            "prod",
+            "1234567",
+            "CID",
+            "KID",
+            &key_path,
+        )
+        .unwrap_err();
+
+        match error {
+            CliError::Usage(message) => {
+                assert!(message.contains("Windows Credential Manager"));
+                assert!(message.contains("EC P-256"));
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+        assert!(
+            store.get("prod").unwrap().is_none(),
+            "oversized secrets must not be persisted"
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn add_m2m_allows_oversized_rsa_key_off_windows() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let key_path = temp_dir.path().join("key.pem");
+        std::fs::write(&key_path, OVERSIZED_RSA_4096_PEM).unwrap();
+        let store = MemoryStore::default();
+
+        add_m2m(
+            &config_path,
+            &store,
+            "prod",
+            "1234567",
+            "CID",
+            "KID",
+            &key_path,
+        )
+        .unwrap();
+
+        assert!(store.get("prod").unwrap().is_some());
     }
 }
