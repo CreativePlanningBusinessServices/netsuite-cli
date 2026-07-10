@@ -2,6 +2,7 @@ mod error;
 mod output;
 mod account;
 mod config;
+mod secrets;
 
 use error::CliError;
 
