@@ -19,7 +19,8 @@ use crate::secrets::{AccountSecrets, KeyringStore, SecretStore};
     name = "netsuite-cli",
     version,
     about = "NetSuite REST API CLI for AI agents",
-    propagate_version = true
+    propagate_version = true,
+    color = clap::ColorChoice::Never
 )]
 pub struct Cli {
     /// Account alias (falls back to $NETSUITE_ACCOUNT, then the configured default)
@@ -334,7 +335,10 @@ pub enum AccountAction {
 }
 
 pub async fn cli_main() -> i32 {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(clap_error) => return handle_clap_error(&clap_error),
+    };
     match dispatch(&cli).await {
         Ok(result) => {
             output::print_json(&result, cli.pretty);
@@ -343,6 +347,26 @@ pub async fn cli_main() -> i32 {
         Err(error) => {
             output::print_error(&error);
             error.exit_code() as i32
+        }
+    }
+}
+
+/// clap's own help/version/error rendering is human-readable text, not our stdout-JSON /
+/// stderr-JSON contract. `--help`/`--version` are a documented exception (human text on stdout,
+/// exit 0, matching what every other CLI does); every other parse failure (bad flag, missing
+/// required arg, invalid enum value, etc.) is folded into the same `CliError::Usage` envelope
+/// every other invocation error goes through, so an agent never has to special-case clap's output.
+fn handle_clap_error(clap_error: &clap::Error) -> i32 {
+    use clap::error::ErrorKind;
+    match clap_error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            print!("{clap_error}");
+            0
+        }
+        _ => {
+            let usage_error = CliError::Usage(clap_error.render().to_string().trim().to_string());
+            output::print_error(&usage_error);
+            usage_error.exit_code() as i32
         }
     }
 }
@@ -672,6 +696,39 @@ mod tests {
     use super::*;
     use crate::config::AccountEntry;
     use crate::secrets::MemoryStore;
+    use clap::error::ErrorKind;
+
+    /// `Cli` intentionally has no `Debug` impl (it carries no state worth dumping), so
+    /// `Result::unwrap_err` (which requires `T: Debug`) doesn't work here; extract the error by
+    /// hand instead.
+    fn expect_parse_error(args: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected {args:?} to fail parsing"),
+            Err(clap_error) => clap_error,
+        }
+    }
+
+    #[test]
+    fn bad_flag_yields_a_usage_kind_error_and_exit_code_two() {
+        let clap_error = expect_parse_error(&["netsuite-cli", "--bogus-flag"]);
+        assert_ne!(clap_error.kind(), ErrorKind::DisplayHelp);
+        assert_ne!(clap_error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(handle_clap_error(&clap_error), 2);
+    }
+
+    #[test]
+    fn help_flag_yields_display_help_kind_and_exit_code_zero() {
+        let clap_error = expect_parse_error(&["netsuite-cli", "--help"]);
+        assert_eq!(clap_error.kind(), ErrorKind::DisplayHelp);
+        assert_eq!(handle_clap_error(&clap_error), 0);
+    }
+
+    #[test]
+    fn version_flag_yields_display_version_kind_and_exit_code_zero() {
+        let clap_error = expect_parse_error(&["netsuite-cli", "--version"]);
+        assert_eq!(clap_error.kind(), ErrorKind::DisplayVersion);
+        assert_eq!(handle_clap_error(&clap_error), 0);
+    }
 
     #[test]
     fn require_flag_returns_value_when_present() {

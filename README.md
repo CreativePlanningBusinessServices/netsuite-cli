@@ -298,7 +298,9 @@ $ netsuite-cli config set cache_ttl_hours 48
 stdout carries **only** JSON — one compact value per invocation by default, or indented with the
 global `--pretty` flag. Nothing else (no log lines, no progress text) is written to stdout;
 interactive prompts during `account add`/`account test --reauth` go to stderr so stdout stays
-parseable even mid-login.
+parseable even mid-login. `--help`/`--version` are the one documented exception: they print
+human-readable text to stdout and exit `0`; every other invocation error (bad flag, missing
+argument, etc.) is JSON on stderr like any other failure below.
 
 On failure, stderr gets exactly one JSON object and the process exits non-zero:
 
