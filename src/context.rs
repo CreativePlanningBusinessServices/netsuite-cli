@@ -32,9 +32,9 @@ pub fn context_for(alias_flag: Option<&str>) -> Result<AccountContext, CliError>
     );
     Ok(AccountContext {
         alias,
-        restlet_base: account::restlet_base(&entry.account_id),
         account_id: entry.account_id.clone(),
         client,
+        restlet_base: account::restlet_base(&entry.account_id),
     })
 }
 

@@ -132,7 +132,8 @@ pub enum RestletAction {
         /// Required; no default, to avoid surprising an agent about side effects
         #[arg(long, value_enum)]
         method: HttpMethodArg,
-        /// Repeatable key=value param (query for GET/DELETE, ignored for POST/PUT bodies)
+        /// Repeatable key=value param sent as a query parameter; RESTlets read these
+        /// via request.parameters for GET/DELETE (use --data for POST/PUT bodies)
         #[arg(long = "param")]
         param: Vec<String>,
         #[arg(long)]
