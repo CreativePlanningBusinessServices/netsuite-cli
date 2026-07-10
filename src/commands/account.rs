@@ -50,14 +50,15 @@ pub fn add_m2m(
     Ok(json!({"alias": alias, "accountId": account_id, "flow": "m2m"}))
 }
 
-/// Windows Credential Manager (the backend `keyring` uses on Windows) rejects credential blobs
-/// whose UTF-16 encoding exceeds 2560 bytes. Serialized `AccountSecrets` JSON is ASCII/UTF-8, so
-/// bytes and UTF-16 code units are close enough that this margin (2500) catches RSA-4096 PEMs
-/// (~3.4KB serialized) well before they'd hit the real ceiling, while EC P-256 PEMs stay clear.
-/// Pure and platform-independent so it's testable on every target; callers gate the resulting
-/// error on `cfg!(windows)` since macOS Keychain and Linux secret-service have no such limit.
+/// Windows Credential Manager (the backend `keyring` uses on Windows) caps blobs at 2560 bytes
+/// as UTF-16, i.e. 2 bytes per code unit for ASCII, so ~1280 ASCII chars. Serialized
+/// `AccountSecrets` JSON is ASCII/UTF-8, so one byte is one UTF-16 code unit here; we use 1250
+/// for margin. That catches RSA-4096 PEMs (~3.4KB serialized) well before they'd hit the real
+/// ceiling, while EC P-256 PEMs stay clear. Pure and platform-independent so it's testable on
+/// every target; callers gate the resulting error on `cfg!(windows)` since macOS Keychain and
+/// Linux secret-service have no such limit.
 fn exceeds_windows_credential_limit(serialized_len: usize) -> bool {
-    const WINDOWS_CREDENTIAL_BLOB_LIMIT_BYTES: usize = 2500;
+    const WINDOWS_CREDENTIAL_BLOB_LIMIT_BYTES: usize = 1250;
     serialized_len > WINDOWS_CREDENTIAL_BLOB_LIMIT_BYTES
 }
 
@@ -274,9 +275,9 @@ mod tests {
     }
 
     #[test]
-    fn exceeds_windows_credential_limit_thresholds_at_2500_bytes() {
-        assert!(!exceeds_windows_credential_limit(2500));
-        assert!(exceeds_windows_credential_limit(2501));
+    fn exceeds_windows_credential_limit_thresholds_at_1250_bytes() {
+        assert!(!exceeds_windows_credential_limit(1250));
+        assert!(exceeds_windows_credential_limit(1251));
         assert!(!exceeds_windows_credential_limit(0));
     }
 
