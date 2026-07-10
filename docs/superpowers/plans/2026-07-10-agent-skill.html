@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Skill &amp; README Quick-Start — Implementation Plan (2026-07-10)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e3; --warn-border:#e6c98a; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:920px; padding:2.5rem 1.5rem 4rem; font:15px/1.55 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); }
+  h1 { font-size:1.55rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2.2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h2.task { background:var(--accent-soft); padding:.45rem .7rem; border-radius:8px; border-bottom:none; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.2rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em; }
+  code { background:var(--code-bg); padding:.1em .3em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.8rem 1rem; overflow-x:auto; line-height:1.45; }
+  .callout { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+  ul.step { list-style:none; padding-left:0; } ul.step li { margin:.6rem 0; }
+  ul { padding-left:1.3rem; }
+</style>
+</head>
+<body>
+
+<h1>Agent Skill &amp; README Quick-Start — Implementation Plan</h1>
+<div class="meta">2026-07-10 · Executes docs/superpowers/specs/2026-07-10-agent-skill-design.html</div>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: superpowers:subagent-driven-development or superpowers:executing-plans, task-by-task with checkboxes.</div>
+
+<p><strong>Goal:</strong> Ship a public-safe agent skill for netsuite-cli (repo canonical + user symlink), an agent quick-start README section, and a private global-CLAUDE.md pointer.</p>
+<p><strong>Architecture:</strong> Pure documentation artifacts; the only "tests" are (a) every command example parse-verified against the release binary, and (b) a fresh-subagent pressure check that the skill actually steers command choice.</p>
+<p><strong>Tech stack:</strong> Markdown skill (superpowers:writing-skills conventions), existing README, bash for validation.</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li><strong>No Creative Planning identifiers in repo artifacts</strong>: no account IDs, cert IDs, client IDs, aliases tied to real accounts, or account-specific URLs. Placeholders only (<code>&lt;ID&gt;</code>, <code>&lt;alias&gt;</code>).</li>
+  <li>Every command shown must parse against <code>target/release/netsuite-cli</code> (exit 2 usage-error with an unknown account alias counts as parsing; exit 0 for offline commands).</li>
+  <li>Commits end with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>. Branch: <code>feature/agent-skill</code>.</li>
+</ul>
+
+<h2 class="task">Task 1: Author skills/netsuite-cli/SKILL.md</h2>
+<p><strong>Files:</strong> Create <code>skills/netsuite-cli/SKILL.md</code></p>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Write the file with exactly this content</strong> (decode HTML entities when transcribing):
+<pre><code>---
+name: netsuite-cli
+description: Use when a task needs NetSuite data or metadata from the command line — reading or writing records, running SuiteQL queries, discovering record schemas, calling RESTlets, or driving async REST jobs. Covers picking the right subcommand, bootstrapping an account, workflow recipes, and triaging errors by exit code.
+---
+
+# netsuite-cli
+
+Single-binary CLI for the NetSuite REST API, built for agents: JSON-only stdout,
+structured JSON errors on stderr, deterministic exit codes. Full command
+reference: `netsuite-cli &lt;subcommand&gt; --help` (examples are copy-paste correct)
+and the repo README.
+
+## Pick the right command
+
+| You have / need | Use |
+|---|---|
+| Record type + internal id | `record get &lt;type&gt; &lt;id&gt;` |
+| Query, aggregate, filter, join | `suiteql "SELECT ..."` |
+| Unknown record type or field names | `describe --list`, then `describe &lt;type&gt;` |
+| Create / update / delete a record | `record create` / `record update` / `record delete` |
+| Upsert keyed on your own id | `record upsert &lt;type&gt; &lt;externalId&gt;` |
+| An endpoint the CLI lacks | `raw &lt;METHOD&gt; /services/rest/...` |
+| Long-running request | `job submit &lt;METHOD&gt; &lt;path&gt;` → `job status &lt;id&gt;` → `job result &lt;id&gt;` |
+| Deployed RESTlet script | `restlet call --script &lt;N&gt; --deploy &lt;N&gt; --method &lt;M&gt;` |
+
+## Bootstrap (once per machine + account)
+
+```bash
+netsuite-cli --version || true   # not installed? README "Install" has release + cargo paths
+netsuite-cli account list        # any accounts registered?
+netsuite-cli account add &lt;alias&gt; --account-id &lt;ID&gt; --flow m2m \
+    --client-id &lt;CLIENT_ID&gt; --cert-id &lt;CERT_ID&gt; --key &lt;path/to/key.pem&gt;
+netsuite-cli account test --account &lt;alias&gt;   # proves auth end to end
+```
+
+- No credentials yet? The NetSuite-side setup (integration record + certificate
+  upload) needs a human admin once — steps are in the README under "NetSuite setup".
+- **M2M is the right flow for agents**: unattended, no browser, safe under
+  parallel invocations. Auth-code acts as a named user but its refresh tokens
+  are one-time-rotating — never run parallel commands against an auth-code
+  account whose token may be expired.
+- Account targeting: `--account &lt;alias&gt;` flag → `NETSUITE_ACCOUNT` env var →
+  configured default (`account set-default`).
+
+## Recipes
+
+- **Discover before writing:** field names are camelCase and account-specific.
+  `describe &lt;type&gt;` returns the JSON Schema; build `--data` bodies from it.
+- **All rows:** add `--all` to `record list` / `suiteql`. If the merged result
+  still says `"hasMore": true`, the server misbehaved and the data is partial —
+  treat it as incomplete, not done.
+- **Create returns** `{"id", "location"}` — the id is parsed from the Location
+  header; an error means the record may not exist, so re-check before retrying.
+- **SuiteQL values arrive as strings** (`"count": "143"`); cast after parsing.
+- **`record list` items are id+link stubs** — fetch full rows via `record get`,
+  or just use `suiteql` for bulk field reads.
+- **Sublists on update:** `record update ... --replace item` replaces the whole
+  `item` sublist; without `--replace`, body lines merge into existing ones.
+- **Data input:** `--data '&lt;json&gt;'`, `--data @file.json`, or `--data -` (stdin).
+
+## Errors: exit code → action
+
+| Exit | Kind | Action |
+|---|---|---|
+| 1 | API | Parse stderr JSON: `details[].["o:errorCode"]` (`NONEXISTENT_ID`, `INVALID_CONTENT`, …) says what to fix |
+| 2 | usage | Re-run with `--help`; the examples are exact |
+| 3 | auth | M2M: credentials wrong/revoked → re-run `account add`. Auth-code: refresh token expired → re-run `account add &lt;alias&gt; --flow auth-code ...` |
+| 4 | network | Retries with backoff (429/5xx) already happened — the failure is real |
+
+## Gotchas
+
+- stdout is ALWAYS machine JSON; `--pretty` is for humans. Only `--help` /
+  `--version` print human text.
+- Windows: use EC P-256 keys — RSA PEMs exceed the Windows credential store
+  size limit and `account add` will reject them.
+- `raw GET /services/rest/record/v1/metadata-catalog --query select=&lt;type&gt;`
+  returns a single object; omit `select` to get the `{"items": [...]}` list.
+- HTTP methods parse case-insensitively (`GET` and `get` both work).
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2: Validate every command parses.</strong> Run each against the binary with a nonexistent alias; expected outcomes:
+<pre><code>B=./target/release/netsuite-cli
+$B --version                                                        # exit 0
+$B account list                                                     # exit 0
+$B account test --account zzz-nope                                  # exit 2 (usage: unknown alias)
+$B record get customer 1 --account zzz-nope                         # exit 2
+$B suiteql "SELECT id FROM currency" --account zzz-nope             # exit 2
+$B describe --list --account zzz-nope                               # exit 2
+$B raw GET /services/rest/record/v1/metadata-catalog --query select=currency --account zzz-nope  # exit 2
+$B job submit POST /x --account zzz-nope                            # exit 2
+$B restlet call --script 1 --deploy 1 --method GET --account zzz-nope  # exit 2
+$B record update customer 1 --data '{}' --replace item --account zzz-nope  # exit 2
+</code></pre>
+Every exit-2 must be the <em>unknown-alias</em> usage error (message contains "unknown account alias"), proving the args parsed. Any clap "invalid value/unexpected argument" error = fix the skill text.</li>
+<li><input type="checkbox"> <strong>Step 3: Identifier scan:</strong> <code>grep -nEi -f &lt;private pattern file&gt; skills/netsuite-cli/SKILL.md  # patterns: account number, org email domain, real alias, credential prefixes — kept out of this public doc</code> → no matches (repo org name in URLs is fine and none are used here).</li>
+<li><input type="checkbox"> <strong>Step 4: Commit:</strong> <code>git add skills/ &amp;&amp; git commit -m "feat: agent-facing usage skill"</code> (+ trailer).</li>
+</ul>
+
+<h2 class="task">Task 2: README "Quick start for AI agents" section</h2>
+<p><strong>Files:</strong> Modify <code>README.md</code> (insert after the intro paragraph + Basecamp link, before "## Install")</p>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Insert exactly:</strong>
+<pre><code>## Quick start for AI agents
+
+```bash
+# Install: grab the release asset for your platform (or: cargo install --git &lt;repo URL&gt;)
+gh release download -R CreativePlanningBusinessServices/netsuite-cli \
+    --pattern "*aarch64-apple-darwin*" && unzip -o netsuite-cli-*.zip
+install -m 0755 netsuite-cli "$HOME/.local/bin/"   # any writable PATH dir
+
+# Bootstrap (credentials: see "NetSuite setup" below — one-time human step)
+netsuite-cli account add &lt;alias&gt; --account-id &lt;ID&gt; --flow m2m \
+    --client-id &lt;CLIENT_ID&gt; --cert-id &lt;CERT_ID&gt; --key &lt;key.pem&gt;
+netsuite-cli account test --account &lt;alias&gt;
+
+# The three commands that cover most work
+netsuite-cli describe --list                       # what record types exist?
+netsuite-cli suiteql "SELECT id, entityid FROM customer" --limit 10
+netsuite-cli record get customer &lt;id&gt; --expand-sub-resources
+```
+
+Everything prints JSON on stdout; errors are JSON on stderr with deterministic
+exit codes (see [Output contract](#output-contract)). Agents should load
+[`skills/netsuite-cli/SKILL.md`](skills/netsuite-cli/SKILL.md) for command
+selection, recipes, and error triage.
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2: Verify:</strong> the three "cover most work" commands parse (unknown-alias trick from Task 1); anchor <code>#output-contract</code> matches the existing "## Output contract" heading; identifier scan on the diff (account IDs etc.).</li>
+<li><input type="checkbox"> <strong>Step 3: Commit:</strong> <code>git commit -am "docs: agent quick-start section"</code> (+ trailer).</li>
+</ul>
+
+<h2 class="task">Task 3: User-level registration (not committed to repo)</h2>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Symlink:</strong> <code>ln -sfn &lt;repo&gt;/skills/netsuite-cli ~/.claude/skills/netsuite-cli</code>; verify <code>ls -la ~/.claude/skills/netsuite-cli/SKILL.md</code> resolves.</li>
+<li><input type="checkbox"> <strong>Step 2: Install the binary on PATH:</strong> <code>install -m 0755 target/release/netsuite-cli /opt/homebrew/bin/netsuite-cli</code> (fallback <code>~/.local/bin</code> if not writable); verify <code>which netsuite-cli &amp;&amp; netsuite-cli --version</code>.</li>
+<li><input type="checkbox"> <strong>Step 3: Global CLAUDE.md line</strong> — append to the "NetSuite via agent-browser" section in <code>~/.claude/CLAUDE.md</code>:
+<pre><code>- For NetSuite DATA work (records, SuiteQL, schemas), prefer the **netsuite-cli** binary
+  (installed on PATH; account alias `&lt;alias&gt;` = &lt;environment&gt; M2M is registered on this machine)
+  over raw REST or browser automation. Usage skill: `netsuite-cli` in ~/.claude/skills
+  (symlinked from the local repo checkout).
+</code></pre></li>
+</ul>
+
+<h2 class="task">Task 4: Pressure-check, PR, review loop</h2>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1 (skill TDD):</strong> dispatch a fresh subagent with ONLY the skill file and the task "Count customers in NetSuite whose email ends in @acme.com, using alias &lt;alias&gt; (don't execute, output the exact commands you would run)". Pass = it reaches for <code>suiteql</code> with a COUNT query (not record list + client-side counting) and handles the string-typed count. Fail = revise the skill's chooser/recipes and re-check once.</li>
+<li><input type="checkbox"> <strong>Step 2: Gates:</strong> <code>cargo test</code> unaffected (no code changes) — run once anyway; identifier grep across the full branch diff: <code>git diff main...HEAD | grep -nEi -f &lt;private pattern file&gt;</code> → empty.</li>
+<li><input type="checkbox"> <strong>Step 3: Push + PR</strong> to main (title "docs: agent usage skill and README quick-start"), then run the pr-review-loop skill to green.</li>
+</ul>
+
+<h2>Self-review</h2>
+<ul>
+  <li>Spec coverage: skill (Task 1), README (Task 2), symlink + global note (Task 3), validation + delivery (Task 4, spec §5). ✓</li>
+  <li>No placeholders beyond intentional <code>&lt;alias&gt;</code>-style user-facing ones. ✓</li>
+  <li>Names consistent: <code>skills/netsuite-cli/SKILL.md</code> everywhere. ✓</li>
+</ul>
+
+</body>
+</html>

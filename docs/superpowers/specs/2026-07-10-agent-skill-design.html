@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli Agent Skill &amp; README Quick-Start — Design Spec (2026-07-10)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:860px; padding:2.5rem 1.5rem 4rem; font:16px/1.6 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.5rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.86em; }
+  code { background:var(--code-bg); padding:.1em .35em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.9rem 1rem; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:.8rem 0; font-size:.93rem; }
+  th, td { border:1px solid var(--border); padding:.45rem .65rem; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul { padding-left:1.3rem; } li { margin:.25rem 0; }
+  .buttons { display:flex; gap:.75rem; flex-wrap:wrap; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:1rem; margin:1.2rem 0; align-items:center; }
+  .buttons span { font-weight:600; }
+  .buttons a { display:inline-block; padding:.5rem 1.1rem; border-radius:8px; text-decoration:none; font-weight:600; border:1px solid var(--accent); }
+  .buttons a.primary { background:var(--accent); color:#fff; }
+  .buttons a.secondary { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>netsuite-cli Agent Skill &amp; README Quick-Start — Design Spec</h1>
+<div class="meta">2026-07-10 · Follow-on to the shipped v0.1.0 CLI · Goal: agents discover, install, and drive the CLI correctly without reading source.</div>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+<h2>1. Deliverables</h2>
+<table>
+  <tr><th>Artifact</th><th>Location</th><th>Purpose</th></tr>
+  <tr><td>Skill</td><td><code>skills/netsuite-cli/SKILL.md</code> (repo, canonical)</td><td>Teaches agents which command to reach for, the discovery workflow, recipes, and error triage. Public-safe: <strong>no Creative Planning account identifiers</strong>.</td></tr>
+  <tr><td>User registration</td><td>symlink <code>~/.claude/skills/netsuite-cli</code> → repo skill dir</td><td>Makes the skill active in every one of Jon's sessions; single source of truth.</td></tr>
+  <tr><td>README section</td><td>"Quick start for AI agents" after the intro</td><td>Install one-liner, bootstrap commands, three canonical examples, pointers to the skill and output contract.</td></tr>
+  <tr><td>Global note</td><td><code>~/.claude/CLAUDE.md</code> NetSuite section (private, not in repo)</td><td>One line: the CLI exists, where the skill lives, and which account alias is registered on this machine.</td></tr>
+</table>
+
+<h2>2. Skill content (≈150 lines)</h2>
+<ul>
+  <li><strong>Frontmatter:</strong> <code>name: netsuite-cli</code>; description triggers on NetSuite REST data tasks (records, SuiteQL, schemas, RESTlets, async jobs) from any project — including phrases like "query NetSuite", "get/update a NetSuite record", "NetSuite schema".</li>
+  <li><strong>Command chooser table:</strong> know type+id → <code>record get</code> · query/aggregate/join → <code>suiteql</code> · unknown shape → <code>describe</code> · unsupported endpoint → <code>raw</code> · long-running → <code>job submit</code> · deployed script → <code>restlet call</code>.</li>
+  <li><strong>Bootstrap:</strong> <code>--version</code> check → install (GitHub release download or <code>cargo install --git</code>) → <code>account list</code> → <code>account add</code> (M2M for unattended, auth-code for named user; NetSuite-side setup lives in the README) → <code>account test</code>. Account selection precedence (<code>--account</code> flag → <code>NETSUITE_ACCOUNT</code> → default).</li>
+  <li><strong>Recipes:</strong> describe-first discovery; <code>--all</code> pagination (honest <code>hasMore:true</code> on guard stops); create returns id via Location; upsert by <code>eid:</code>; async submit → status → result; SuiteQL count/aggregate with string-typed values; metadata-catalog <code>select=</code> single-object quirk.</li>
+  <li><strong>Error triage:</strong> exit 3 → reauth per flow · exit 1 → parse <code>o:errorCode</code>/<code>details</code> · exit 2 → usage, re-read <code>--help</code> · exit 4 → network (retries already happened) · 429/5xx handled internally. Windows = EC P-256 keys only. Auth-code refresh rotation races under parallel invocations → use M2M for agent fleets.</li>
+</ul>
+
+<h2>3. README quick-start section</h2>
+<p>Inserted after the intro paragraph, before "Install": fenced install one-liner per OS (curl release asset → unzip → PATH, plus <code>cargo install --git</code> alternative), then the four bootstrap commands, then <code>record get</code>/<code>suiteql</code>/<code>describe</code> one-liners, then two pointers: "full command reference below" and "agents: load <code>skills/netsuite-cli/SKILL.md</code>". No duplication of the full reference.</p>
+
+<h2>4. Constraints &amp; non-goals</h2>
+<ul>
+  <li>No account IDs, cert IDs, client IDs, or internal URLs anywhere in repo artifacts (public repo — enforced lesson from PR #2).</li>
+  <li>Skill follows superpowers:writing-skills conventions (tight, imperative, no restating <code>--help</code>).</li>
+  <li>Every command example must parse against the real binary before merge (same bar as the README had).</li>
+  <li>Non-goals: no plugin packaging, no changes to CLI code, no AGENTS.md (the skill covers it), no rewrite of existing README sections.</li>
+</ul>
+
+<h2>5. Testing &amp; delivery</h2>
+<ul>
+  <li>Validate every skill/README command against <code>target/release/netsuite-cli</code> (parse-level; live calls only for read-only examples).</li>
+  <li>Symlink verified by listing skills in a fresh session context (manual check).</li>
+  <li>Branch <code>feature/agent-skill</code> → PR → pr-review-loop to green.</li>
+</ul>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+</body>
+</html>
