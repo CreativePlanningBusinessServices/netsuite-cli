@@ -1,0 +1,7 @@
+[package]
+name = "netsuite-cli"
+version = "0.1.0"
+edition = "2024"
+description = "NetSuite REST API CLI for AI agents — multi-account OAuth, record endpoints, SuiteQL, metadata"
+
+[dependencies]
