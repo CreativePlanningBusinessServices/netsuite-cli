@@ -197,29 +197,47 @@ impl AuthCodeProvider {
                     self.alias
                 ))
             })?;
-        if let Some(rotated_refresh) = &token.refresh_token {
-            self.store
-                .set(
-                    &self.alias,
-                    &AccountSecrets::AuthCode {
-                        client_id: self.client_id.clone(),
-                        refresh_token: Some(rotated_refresh.clone()),
-                    },
-                )
-                .map_err(|store_error| {
-                    // NetSuite has already invalidated the old refresh token server-side by
-                    // this point (refresh tokens are one-time-use), so there's no safe fallback
-                    // — the fresh access token we hold in memory can't be persisted for reuse
-                    // either without the rotated refresh token to pair it with next time. Make
-                    // the account's broken state explicit instead of surfacing a bare keychain
-                    // error that gives no indication the account now needs re-authentication.
-                    CliError::Auth(format!(
-                        "NetSuite rotated the refresh token but saving it to the keychain \
-                         failed ({store_error}); this account must be re-authenticated: run \
-                         `netsuite-cli account add {} --flow auth-code …`",
-                        self.alias
-                    ))
-                })?;
+        match &token.refresh_token {
+            Some(rotated_refresh) => {
+                self.store
+                    .set(
+                        &self.alias,
+                        &AccountSecrets::AuthCode {
+                            client_id: self.client_id.clone(),
+                            refresh_token: Some(rotated_refresh.clone()),
+                        },
+                    )
+                    .map_err(|store_error| {
+                        // NetSuite has already invalidated the old refresh token server-side by
+                        // this point (refresh tokens are one-time-use), so there's no safe
+                        // fallback — the fresh access token we hold in memory can't be persisted
+                        // for reuse either without the rotated refresh token to pair it with next
+                        // time. Make the account's broken state explicit instead of surfacing a
+                        // bare keychain error that gives no indication the account now needs
+                        // re-authentication.
+                        CliError::Auth(format!(
+                            "NetSuite rotated the refresh token but saving it to the keychain \
+                             failed ({store_error}); this account must be re-authenticated: run \
+                             `netsuite-cli account add {} --flow auth-code …`",
+                            self.alias
+                        ))
+                    })?;
+            }
+            None => {
+                // NetSuite documents that it rotates the refresh token on every use, so a
+                // successful refresh response without one is unexpected — but the old refresh
+                // token is still one-time-use and has already been invalidated server-side by
+                // this call regardless. Don't fail the command that just got a perfectly good
+                // access token; warn instead so the eventual "refresh failed" on the next
+                // expiry isn't a surprise with no history to explain it.
+                eprintln!(
+                    "warning: NetSuite's refresh response for '{}' did not include a new \
+                     refresh token; the stored one is one-time-use and has already been \
+                     invalidated, so the next refresh will likely fail — if it does, \
+                     re-authenticate with `netsuite-cli account add {} --flow auth-code …`",
+                    self.alias, self.alias
+                );
+            }
         }
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)

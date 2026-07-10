@@ -107,6 +107,52 @@ async fn provider_refreshes_and_persists_rotated_refresh_token() {
 }
 
 #[tokio::test]
+async fn refresh_without_rotated_token_still_succeeds_and_leaves_old_refresh_stored() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=RT_OLD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "AT2", "expires_in": 3600, "token_type": "bearer"
+        })))
+        .mount(&server)
+        .await;
+
+    let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+    store
+        .set(
+            "dev",
+            &AccountSecrets::AuthCode {
+                client_id: "cid".into(),
+                refresh_token: Some("RT_OLD".into()),
+            },
+        )
+        .unwrap();
+
+    let provider = AuthCodeProvider::new(
+        reqwest::Client::new(),
+        "dev".into(),
+        format!("{}/token", server.uri()),
+        "cid".into(),
+        store.clone(),
+    );
+
+    // The just-obtained access token is good, so this command must still succeed even though
+    // the server didn't rotate the refresh token.
+    assert_eq!(provider.access_token().await.unwrap(), "AT2");
+
+    // Nothing to persist in place of the (now server-invalidated) old refresh token, so it's
+    // left as-is rather than being silently cleared.
+    match store.get("dev").unwrap().unwrap() {
+        AccountSecrets::AuthCode { refresh_token, .. } => {
+            assert_eq!(refresh_token.as_deref(), Some("RT_OLD"))
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn expired_refresh_token_yields_actionable_auth_error() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
