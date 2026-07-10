@@ -2,6 +2,7 @@ mod common;
 
 use common::client_for;
 use netsuite_cli::commands::record;
+use netsuite_cli::error::CliError;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -57,6 +58,57 @@ async fn create_returns_id_from_location_header() {
 }
 
 #[tokio::test]
+async fn create_errors_when_location_header_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/customer"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let create_result = record::create(
+        &client_for(&server),
+        "customer",
+        serde_json::json!({"companyName": "Acme"}),
+    )
+    .await;
+
+    match create_result {
+        Err(CliError::Api {
+            status, message, ..
+        }) => {
+            assert_eq!(status, 204);
+            assert!(
+                message.contains("no Location header was returned"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected CliError::Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_all_stops_when_page_contributes_no_items_but_claims_more() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/rest/record/v1/customer"))
+        .and(query_param("offset", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 0, "hasMore": true, "offset": 0, "totalResults": 3,
+            "items": [], "links": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let listing = record::list(&client_for(&server), "customer", None, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(listing["hasMore"], true);
+    assert_eq!(listing["items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn list_all_follows_pagination_and_merges_items() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -85,6 +137,8 @@ async fn list_all_follows_pagination_and_merges_items() {
     assert_eq!(listing["items"].as_array().unwrap().len(), 3);
     assert_eq!(listing["count"], 3);
     assert_eq!(listing["hasMore"], false);
+    assert_eq!(listing["offset"], 0);
+    assert!(listing["links"].is_array());
 }
 
 #[tokio::test]

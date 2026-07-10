@@ -31,6 +31,9 @@ pub async fn get(
     Ok(response.body.unwrap_or(Value::Null))
 }
 
+/// NetSuite's documented maximum page count for a single listing traversal.
+const MAX_PAGES: u32 = 1000;
+
 pub async fn list(
     client: &NsClient,
     record_type: &str,
@@ -42,6 +45,7 @@ pub async fn list(
     let page_limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
     let mut page_offset = offset.unwrap_or(0);
     let mut merged_items: Vec<Value> = Vec::new();
+    let mut pages_fetched: u32 = 0;
     loop {
         let mut query: Vec<(&str, String)> = vec![
             ("limit", page_limit.to_string()),
@@ -63,12 +67,27 @@ pub async fn list(
         if !fetch_all {
             return Ok(page);
         }
+        pages_fetched += 1;
+        let page_item_count = page["items"].as_array().map(Vec::len).unwrap_or(0);
         merged_items.extend(page["items"].as_array().cloned().unwrap_or_default());
-        if page["hasMore"].as_bool() != Some(true) {
-            let total = page["totalResults"].clone();
+
+        let total = page["totalResults"].clone();
+        let has_more = page["hasMore"].as_bool() == Some(true);
+        if !has_more {
             return Ok(json!({
                 "items": merged_items, "count": merged_items.len(),
                 "hasMore": false, "totalResults": total,
+                "offset": 0, "links": [],
+            }));
+        }
+        // A page that claims more results but contributes nothing means the
+        // server is misbehaving; stop rather than looping forever. Likewise,
+        // never traverse past NetSuite's documented page cap.
+        if page_item_count == 0 || pages_fetched >= MAX_PAGES {
+            return Ok(json!({
+                "items": merged_items, "count": merged_items.len(),
+                "hasMore": true, "totalResults": total,
+                "offset": 0, "links": [],
             }));
         }
         page_offset += page_limit;
@@ -85,7 +104,14 @@ pub async fn create(client: &NsClient, record_type: &str, body: Value) -> Result
             Some(&body),
         )
         .await?;
-    let location = response.location.unwrap_or_default();
+    let Some(location) = response.location else {
+        return Err(CliError::Api {
+            status: response.status,
+            message: "create succeeded but no Location header was returned; record id unknown"
+                .into(),
+            details: vec![],
+        });
+    };
     let new_id = location.rsplit('/').next().unwrap_or_default().to_string();
     Ok(json!({"id": new_id, "location": location}))
 }
