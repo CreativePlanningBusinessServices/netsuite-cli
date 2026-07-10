@@ -1,9 +1,15 @@
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
 
-use crate::commands::{self, record, suiteql};
+use crate::commands::describe::MetadataFormat;
+use crate::commands::{self, describe, record, suiteql};
 use crate::context::context_for;
 use crate::error::CliError;
 use crate::output;
+
+/// Task 12 will make this configurable; hardcoded for now.
+const METADATA_CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
 
 #[derive(Parser)]
 #[command(
@@ -42,6 +48,19 @@ pub enum Command {
         offset: Option<u64>,
         #[arg(long)]
         all: bool,
+    },
+    /// Discover record types and per-type schemas from this account's metadata catalog
+    #[command(
+        after_help = "Examples:\n  netsuite-cli describe --list\n  netsuite-cli describe customer\n  netsuite-cli describe salesOrder --format openapi --refresh"
+    )]
+    Describe {
+        record_type: Option<String>,
+        #[arg(long)]
+        list: bool,
+        #[arg(long, value_enum, default_value = "schema")]
+        format: MetadataFormat,
+        #[arg(long)]
+        refresh: bool,
     },
 }
 
@@ -200,6 +219,34 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
         } => {
             let context = context_for(cli.account.as_deref())?;
             suiteql::run(&context.client, query, *limit, *offset, *all).await
+        }
+        Command::Describe {
+            record_type,
+            list,
+            format,
+            refresh,
+        } => {
+            let context = context_for(cli.account.as_deref())?;
+            match (*list, record_type) {
+                (true, _) => describe::list_types(&context.client).await,
+                (false, None) => Err(CliError::Usage(
+                    "describe requires either a record type or --list, e.g. `netsuite-cli describe --list` or `netsuite-cli describe customer`".into(),
+                )),
+                (false, Some(record_type)) => {
+                    let cache_dir = crate::config::default_cache_dir()
+                        .join("metadata")
+                        .join(&context.alias);
+                    describe::describe_type(
+                        &context.client,
+                        record_type,
+                        *format,
+                        &cache_dir,
+                        *refresh,
+                        METADATA_CACHE_TTL,
+                    )
+                    .await
+                }
+            }
         }
     }
 }

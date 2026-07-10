@@ -1,3 +1,4 @@
+pub mod describe;
 pub mod record;
 pub mod suiteql;
 
