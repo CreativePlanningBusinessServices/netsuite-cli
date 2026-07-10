@@ -1,12 +1,16 @@
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
 use crate::commands::describe::MetadataFormat;
-use crate::commands::{self, describe, record, suiteql};
+use crate::commands::{self, account, describe, record, suiteql};
+use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
 use crate::error::CliError;
 use crate::output;
+use crate::secrets::{AccountSecrets, KeyringStore, SecretStore};
 
 /// Task 12 will make this configurable; hardcoded for now.
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -31,6 +35,11 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Manage stored account credentials and aliases
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
     /// Record CRUD against record/v1 (record types are plain strings, e.g. customer)
     Record {
         #[command(subcommand)]
@@ -123,6 +132,60 @@ pub enum RecordAction {
     Delete { record_type: String, id: String },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum AccountFlowArg {
+    M2m,
+    AuthCode,
+}
+
+#[derive(Subcommand)]
+pub enum AccountAction {
+    /// Add or overwrite an account alias; the first account added becomes the default
+    #[command(
+        after_help = "Examples:\n  netsuite-cli account add prod --account-id 1234567 --flow m2m --client-id CID --cert-id KID --key ./netsuite-m2m.pem\n  netsuite-cli account add dev --account-id 1234567_SB1 --flow auth-code --client-id CID --port 8899"
+    )]
+    Add {
+        alias: String,
+        #[arg(long = "account-id")]
+        account_id: String,
+        #[arg(long, value_enum)]
+        flow: AccountFlowArg,
+        /// Required for both flows
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// Required for --flow m2m
+        #[arg(long = "cert-id")]
+        cert_id: Option<String>,
+        /// Required for --flow m2m
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Loopback listener port for --flow auth-code
+        #[arg(long, default_value_t = 8899)]
+        port: u16,
+        /// For --flow auth-code: paste the redirect URL instead of running the loopback listener
+        #[arg(long)]
+        paste: bool,
+    },
+    /// List configured account aliases (never prints secrets)
+    List,
+    /// Change which alias is used when --account/$NETSUITE_ACCOUNT is not given
+    SetDefault { alias: String },
+    /// Remove an account alias and its stored secrets
+    Remove { alias: String },
+    /// Verify stored credentials by calling the metadata catalog
+    Test {
+        #[arg(long)]
+        alias: Option<String>,
+        /// Re-run the interactive login before testing (auth-code accounts only)
+        #[arg(long)]
+        reauth: bool,
+        #[arg(long, default_value_t = 8899)]
+        port: u16,
+        #[arg(long)]
+        paste: bool,
+    },
+}
+
 pub async fn cli_main() -> i32 {
     let cli = Cli::parse();
     match dispatch(&cli).await {
@@ -139,6 +202,7 @@ pub async fn cli_main() -> i32 {
 
 async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
     match &cli.command {
+        Command::Account { action } => dispatch_account(cli, action).await,
         Command::Record { action } => {
             let context = context_for(cli.account.as_deref())?;
             match action {
@@ -250,4 +314,126 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             .await
         }
     }
+}
+
+async fn dispatch_account(
+    cli: &Cli,
+    action: &AccountAction,
+) -> Result<serde_json::Value, CliError> {
+    let config_path = crate::config::default_config_path();
+    let store: Arc<dyn SecretStore> = Arc::new(KeyringStore);
+    match action {
+        AccountAction::Add {
+            alias,
+            account_id,
+            flow,
+            client_id,
+            cert_id,
+            key,
+            port,
+            paste,
+        } => match flow {
+            AccountFlowArg::M2m => {
+                let client_id =
+                    require_flag(client_id.as_deref(), "--flow m2m requires --client-id")?;
+                let cert_id = require_flag(cert_id.as_deref(), "--flow m2m requires --cert-id")?;
+                let key = key.as_deref().ok_or_else(|| {
+                    CliError::Usage("account add --flow m2m requires --key".into())
+                })?;
+                account::add_m2m(
+                    &config_path,
+                    store.as_ref(),
+                    alias,
+                    account_id,
+                    client_id,
+                    cert_id,
+                    key,
+                )
+            }
+            AccountFlowArg::AuthCode => {
+                let client_id = require_flag(
+                    client_id.as_deref(),
+                    "--flow auth-code requires --client-id",
+                )?;
+                account::add_auth_code(
+                    &config_path,
+                    store.clone(),
+                    alias,
+                    account_id,
+                    client_id,
+                    *port,
+                    *paste,
+                )
+                .await
+            }
+        },
+        AccountAction::List => account::list(&config_path),
+        AccountAction::SetDefault { alias } => account::set_default(&config_path, alias),
+        AccountAction::Remove { alias } => account::remove(&config_path, store.as_ref(), alias),
+        AccountAction::Test {
+            alias,
+            reauth,
+            port,
+            paste,
+        } => {
+            let config = Config::load(&config_path)?;
+            let env_alias = std::env::var("NETSUITE_ACCOUNT").ok();
+            let resolved_alias = config.resolve_alias(
+                alias.as_deref().or(cli.account.as_deref()),
+                env_alias.as_deref(),
+            )?;
+            if *reauth {
+                reauthenticate(
+                    &config,
+                    &config_path,
+                    store.clone(),
+                    &resolved_alias,
+                    *port,
+                    *paste,
+                )
+                .await?;
+            }
+            let context = context_for(Some(&resolved_alias))?;
+            account::test(&context.client, &resolved_alias).await
+        }
+    }
+}
+
+fn require_flag<'flag>(value: Option<&'flag str>, message: &str) -> Result<&'flag str, CliError> {
+    value.ok_or_else(|| CliError::Usage(format!("account add {message}")))
+}
+
+async fn reauthenticate(
+    config: &Config,
+    config_path: &std::path::Path,
+    store: Arc<dyn SecretStore>,
+    alias: &str,
+    port: u16,
+    paste: bool,
+) -> Result<(), CliError> {
+    let entry = &config.accounts[alias];
+    let AuthFlow::AuthCode = entry.flow else {
+        return Err(CliError::Usage(
+            "--reauth is only supported for auth-code accounts".into(),
+        ));
+    };
+    let secrets = store
+        .get(alias)?
+        .ok_or_else(|| CliError::Auth(format!("no credentials stored for '{alias}'")))?;
+    let AccountSecrets::AuthCode { client_id, .. } = secrets else {
+        return Err(CliError::Auth(format!(
+            "stored credentials for '{alias}' do not match its configured flow"
+        )));
+    };
+    account::add_auth_code(
+        config_path,
+        store,
+        alias,
+        &entry.account_id,
+        &client_id,
+        port,
+        paste,
+    )
+    .await?;
+    Ok(())
 }

@@ -2,7 +2,7 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use rand::Rng;
@@ -306,6 +306,10 @@ fn read_pasted_redirect(expected_state: &str) -> Result<String, CliError> {
     parse_callback_query(query, expected_state)
 }
 
+// A stalled or malicious local connection that opens the TLS session but never finishes
+// sending its request must not be able to hang `account add` forever.
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn listen_for_redirect(port: u16, expected_state: &str) -> Result<String, CliError> {
     let acceptor = build_loopback_tls_acceptor()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -328,10 +332,13 @@ async fn listen_for_redirect(port: u16, expected_state: &str) -> Result<String, 
             continue;
         };
 
-        let request_head = match read_request_head(&mut tls_stream).await {
-            Ok(head) => head,
-            Err(_) => continue,
-        };
+        let request_head =
+            match tokio::time::timeout(CONNECTION_READ_TIMEOUT, read_request_head(&mut tls_stream))
+                .await
+            {
+                Ok(Ok(head)) => head,
+                Ok(Err(_)) | Err(_) => continue,
+            };
         let Some(request_path) = request_line_path(&request_head) else {
             continue;
         };

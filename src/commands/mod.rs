@@ -1,3 +1,4 @@
+pub mod account;
 pub mod describe;
 pub mod record;
 pub mod suiteql;
