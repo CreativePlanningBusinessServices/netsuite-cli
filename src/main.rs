@@ -1,10 +1,5 @@
-mod error;
-mod output;
-mod account;
-mod config;
-mod secrets;
-
-use error::CliError;
+use netsuite_cli::error::CliError;
+use netsuite_cli::output;
 
 #[tokio::main]
 async fn main() {
