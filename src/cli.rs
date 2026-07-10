@@ -81,7 +81,7 @@ pub enum Command {
         after_help = "Examples:\n  netsuite-cli raw GET /services/rest/record/v1/customer/1\n  netsuite-cli raw POST /services/rest/record/v1/customer --data '{\"companyName\":\"Acme\"}'"
     )]
     Raw {
-        #[arg(value_enum)]
+        #[arg(value_enum, ignore_case = true)]
         method: HttpMethodArg,
         path: String,
         /// Repeatable key=value query parameter
@@ -182,7 +182,7 @@ pub enum RestletAction {
         #[arg(long)]
         deploy: String,
         /// Required; no default, to avoid surprising an agent about side effects
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, ignore_case = true)]
         method: RestletMethodArg,
         /// Repeatable key=value param sent as a query parameter; RESTlets read these
         /// via request.parameters for GET/DELETE (use --data for POST/PUT bodies)
@@ -199,7 +199,7 @@ pub enum JobAction {
         after_help = "Example: netsuite-cli job submit POST /services/rest/record/v1/customer --data '{\"companyName\":\"Acme\"}' --idempotency-key 8f14e-uuid"
     )]
     Submit {
-        #[arg(value_enum)]
+        #[arg(value_enum, ignore_case = true)]
         method: HttpMethodArg,
         path: String,
         #[arg(long)]
@@ -728,6 +728,31 @@ mod tests {
         let clap_error = expect_parse_error(&["netsuite-cli", "--version"]);
         assert_eq!(clap_error.kind(), ErrorKind::DisplayVersion);
         assert_eq!(handle_clap_error(&clap_error), 0);
+    }
+
+    #[test]
+    fn http_method_args_are_case_insensitive() {
+        Cli::try_parse_from(["netsuite-cli", "raw", "GET", "/x"])
+            .expect("uppercase method should parse");
+        Cli::try_parse_from(["netsuite-cli", "raw", "get", "/x"])
+            .expect("lowercase method should parse");
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "restlet",
+            "call",
+            "--script",
+            "1",
+            "--deploy",
+            "1",
+            "--method",
+            "POST",
+        ])
+        .expect("uppercase restlet method should parse");
+    }
+
+    #[test]
+    fn bogus_http_method_still_errors() {
+        expect_parse_error(&["netsuite-cli", "raw", "BOGUS", "/x"]);
     }
 
     #[test]
