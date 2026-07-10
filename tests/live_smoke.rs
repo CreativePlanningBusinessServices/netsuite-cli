@@ -46,11 +46,16 @@ async fn metadata_catalog_is_reachable_with_stored_credentials() {
     let body = response
         .body
         .expect("metadata catalog response has a JSON body");
-    assert!(
-        body["items"]
+
+    // With ?select=, NetSuite returns the record type object directly; without it,
+    // the response is an {"items": [...]} collection.
+    let describes_currency = body["name"] == "currency"
+        || body["items"]
             .as_array()
-            .is_some_and(|items| !items.is_empty()),
-        "expected at least the currency record type in the catalog: {body}"
+            .is_some_and(|items| items.iter().any(|item| item["name"] == "currency"));
+    assert!(
+        describes_currency,
+        "expected the currency record type in the catalog: {body}"
     );
 }
 
