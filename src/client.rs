@@ -45,8 +45,10 @@ impl NsClient {
     ) -> Result<NsResponse, CliError> {
         let url = if path.starts_with("https://") || path.starts_with("http://") {
             path.to_string()
-        } else {
+        } else if path.starts_with('/') {
             format!("{}{}", self.base, path)
+        } else {
+            format!("{}/{}", self.base, path)
         };
 
         let mut reauthorized = false;

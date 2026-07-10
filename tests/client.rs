@@ -59,6 +59,22 @@ async fn sends_bearer_and_parses_json_body() {
 }
 
 #[tokio::test]
+async fn inserts_leading_slash_when_joining_relative_path_without_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/no-slash/path"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&server)
+        .await;
+
+    let response = client(&server)
+        .request(reqwest::Method::GET, "no-slash/path", &[], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
 async fn captures_location_on_204_create() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
