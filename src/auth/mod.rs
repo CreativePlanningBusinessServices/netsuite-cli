@@ -1,3 +1,4 @@
+pub mod authcode;
 pub mod m2m;
 
 use std::future::Future;

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::account;
 use crate::auth::TokenProvider;
+use crate::auth::authcode::AuthCodeProvider;
 use crate::auth::m2m::{M2mConfig, M2mProvider};
 use crate::client::NsClient;
 use crate::config::{AuthFlow, Config};
@@ -76,8 +77,14 @@ fn provider_for(
                 store,
             )))
         }
-        (AuthFlow::AuthCode, AccountSecrets::AuthCode { .. }) => {
-            Err(CliError::Auth("auth-code provider lands in Task 9".into())) // replaced in Task 9
+        (AuthFlow::AuthCode, AccountSecrets::AuthCode { client_id, .. }) => {
+            Ok(Arc::new(AuthCodeProvider::new(
+                reqwest::Client::new(),
+                alias.to_string(),
+                token_url,
+                client_id,
+                store,
+            )))
         }
         _ => Err(CliError::Auth(format!(
             "stored credentials for '{alias}' do not match its configured flow"
