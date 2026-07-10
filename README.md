@@ -10,6 +10,30 @@ switching between them with one flag.
 
 Basecamp task: https://basecamp.com/2808802/projects/8218129/todos/518729835
 
+## Quick start for AI agents
+
+```bash
+# Install: grab the release asset for your platform (or: cargo install --git <repo URL>)
+gh release download -R CreativePlanningBusinessServices/netsuite-cli \
+    --pattern "*aarch64-apple-darwin*" && unzip -o netsuite-cli-*.zip
+install -m 0755 netsuite-cli "$HOME/.local/bin/"   # any writable PATH dir
+
+# Bootstrap (credentials: see "NetSuite setup" below — one-time human step)
+netsuite-cli account add <alias> --account-id <ID> --flow m2m \
+    --client-id <CLIENT_ID> --cert-id <CERT_ID> --key <key.pem>
+netsuite-cli account test --account <alias>
+
+# The three commands that cover most work
+netsuite-cli describe --list                       # what record types exist?
+netsuite-cli suiteql "SELECT id, entityid FROM customer" --limit 10
+netsuite-cli record get customer <id> --expand-sub-resources
+```
+
+Everything prints JSON on stdout; errors are JSON on stderr with deterministic
+exit codes (see [Output contract](#output-contract)). Agents should load
+[`skills/netsuite-cli/SKILL.md`](skills/netsuite-cli/SKILL.md) for command
+selection, recipes, and error triage.
+
 ## Install
 
 Download the archive for your platform from the [Releases page](https://github.com/CreativePlanningBusinessServices/netsuite-cli/releases),
