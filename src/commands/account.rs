@@ -120,11 +120,16 @@ pub fn remove(config_path: &Path, store: &dyn SecretStore, alias: &str) -> Resul
             "unknown account alias '{alias}'; run `netsuite-cli account list`"
         )));
     }
-    store.delete(alias)?;
     if config.default_account.as_deref() == Some(alias) {
         config.default_account = None;
     }
+    // Save the config removal before deleting keychain secrets: if the secrets delete below
+    // fails after this, the alias is already gone from config (invisible to the CLI, and a
+    // future `account add` for the same alias just overwrites the orphaned keychain entry).
+    // The reverse order can leave the alias in config with no secrets behind it, which then
+    // surfaces as a confusing "no credentials stored" error on unrelated commands later.
     config.save(config_path)?;
+    store.delete(alias)?;
     Ok(json!({"removed": alias}))
 }
 

@@ -225,6 +225,55 @@ fn remove_unknown_alias_is_usage_error() {
     assert!(matches!(remove_result, Err(CliError::Usage(_))));
 }
 
+/// Proves the config removal is saved before the keychain delete is attempted: if the config
+/// write fails, the alias must still resolve and its secrets must be untouched, rather than
+/// being deleted from the keychain under an alias config still thinks exists.
+#[test]
+#[cfg(unix)]
+fn remove_leaves_alias_and_secrets_intact_when_config_save_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+    let key_path = temp_dir.path().join("netsuite-m2m.pem");
+    std::fs::write(&key_path, key_pem()).unwrap();
+    let store = MemoryStore::default();
+    account::add_m2m(
+        &config_path,
+        &store,
+        "prod",
+        "1234567",
+        "CID",
+        "KID",
+        &key_path,
+    )
+    .unwrap();
+
+    // Make the config file read-only so `Config::save` fails inside `remove`, without touching
+    // permissions on other files in the temp dir (e.g. the key file already read above).
+    let original_permissions = std::fs::metadata(&config_path).unwrap().permissions();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let remove_result = account::remove(&config_path, &store, "prod");
+
+    // Restore write permission before any assertion can panic and skip cleanup.
+    std::fs::set_permissions(&config_path, original_permissions).unwrap();
+
+    assert!(
+        matches!(remove_result, Err(CliError::Usage(_))),
+        "expected a config-save Usage error, got {remove_result:?}"
+    );
+    let config = Config::load(&config_path).unwrap();
+    assert!(
+        config.accounts.contains_key("prod"),
+        "alias must still resolve after a failed config save"
+    );
+    assert!(
+        store.get("prod").unwrap().is_some(),
+        "secrets must be untouched when config save fails before the keychain delete"
+    );
+}
+
 #[test]
 fn set_default_validates_alias_exists() {
     let temp_dir = tempfile::tempdir().unwrap();
