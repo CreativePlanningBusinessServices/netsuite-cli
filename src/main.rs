@@ -1,5 +1,7 @@
 mod error;
 mod output;
+mod account;
+mod config;
 
 use error::CliError;
 
