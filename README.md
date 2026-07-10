@@ -129,6 +129,14 @@ default 48h validity, 168h max rotation window) and `netsuite-cli` persists the 
 automatically — you should never need to re-run `account add` unless the rotation window lapses,
 in which case re-run it or use `account test --reauth`.
 
+**Concurrent use:** because refresh tokens are one-time-use and rotate on every refresh, avoid
+running multiple `netsuite-cli` commands concurrently against the same `auth-code` account when
+its cached access token has expired — if two invocations race to refresh at once, only one
+rotated refresh token wins and the loser's account is left needing re-authentication. `m2m`
+accounts have no such constraint (each request is signed independently, with nothing that
+rotates or can be raced), so they're the better choice when running commands in parallel, e.g.
+from multiple agents.
+
 ## Usage
 
 ### Accounts and switching
