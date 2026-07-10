@@ -44,12 +44,19 @@ fn install_update() -> Result<Value, CliError> {
 }
 
 fn build_updater() -> Result<Box<dyn self_update::update::ReleaseUpdate>, CliError> {
-    self_update::backends::github::Update::configure()
+    let mut updater = self_update::backends::github::Update::configure();
+    updater
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name("netsuite-cli")
         .show_download_progress(false)
-        .current_version(env!("CARGO_PKG_VERSION"))
+        .current_version(env!("CARGO_PKG_VERSION"));
+    // The repo is private, so listing/downloading releases needs a token
+    // (a GitHub PAT with `repo` scope, or `gh auth token`).
+    if let Ok(github_token) = std::env::var("GITHUB_TOKEN") {
+        updater.auth_token(&github_token);
+    }
+    updater
         .build()
         .map_err(|update_error| CliError::Network(update_error.to_string()))
 }
