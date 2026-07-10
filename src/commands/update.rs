@@ -25,11 +25,24 @@ fn check_for_update() -> Result<Value, CliError> {
     let latest_release = updater
         .get_latest_release()
         .map_err(|update_error| CliError::Network(update_error.to_string()))?;
+    let update_available = update_available(current_version, &latest_release.version)?;
     Ok(json!({
         "current": current_version,
         "latest": latest_release.version,
-        "updateAvailable": latest_release.version != current_version,
+        "updateAvailable": update_available,
     }))
+}
+
+/// GitHub release tags are commonly spelled with a leading `v` (`v0.2.0`) while
+/// `CARGO_PKG_VERSION` never has one, so plain string inequality misfires on semver-equivalent
+/// spellings. Strip the prefix and compare with real semver ordering instead.
+fn update_available(current: &str, latest: &str) -> Result<bool, CliError> {
+    let latest_stripped = latest.strip_prefix(['v', 'V']).unwrap_or(latest);
+    self_update::version::bump_is_greater(current, latest_stripped).map_err(|version_error| {
+        CliError::Network(format!(
+            "cannot compare versions '{current}' and '{latest}': {version_error}"
+        ))
+    })
 }
 
 fn install_update() -> Result<Value, CliError> {
@@ -59,4 +72,24 @@ fn build_updater() -> Result<Box<dyn self_update::update::ReleaseUpdate>, CliErr
     updater
         .build()
         .map_err(|update_error| CliError::Network(update_error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_available_treats_v_prefixed_equal_versions_as_no_update() {
+        assert!(!update_available("0.1.0", "v0.1.0").unwrap());
+    }
+
+    #[test]
+    fn update_available_detects_a_newer_release() {
+        assert!(update_available("0.1.0", "0.2.0").unwrap());
+    }
+
+    #[test]
+    fn update_available_is_false_when_current_is_newer_than_latest() {
+        assert!(!update_available("0.2.0", "0.1.0").unwrap());
+    }
 }
