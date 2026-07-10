@@ -130,10 +130,31 @@ fn encoding_key_for_pem(pem: &str) -> Result<(EncodingKey, Algorithm), CliError>
         return Ok((rsa_key, Algorithm::PS256));
     }
     if let Ok(ec_key) = EncodingKey::from_ec_pem(pem.as_bytes()) {
-        return Ok((ec_key, Algorithm::ES256));
+        let algorithm = ec_algorithm_for_key(&ec_key)?;
+        return Ok((ec_key, algorithm));
     }
     Err(CliError::Auth(
         "private key is not a valid RSA or EC PEM".into(),
+    ))
+}
+
+/// `EncodingKey::from_ec_pem` accepts P-256, P-384, and P-521 keys alike but doesn't expose
+/// which curve it parsed, and jsonwebtoken only implements ES256 (P-256) and ES384 (P-384) —
+/// not ES512 (P-521). Signing with the wrong algorithm for the curve fails deep inside the
+/// crypto backend with an unhelpful error, so probe by trial-signing a throwaway claims object
+/// with each supported algorithm and use whichever one the key actually accepts.
+fn ec_algorithm_for_key(key: &EncodingKey) -> Result<Algorithm, CliError> {
+    let probe_claims = json!({"probe": true});
+    for algorithm in [Algorithm::ES256, Algorithm::ES384] {
+        let header = Header::new(algorithm);
+        if jsonwebtoken::encode(&header, &probe_claims, key).is_ok() {
+            return Ok(algorithm);
+        }
+    }
+    Err(CliError::Auth(
+        "EC private key does not match a supported curve; the NetSuite CLI's JWT library \
+         supports P-256 (ES256) and P-384 (ES384) only — P-521 keys are not supported"
+            .into(),
     ))
 }
 
@@ -183,6 +204,23 @@ mod tests {
         assert_eq!(claims["iat"], 1_700_000_000_u64);
         assert_eq!(claims["exp"], 1_700_000_000_u64 + 3300);
         assert!(claims["jti"].as_str().unwrap().len() >= 16);
+    }
+
+    #[test]
+    fn p384_ec_key_signs_with_es384() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let config = M2mConfig {
+            token_url:
+                "https://123456-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token"
+                    .into(),
+            client_id: "myclientid".into(),
+            cert_id: "certkid123".into(),
+            private_key_pem: key_pair.serialize_pem(),
+            scopes: vec!["rest_webservices".into()],
+        };
+        let assertion = build_assertion(&config, 1_700_000_000).unwrap();
+        let header = decode_segment(assertion.split('.').next().unwrap());
+        assert_eq!(header["alg"], "ES384");
     }
 
     #[test]
