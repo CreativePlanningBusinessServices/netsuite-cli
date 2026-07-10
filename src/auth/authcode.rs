@@ -310,6 +310,11 @@ fn read_pasted_redirect(expected_state: &str) -> Result<String, CliError> {
 // sending its request must not be able to hang `account add` forever.
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Repeated TLS probe connections (e.g. from port scanners or browser cert-warning retries)
+// each reset the per-connection timeout, so the accept loop also needs an overall deadline
+// on the whole login attempt.
+const LOGIN_FLOW_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn listen_for_redirect(port: u16, expected_state: &str) -> Result<String, CliError> {
     let acceptor = build_loopback_tls_acceptor()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -321,6 +326,24 @@ async fn listen_for_redirect(port: u16, expected_state: &str) -> Result<String, 
         })?;
     eprintln!("Waiting for the OAuth redirect on https://localhost:{port}/callback …");
 
+    match tokio::time::timeout(
+        LOGIN_FLOW_TIMEOUT,
+        accept_callback(listener, acceptor, expected_state),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(CliError::Auth(
+            "login timed out after 5 minutes; re-run account add (or use --paste)".into(),
+        )),
+    }
+}
+
+async fn accept_callback(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    expected_state: &str,
+) -> Result<String, CliError> {
     loop {
         let (tcp_stream, _peer_addr) = listener
             .accept()
