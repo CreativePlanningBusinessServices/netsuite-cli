@@ -91,12 +91,37 @@ async fn resolve_single_task_id(client: &NsClient, job_id: &str) -> Result<Strin
     }
 }
 
+/// The task-list schema only guarantees `links` with a self href ending in
+/// `.../task/{taskId}`; `id` is a speculative convenience field some responses
+/// omit, so it falls back to deriving the id from the self link's href.
 fn extract_task_ids(task_list: &Value) -> Vec<String> {
     task_list["items"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .iter()
-        .filter_map(|item| item["id"].as_str().map(str::to_string))
+        .filter_map(extract_task_id)
         .collect()
+}
+
+fn extract_task_id(item: &Value) -> Option<String> {
+    if let Some(id) = item["id"].as_str() {
+        return Some(id.to_string());
+    }
+    let href = self_link_href(item)?;
+    let task_id = href.rsplit('/').next().unwrap_or_default();
+    if task_id.is_empty() {
+        None
+    } else {
+        Some(task_id.to_string())
+    }
+}
+
+fn self_link_href(item: &Value) -> Option<&str> {
+    let links = item["links"].as_array()?;
+    let self_link = links
+        .iter()
+        .find(|link| link["rel"] == "self")
+        .or_else(|| links.first())?;
+    self_link["href"].as_str()
 }

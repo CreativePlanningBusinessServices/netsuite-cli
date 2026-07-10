@@ -252,7 +252,15 @@ async fn job_result_without_task_errors_on_multiple_tasks() {
     Mock::given(method("GET"))
         .and(path("/services/rest/async/v1/job/9001/task/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "items": [{"id": "9001.1"}, {"id": "9001.2"}]
+            "items": [
+                {"id": "9001.1"},
+                {
+                    "links": [{
+                        "rel": "self",
+                        "href": "/services/rest/async/v1/job/9001/task/9001.2"
+                    }]
+                }
+            ]
         })))
         .mount(&server)
         .await;
@@ -266,6 +274,33 @@ async fn job_result_without_task_errors_on_multiple_tasks() {
         }
         other => panic!("expected CliError::Usage, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn job_result_without_task_auto_picks_single_task_from_links_only_item() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/rest/async/v1/job/9001/task/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "links": [{
+                    "rel": "self",
+                    "href": "/services/rest/async/v1/job/9001/task/9001.1"
+                }]
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/services/rest/async/v1/job/9001/task/9001.1/result"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "647"})))
+        .mount(&server)
+        .await;
+
+    let result = job::result(&client_for(&server), "9001", None)
+        .await
+        .unwrap();
+    assert_eq!(result["id"], "647");
 }
 
 #[tokio::test]
