@@ -46,6 +46,9 @@ pub fn add_m2m(
     }
 
     store.set(alias, &secrets)?;
+    // Re-registering an alias must not leave a stale cached bearer token from the previous
+    // credentials being served until it expires or 401s.
+    store.delete_token(alias)?;
     write_account_entry(config_path, alias, account_id, AuthFlow::M2m)?;
     Ok(json!({"alias": alias, "accountId": account_id, "flow": "m2m"}))
 }
@@ -196,6 +199,10 @@ fn store_auth_code_account(
             refresh_token: token.refresh_token.clone(),
         },
     )?;
+    // Re-registering an alias must not leave a stale cached bearer token from the previous
+    // credentials around; the fresh token is set right below, but clear first for consistency
+    // with add_m2m and in case set_token below is ever skipped or fails.
+    store.delete_token(alias)?;
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -316,6 +323,41 @@ mod tests {
         assert!(
             store.get("prod").unwrap().is_none(),
             "oversized secrets must not be persisted"
+        );
+    }
+
+    #[test]
+    fn add_m2m_clears_stale_cached_token_on_reregister() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let key_path = temp_dir.path().join("key.pem");
+        let key_pem = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        let store = MemoryStore::default();
+        store
+            .set_token(
+                "prod",
+                &CachedToken {
+                    access_token: "STALE".into(),
+                    expires_at_epoch: u64::MAX,
+                },
+            )
+            .unwrap();
+
+        add_m2m(
+            &config_path,
+            &store,
+            "prod",
+            "1234567",
+            "CID",
+            "KID",
+            &key_path,
+        )
+        .unwrap();
+
+        assert!(
+            store.get_token("prod").unwrap().is_none(),
+            "stale cached token must be cleared when re-registering an alias"
         );
     }
 

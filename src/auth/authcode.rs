@@ -347,16 +347,19 @@ async fn listen_for_redirect(port: u16, expected_state: &str) -> Result<String, 
             let _ = tls_stream.write_all(NOT_FOUND_RESPONSE).await;
             continue;
         }
-        let _ = tls_stream
-            .write_all(login_complete_response().as_bytes())
-            .await;
-        let _ = tls_stream.shutdown().await;
 
         let query = request_path
             .split_once('?')
             .map(|(_, query)| query)
             .unwrap_or("");
-        return parse_callback_query(query, expected_state);
+        let callback_result = parse_callback_query(query, expected_state);
+
+        let _ = tls_stream
+            .write_all(callback_response(&callback_result).as_bytes())
+            .await;
+        let _ = tls_stream.shutdown().await;
+
+        return callback_result;
     }
 }
 
@@ -419,8 +422,19 @@ fn request_line_path(request_head: &str) -> Option<&str> {
 const NOT_FOUND_RESPONSE: &[u8] =
     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
-fn login_complete_response() -> String {
-    let body = "<html><body>Login complete \u{2014} return to your terminal.</body></html>";
+/// Pure helper so the browser's callback page reflects the actual outcome instead of always
+/// claiming success. Never interpolates raw query values into the body — only these two fixed,
+/// safe strings are ever shown — so a malicious `?error=` or `?code=` value can't be reflected
+/// into the response.
+fn callback_response_body(callback_result: &Result<String, CliError>) -> &'static str {
+    match callback_result {
+        Ok(_) => "<html><body>Login complete \u{2014} return to your terminal.</body></html>",
+        Err(_) => "<html><body>Login failed \u{2014} return to your terminal.</body></html>",
+    }
+}
+
+fn callback_response(callback_result: &Result<String, CliError>) -> String {
+    let body = callback_response_body(callback_result);
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -483,5 +497,22 @@ mod tests {
         assert_eq!(parsed, "abc123");
         assert!(parse_callback_query("code=abc&state=WRONG", "EXPECTED").is_err());
         assert!(parse_callback_query("error=access_denied&state=EXPECTED", "EXPECTED").is_err());
+    }
+
+    #[test]
+    fn callback_response_body_reflects_success_or_failure() {
+        let success = callback_response_body(&Ok("abc123".to_string()));
+        assert!(success.contains("Login complete"));
+
+        let denied = callback_response_body(&Err(CliError::Auth(
+            "authorization denied: access_denied".into(),
+        )));
+        assert!(denied.contains("Login failed"));
+        assert!(!denied.contains("access_denied"));
+
+        let state_mismatch = callback_response_body(&Err(CliError::Auth(
+            "state mismatch in OAuth callback — possible CSRF, aborting".into(),
+        )));
+        assert!(state_mismatch.contains("Login failed"));
     }
 }
