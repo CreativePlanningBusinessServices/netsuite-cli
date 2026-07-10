@@ -226,27 +226,28 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
             format,
             refresh,
         } => {
-            let context = context_for(cli.account.as_deref())?;
-            match (*list, record_type) {
-                (true, _) => describe::list_types(&context.client).await,
-                (false, None) => Err(CliError::Usage(
+            if !*list && record_type.is_none() {
+                return Err(CliError::Usage(
                     "describe requires either a record type or --list, e.g. `netsuite-cli describe --list` or `netsuite-cli describe customer`".into(),
-                )),
-                (false, Some(record_type)) => {
-                    let cache_dir = crate::config::default_cache_dir()
-                        .join("metadata")
-                        .join(&context.alias);
-                    describe::describe_type(
-                        &context.client,
-                        record_type,
-                        *format,
-                        &cache_dir,
-                        *refresh,
-                        METADATA_CACHE_TTL,
-                    )
-                    .await
-                }
+                ));
             }
+            let context = context_for(cli.account.as_deref())?;
+            if *list {
+                return describe::list_types(&context.client).await;
+            }
+            let record_type = record_type.as_ref().expect("checked above");
+            let cache_dir = crate::config::default_cache_dir()
+                .join("metadata")
+                .join(&context.alias);
+            describe::describe_type(
+                &context.client,
+                record_type,
+                *format,
+                &cache_dir,
+                *refresh,
+                METADATA_CACHE_TTL,
+            )
+            .await
         }
     }
 }
