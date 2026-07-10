@@ -437,3 +437,99 @@ async fn reauthenticate(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AccountEntry;
+    use crate::secrets::MemoryStore;
+
+    #[test]
+    fn require_flag_returns_value_when_present() {
+        assert_eq!(
+            require_flag(Some("cid"), "--flow m2m requires --client-id").unwrap(),
+            "cid"
+        );
+    }
+
+    #[test]
+    fn require_flag_errors_naming_missing_flag() {
+        let error = require_flag(None, "--flow m2m requires --client-id").unwrap_err();
+        match error {
+            CliError::Usage(message) => assert!(message.contains("--client-id")),
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_account_missing_key_arm_matches_require_flag_message_shape() {
+        // The `--key` check in dispatch_account's M2m arm is hand-rolled rather than going
+        // through require_flag; it should still surface a Usage error naming `--key` and
+        // matching the same "account add <detail>" message shape require_flag produces.
+        let cli = Cli {
+            account: None,
+            pretty: false,
+            command: Command::Account {
+                action: AccountAction::List,
+            },
+        };
+        let action = AccountAction::Add {
+            alias: "prod".into(),
+            account_id: "1234567".into(),
+            flow: AccountFlowArg::M2m,
+            client_id: Some("CID".into()),
+            cert_id: Some("KID".into()),
+            key: None,
+            port: 8899,
+            paste: false,
+        };
+
+        // Neither client_id nor cert_id is missing, so this reaches the --key check
+        // without ever touching the config file or keyring.
+        let error = dispatch_account(&cli, &action).await.unwrap_err();
+        match error {
+            CliError::Usage(message) => {
+                assert!(message.starts_with("account add "));
+                assert!(message.contains("--key"));
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    fn config_with_m2m_alias(alias: &str) -> Config {
+        let mut config = Config::default();
+        config.accounts.insert(
+            alias.to_string(),
+            AccountEntry {
+                account_id: "1234567".into(),
+                flow: AuthFlow::M2m,
+            },
+        );
+        config.default_account = Some(alias.to_string());
+        config
+    }
+
+    #[tokio::test]
+    async fn reauthenticate_rejects_m2m_flow_account_with_usage_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let config = config_with_m2m_alias("prod");
+        config.save(&config_path).unwrap();
+
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        let error = reauthenticate(&config, &config_path, store, "prod", 8899, false)
+            .await
+            .unwrap_err();
+
+        match error {
+            CliError::Usage(message) => {
+                let lowercase_message = message.to_lowercase();
+                assert!(
+                    lowercase_message.contains("reauth") || lowercase_message.contains("auth-code"),
+                    "expected message to mention reauth/auth-code, got: {message}"
+                );
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+}
