@@ -94,10 +94,10 @@ impl TokenProvider for M2mProvider {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            if let Some(cached) = self.store.get_token(&self.alias)? {
-                if cached.is_valid_at(now_epoch) {
-                    return Ok(cached.access_token);
-                }
+            if let Some(cached) = self.store.get_token(&self.alias)?
+                && cached.is_valid_at(now_epoch)
+            {
+                return Ok(cached.access_token);
             }
             self.fetch_fresh_token().await
         })

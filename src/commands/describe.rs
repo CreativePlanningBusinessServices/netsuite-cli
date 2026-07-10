@@ -57,10 +57,8 @@ pub async fn describe_type(
     cache_ttl: Duration,
 ) -> Result<Value, CliError> {
     let cache_file = cache_dir.join(format!("{record_type}.{}.json", format.cache_suffix()));
-    if !refresh {
-        if let Some(cached_metadata) = read_fresh_cache(&cache_file, cache_ttl) {
-            return Ok(cached_metadata);
-        }
+    if !refresh && let Some(cached_metadata) = read_fresh_cache(&cache_file, cache_ttl) {
+        return Ok(cached_metadata);
     }
     let response = client
         .request(
