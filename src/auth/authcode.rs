@@ -198,13 +198,28 @@ impl AuthCodeProvider {
                 ))
             })?;
         if let Some(rotated_refresh) = &token.refresh_token {
-            self.store.set(
-                &self.alias,
-                &AccountSecrets::AuthCode {
-                    client_id: self.client_id.clone(),
-                    refresh_token: Some(rotated_refresh.clone()),
-                },
-            )?;
+            self.store
+                .set(
+                    &self.alias,
+                    &AccountSecrets::AuthCode {
+                        client_id: self.client_id.clone(),
+                        refresh_token: Some(rotated_refresh.clone()),
+                    },
+                )
+                .map_err(|store_error| {
+                    // NetSuite has already invalidated the old refresh token server-side by
+                    // this point (refresh tokens are one-time-use), so there's no safe fallback
+                    // — the fresh access token we hold in memory can't be persisted for reuse
+                    // either without the rotated refresh token to pair it with next time. Make
+                    // the account's broken state explicit instead of surfacing a bare keychain
+                    // error that gives no indication the account now needs re-authentication.
+                    CliError::Auth(format!(
+                        "NetSuite rotated the refresh token but saving it to the keychain \
+                         failed ({store_error}); this account must be re-authenticated: run \
+                         `netsuite-cli account add {} --flow auth-code …`",
+                        self.alias
+                    ))
+                })?;
         }
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -2,9 +2,39 @@ use std::sync::Arc;
 
 use netsuite_cli::auth::TokenProvider;
 use netsuite_cli::auth::authcode::{AuthCodeProvider, exchange_code};
-use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
+use netsuite_cli::error::CliError;
+use netsuite_cli::secrets::{AccountSecrets, CachedToken, MemoryStore, SecretStore};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Wraps a `MemoryStore` but fails only `set` (the rotated-refresh-token write), so tests can
+/// prove what happens when persisting the rotated refresh token fails after a successful
+/// refresh — the interesting case, since `refresh` itself already succeeded and NetSuite has
+/// already invalidated the old refresh token server-side by that point.
+struct FailingOnSetStore {
+    inner: MemoryStore,
+}
+
+impl SecretStore for FailingOnSetStore {
+    fn get(&self, alias: &str) -> Result<Option<AccountSecrets>, CliError> {
+        self.inner.get(alias)
+    }
+    fn set(&self, _alias: &str, _secrets: &AccountSecrets) -> Result<(), CliError> {
+        Err(CliError::Auth("keychain unavailable".into()))
+    }
+    fn delete(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete(alias)
+    }
+    fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError> {
+        self.inner.get_token(alias)
+    }
+    fn set_token(&self, alias: &str, token: &CachedToken) -> Result<(), CliError> {
+        self.inner.set_token(alias, token)
+    }
+    fn delete_token(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete_token(alias)
+    }
+}
 
 #[tokio::test]
 async fn exchange_sends_pkce_verifier_and_public_client_id() {
@@ -109,5 +139,55 @@ async fn expired_refresh_token_yields_actionable_auth_error() {
     assert!(
         error.to_string().contains("account add"),
         "should tell the user to re-authenticate: {error}"
+    );
+}
+
+#[tokio::test]
+async fn failed_rotated_refresh_persist_yields_explicit_reauth_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=RT_OLD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "AT2", "refresh_token": "RT_NEW", "expires_in": 3600, "token_type": "bearer"
+        })))
+        .mount(&server)
+        .await;
+
+    // Seed the initial refresh token through a plain MemoryStore (FailingOnSetStore fails all
+    // `set` calls, including this one), then wrap it so only the rotation write fails.
+    let seeded_store = MemoryStore::default();
+    seeded_store
+        .set(
+            "dev",
+            &AccountSecrets::AuthCode {
+                client_id: "cid".into(),
+                refresh_token: Some("RT_OLD".into()),
+            },
+        )
+        .unwrap();
+    let store: Arc<dyn SecretStore> = Arc::new(FailingOnSetStore {
+        inner: seeded_store,
+    });
+
+    let provider = AuthCodeProvider::new(
+        reqwest::Client::new(),
+        "dev".into(),
+        format!("{}/token", server.uri()),
+        "cid".into(),
+        store,
+    );
+
+    let error = provider.access_token().await.unwrap_err();
+    assert!(matches!(error, CliError::Auth(_)));
+    let message = error.to_string();
+    assert!(
+        message.contains("rotated the refresh token") && message.contains("keychain"),
+        "error should explain the rotated token could not be saved: {message}"
+    );
+    assert!(
+        message.contains("account add") && message.contains("re-authenticated"),
+        "error should tell the user the account is broken and how to fix it: {message}"
     );
 }
