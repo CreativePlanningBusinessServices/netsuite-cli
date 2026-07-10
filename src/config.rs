@@ -30,20 +30,27 @@ impl Config {
         if !path.exists() {
             return Ok(Config::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .map_err(|read_error| CliError::Usage(format!("cannot read config {}: {read_error}", path.display())))?;
-        toml::from_str(&raw)
-            .map_err(|parse_error| CliError::Usage(format!("invalid config {}: {parse_error}", path.display())))
+        let raw = std::fs::read_to_string(path).map_err(|read_error| {
+            CliError::Usage(format!(
+                "cannot read config {}: {read_error}",
+                path.display()
+            ))
+        })?;
+        toml::from_str(&raw).map_err(|parse_error| {
+            CliError::Usage(format!("invalid config {}: {parse_error}", path.display()))
+        })
     }
 
     pub fn save(&self, path: &Path) -> Result<(), CliError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|io_error| CliError::Usage(format!("cannot create {}: {io_error}", parent.display())))?;
+            std::fs::create_dir_all(parent).map_err(|io_error| {
+                CliError::Usage(format!("cannot create {}: {io_error}", parent.display()))
+            })?;
         }
         let raw = toml::to_string_pretty(self).expect("config serializable");
-        std::fs::write(path, raw)
-            .map_err(|io_error| CliError::Usage(format!("cannot write {}: {io_error}", path.display())))
+        std::fs::write(path, raw).map_err(|io_error| {
+            CliError::Usage(format!("cannot write {}: {io_error}", path.display()))
+        })
     }
 
     pub fn resolve_alias(&self, flag: Option<&str>, env: Option<&str>) -> Result<String, CliError> {
@@ -55,7 +62,8 @@ impl Config {
                 "no account selected: pass --account, set NETSUITE_ACCOUNT, or run `netsuite-cli account set-default`".into()))?;
         if !self.accounts.contains_key(&alias) {
             return Err(CliError::Usage(format!(
-                "unknown account alias '{alias}'; run `netsuite-cli account list`")));
+                "unknown account alias '{alias}'; run `netsuite-cli account list`"
+            )));
         }
         Ok(alias)
     }
@@ -81,8 +89,20 @@ mod tests {
 
     fn sample_config() -> Config {
         let mut config = Config::default();
-        config.accounts.insert("prod".into(), AccountEntry { account_id: "1234567".into(), flow: AuthFlow::M2m });
-        config.accounts.insert("sb1".into(), AccountEntry { account_id: "1234567_SB1".into(), flow: AuthFlow::AuthCode });
+        config.accounts.insert(
+            "prod".into(),
+            AccountEntry {
+                account_id: "1234567".into(),
+                flow: AuthFlow::M2m,
+            },
+        );
+        config.accounts.insert(
+            "sb1".into(),
+            AccountEntry {
+                account_id: "1234567_SB1".into(),
+                flow: AuthFlow::AuthCode,
+            },
+        );
         config.default_account = Some("prod".into());
         config
     }
@@ -108,11 +128,20 @@ mod tests {
     #[test]
     fn alias_resolution_prefers_flag_then_env_then_default() {
         let config = sample_config();
-        assert_eq!(config.resolve_alias(Some("sb1"), Some("ignored")).unwrap(), "sb1");
+        assert_eq!(
+            config.resolve_alias(Some("sb1"), Some("ignored")).unwrap(),
+            "sb1"
+        );
         assert_eq!(config.resolve_alias(None, Some("sb1")).unwrap(), "sb1");
         assert_eq!(config.resolve_alias(None, None).unwrap(), "prod");
-        assert!(matches!(config.resolve_alias(Some("nope"), None), Err(crate::error::CliError::Usage(_))));
+        assert!(matches!(
+            config.resolve_alias(Some("nope"), None),
+            Err(crate::error::CliError::Usage(_))
+        ));
         let empty = Config::default();
-        assert!(matches!(empty.resolve_alias(None, None), Err(crate::error::CliError::Usage(_))));
+        assert!(matches!(
+            empty.resolve_alias(None, None),
+            Err(crate::error::CliError::Usage(_))
+        ));
     }
 }

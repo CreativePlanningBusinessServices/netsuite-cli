@@ -3,7 +3,10 @@ use serde_json::Value;
 
 pub fn print_json(value: &Value, pretty: bool) {
     if pretty {
-        println!("{}", serde_json::to_string_pretty(value).expect("serializable"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).expect("serializable")
+        );
     } else {
         println!("{}", serde_json::to_string(value).expect("serializable"));
     }

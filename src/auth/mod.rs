@@ -19,6 +19,8 @@ pub struct TokenResponse {
 // aren't object-safe without boxing, so access_token returns a boxed future explicitly
 // rather than using `impl Future` (which would require `Self: Sized`).
 pub trait TokenProvider: Send + Sync {
-    fn access_token<'life>(&'life self) -> Pin<Box<dyn Future<Output = Result<String, CliError>> + Send + 'life>>;
+    fn access_token<'life>(
+        &'life self,
+    ) -> Pin<Box<dyn Future<Output = Result<String, CliError>> + Send + 'life>>;
     fn invalidate(&self);
 }

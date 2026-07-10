@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use netsuite_cli::auth::m2m::{M2mConfig, M2mProvider};
 use netsuite_cli::auth::TokenProvider;
+use netsuite_cli::auth::m2m::{M2mConfig, M2mProvider};
 use netsuite_cli::secrets::MemoryStore;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -29,8 +29,12 @@ async fn exchanges_assertion_for_token_and_caches_it() {
         .mount(&server).await;
 
     let token_url = format!("{}/services/rest/auth/oauth2/v1/token", server.uri());
-    let provider = M2mProvider::new(reqwest::Client::new(), "prod".into(),
-        test_config(token_url), Arc::new(MemoryStore::default()));
+    let provider = M2mProvider::new(
+        reqwest::Client::new(),
+        "prod".into(),
+        test_config(token_url),
+        Arc::new(MemoryStore::default()),
+    );
 
     assert_eq!(provider.access_token().await.unwrap(), "ACCESS_1");
     assert_eq!(provider.access_token().await.unwrap(), "ACCESS_1");
@@ -39,15 +43,21 @@ async fn exchanges_assertion_for_token_and_caches_it() {
 #[tokio::test]
 async fn token_endpoint_error_maps_to_auth_error() {
     let server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/services/rest/auth/oauth2/v1/token"))
+    Mock::given(method("POST"))
+        .and(path("/services/rest/auth/oauth2/v1/token"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
             "error": "invalid_grant"
         })))
-        .mount(&server).await;
+        .mount(&server)
+        .await;
 
     let token_url = format!("{}/services/rest/auth/oauth2/v1/token", server.uri());
-    let provider = M2mProvider::new(reqwest::Client::new(), "prod".into(),
-        test_config(token_url), Arc::new(MemoryStore::default()));
+    let provider = M2mProvider::new(
+        reqwest::Client::new(),
+        "prod".into(),
+        test_config(token_url),
+        Arc::new(MemoryStore::default()),
+    );
 
     let error = provider.access_token().await.unwrap_err();
     assert!(matches!(error, netsuite_cli::error::CliError::Auth(_)));

@@ -26,41 +26,74 @@ pub struct M2mProvider {
 }
 
 impl M2mProvider {
-    pub fn new(http: reqwest::Client, alias: String, config: M2mConfig, store: Arc<dyn SecretStore>) -> Self {
-        M2mProvider { http, alias, config, store }
+    pub fn new(
+        http: reqwest::Client,
+        alias: String,
+        config: M2mConfig,
+        store: Arc<dyn SecretStore>,
+    ) -> Self {
+        M2mProvider {
+            http,
+            alias,
+            config,
+            store,
+        }
     }
 
     async fn fetch_fresh_token(&self) -> Result<String, CliError> {
-        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let assertion = build_assertion(&self.config, now_epoch)?;
-        let response = self.http.post(&self.config.token_url)
+        let response = self
+            .http
+            .post(&self.config.token_url)
             .form(&[
                 ("grant_type", "client_credentials"),
-                ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
                 ("client_assertion", assertion.as_str()),
             ])
-            .send().await
-            .map_err(|send_error| CliError::Network(format!("token request failed: {send_error}")))?;
+            .send()
+            .await
+            .map_err(|send_error| {
+                CliError::Network(format!("token request failed: {send_error}"))
+            })?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.map_err(|read_error| {
+            CliError::Network(format!("reading token response failed: {read_error}"))
+        })?;
         if !status.is_success() {
-            return Err(CliError::Auth(format!("token endpoint returned {status}: {body}")));
+            return Err(CliError::Auth(format!(
+                "token endpoint returned {status}: {body}"
+            )));
         }
         let token: TokenResponse = serde_json::from_str(&body)
             .map_err(|parse_error| CliError::Auth(format!("bad token response: {parse_error}")))?;
-        self.store.set_token(&self.alias, &CachedToken {
-            access_token: token.access_token.clone(),
-            expires_at_epoch: now_epoch + token.expires_in,
-        })?;
+        self.store.set_token(
+            &self.alias,
+            &CachedToken {
+                access_token: token.access_token.clone(),
+                expires_at_epoch: now_epoch + token.expires_in,
+            },
+        )?;
         Ok(token.access_token)
     }
 }
 
 impl TokenProvider for M2mProvider {
-    fn access_token<'life>(&'life self) -> Pin<Box<dyn Future<Output = Result<String, CliError>> + Send + 'life>> {
+    fn access_token<'life>(
+        &'life self,
+    ) -> Pin<Box<dyn Future<Output = Result<String, CliError>> + Send + 'life>> {
         Box::pin(async move {
-            let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let now_epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             if let Some(cached) = self.store.get_token(&self.alias)? {
                 if cached.is_valid_at(now_epoch) {
                     return Ok(cached.access_token);
@@ -99,7 +132,9 @@ fn encoding_key_for_pem(pem: &str) -> Result<(EncodingKey, Algorithm), CliError>
     if let Ok(ec_key) = EncodingKey::from_ec_pem(pem.as_bytes()) {
         return Ok((ec_key, Algorithm::ES256));
     }
-    Err(CliError::Auth("private key is not a valid RSA or EC PEM".into()))
+    Err(CliError::Auth(
+        "private key is not a valid RSA or EC PEM".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -112,14 +147,18 @@ mod tests {
     }
 
     fn decode_segment(segment: &str) -> serde_json::Value {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segment)
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
     #[test]
     fn assertion_has_verified_header_and_claims() {
         let config = M2mConfig {
-            token_url: "https://123456-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token".into(),
+            token_url:
+                "https://123456-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token"
+                    .into(),
             client_id: "myclientid".into(),
             cert_id: "certkid123".into(),
             private_key_pem: test_key_pem(),
@@ -137,7 +176,10 @@ mod tests {
         let claims = decode_segment(segments[1]);
         assert_eq!(claims["iss"], "myclientid");
         assert_eq!(claims["aud"], config.token_url);
-        assert_eq!(claims["scope"], serde_json::json!(["rest_webservices", "restlets"]));
+        assert_eq!(
+            claims["scope"],
+            serde_json::json!(["rest_webservices", "restlets"])
+        );
         assert_eq!(claims["iat"], 1_700_000_000_u64);
         assert_eq!(claims["exp"], 1_700_000_000_u64 + 3300);
         assert!(claims["jti"].as_str().unwrap().len() >= 16);
@@ -146,9 +188,15 @@ mod tests {
     #[test]
     fn unparseable_key_is_an_auth_error() {
         let config = M2mConfig {
-            token_url: "https://x/token".into(), client_id: "c".into(), cert_id: "k".into(),
-            private_key_pem: "not a pem".into(), scopes: vec![],
+            token_url: "https://x/token".into(),
+            client_id: "c".into(),
+            cert_id: "k".into(),
+            private_key_pem: "not a pem".into(),
+            scopes: vec![],
         };
-        assert!(matches!(build_assertion(&config, 0), Err(crate::error::CliError::Auth(_))));
+        assert!(matches!(
+            build_assertion(&config, 0),
+            Err(crate::error::CliError::Auth(_))
+        ));
     }
 }
