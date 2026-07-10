@@ -8,8 +8,6 @@ branch on outcome without screen-scraping. It covers record CRUD, SuiteQL, RESTl
 discovery, async jobs, and raw passthrough requests against any number of NetSuite accounts,
 switching between them with one flag.
 
-Basecamp task: https://basecamp.com/2808802/projects/8218129/todos/518729835
-
 ## Quick start for AI agents
 
 ```bash
@@ -47,15 +45,6 @@ published for:
 
 Once installed, `netsuite-cli update` checks GitHub Releases for a newer version and installs it
 in place — see [Updating](#updating).
-
-> **The repo is currently private.** Both downloading a release asset via the GitHub UI/API and
-> running `netsuite-cli update` need authentication. For `update`, set `GITHUB_TOKEN` to a GitHub
-> personal access token with `repo` scope (or reuse the `gh` CLI's token):
->
-> ```bash
-> export GITHUB_TOKEN=$(gh auth token)
-> netsuite-cli update
-> ```
 
 ## NetSuite setup
 
@@ -361,8 +350,6 @@ exit: 2
 netsuite-cli update --check   # report whether a newer release exists; installs nothing
 netsuite-cli update           # download and install the latest release in place
 ```
-
-See [Install](#install) for the `GITHUB_TOKEN` requirement while the repo is private.
 
 ## Development
 
