@@ -2,6 +2,33 @@
 name = "netsuite-cli"
 version = "0.1.0"
 edition = "2024"
-description = "NetSuite REST API CLI for AI agents — multi-account OAuth, record endpoints, SuiteQL, metadata"
+description = "NetSuite REST API CLI for AI agents — multi-account OAuth, records, SuiteQL, metadata"
 
 [dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+jsonwebtoken = "9"
+directories = "6"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+toml = "0.8"
+webbrowser = "1"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+self_update = { version = "0.42", default-features = false, features = ["rustls", "archive-zip", "compression-zip-deflate"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+rcgen = "0.13"

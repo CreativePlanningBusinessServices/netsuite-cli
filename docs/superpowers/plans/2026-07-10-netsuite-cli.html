@@ -1,0 +1,2062 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli — Implementation Plan (2026-07-10)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e3; --warn-border:#e6c98a; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:920px; padding:2.5rem 1.5rem 4rem; font:15px/1.55 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.3rem; margin:2.4rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h3 { font-size:1.05rem; margin:1.5rem 0 .4rem; }
+  h2.task { background:var(--accent-soft); padding:.45rem .7rem; border-radius:8px; border-bottom:none; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.2rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em; }
+  code { background:var(--code-bg); padding:.1em .3em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.8rem 1rem; overflow-x:auto; line-height:1.45; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:.8rem 0; font-size:.9rem; }
+  th, td { border:1px solid var(--border); padding:.4rem .6rem; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul { padding-left:1.3rem; } li { margin:.2rem 0; }
+  .step { list-style:none; padding-left:0; }
+  .step li { margin:.6rem 0; }
+  .step input { margin-right:.5rem; }
+  .files, .iface { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.6rem .9rem; margin:.5rem 0; font-size:.9rem; }
+  .callout { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+  .buttons { display:flex; gap:.75rem; flex-wrap:wrap; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:1rem; margin:1.2rem 0; align-items:center; }
+  .buttons span { font-weight:600; }
+  .buttons a { display:inline-block; padding:.5rem 1.1rem; border-radius:8px; text-decoration:none; font-weight:600; border:1px solid var(--accent); }
+  .buttons a.primary { background:var(--accent); color:#fff; }
+  .buttons a.secondary { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>netsuite-cli — Implementation Plan</h1>
+<div class="meta">2026-07-10 · Executes the approved spec <code>docs/superpowers/specs/2026-07-09-netsuite-cli-design.html</code> · All protocol details below verified against Oracle NetSuite help docs on 2026-07-09/10.</div>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use <code>superpowers:subagent-driven-development</code> (recommended) or <code>superpowers:executing-plans</code> to implement this plan task-by-task. Steps use checkbox syntax for tracking. Follow TDD exactly as written: failing test → verify fail → implement → verify pass → commit.</div>
+
+<p><strong>Goal:</strong> A cross-platform (macOS/Windows) Rust CLI giving AI agents the full NetSuite REST surface — record CRUD, SuiteQL, metadata catalog, RESTlets, async jobs, raw passthrough — with multi-account OAuth 2.0 credentials in the OS keychain and JSON-always output.</p>
+
+<p><strong>Architecture:</strong> Thin clap command layer → per-surface command functions taking a shared <code>NsClient</code> (reqwest; bearer injection via a <code>TokenProvider</code> trait; retry/backoff; NetSuite error-envelope mapping). Record types are runtime strings; schemas come from each account's live metadata catalog (cached). Secrets live behind a <code>SecretStore</code> trait (keyring in prod, in-memory in tests) so no test touches a real keychain.</p>
+
+<p><strong>Tech stack:</strong> Rust 2024 · clap 4 (derive) · tokio 1 · reqwest 0.12 (rustls) · serde/serde_json · keyring 3 · jsonwebtoken 9 · directories 6 · rcgen + tokio-rustls (HTTPS loopback for auth-code) · self_update 0.42 · wiremock 0.6, tempfile, assert_cmd (dev).</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li>Rust edition <strong>2024</strong>; binary name <code>netsuite-cli</code>; must build on macOS and Windows (no unix-only APIs outside <code>#[cfg]</code>).</li>
+  <li>stdout carries <strong>only JSON</strong> (compact default, <code>--pretty</code> flag). All errors go to stderr as one JSON object <code>{"kind","status"?,"message","details"?}</code>.</li>
+  <li>Exit codes: <strong>0</strong> success · <strong>1</strong> API error · <strong>2</strong> usage error · <strong>3</strong> auth error · <strong>4</strong> network error.</li>
+  <li>Account targeting precedence: <code>--account</code> flag → <code>NETSUITE_ACCOUNT</code> env var → config <code>default_account</code>.</li>
+  <li>No secrets in the TOML config file, ever. Secrets only via <code>SecretStore</code>.</li>
+  <li>Every commit message ends with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>.</li>
+  <li>Tests must not hit the network (wiremock only) and must not touch the real OS keychain.</li>
+  <li>Descriptive names only — no single-letter variables. Comments only where genuinely non-obvious. Functions ordered top-down (highest level first).</li>
+</ul>
+
+<h2>Verified NetSuite protocol reference</h2>
+<p>Every task below relies on these facts, verified against docs.oracle.com (section IDs in parentheses). Do not "correct" them from memory.</p>
+<table>
+  <tr><th>Fact</th><th>Value</th></tr>
+  <tr><td>Domain mapping</td><td>Account ID lowercased, <code>_</code>→<code>-</code>: <code>123456_SB1</code> → <code>123456-sb1.suitetalk.api.netsuite.com</code> (§1498251763). REST base <code>https://{domain}.suitetalk.api.netsuite.com</code>; RESTlets <code>…restlets.api.netsuite.com</code>; browser login <code>…app.netsuite.com</code>.</td></tr>
+  <tr><td>Token endpoint</td><td><code>POST {rest_base}/services/rest/auth/oauth2/v1/token</code>, body <code>application/x-www-form-urlencoded</code> (§162755359851).</td></tr>
+  <tr><td>M2M assertion JWT</td><td>Header: <code>typ=JWT</code>, <code>alg</code> ∈ {PS256, PS384, PS512, ES256, ES384, ES512} (plain RS256 rejected), <code>kid</code> = Certificate ID from the M2M mapping. Claims: <code>iss</code>=client ID, <code>scope</code>=JSON array e.g. <code>["rest_webservices"]</code> (Oracle's own example uses an array), <code>aud</code>=token endpoint URL, <code>iat</code>, <code>exp</code> &lt; iat+3600, <code>jti</code> (in Oracle's example; include it). Body params: <code>grant_type=client_credentials</code>, <code>client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer</code>, <code>client_assertion</code> (§162790605110).</td></tr>
+  <tr><td>M2M response</td><td><code>{"access_token","expires_in":3600,"token_type":"Bearer"}</code>. <strong>No refresh token</strong> — re-mint the assertion when expired. Certs: RSA 3072/4096 or EC P-256/384/521, max 2-year validity (§162755332391).</td></tr>
+  <tr><td>Auth-code authorize</td><td><code>GET https://{account}.app.netsuite.com/app/login/oauth2/authorize.nl</code> with <code>response_type=code</code>, <code>client_id</code>, <code>redirect_uri</code> (<strong>https or custom scheme only — plain http rejected</strong>), <code>scope</code> (space-separated: <code>restlets rest_webservices suite_analytics</code>), <code>state</code> (22–1024 chars), PKCE <code>code_challenge</code> + <code>code_challenge_method=S256</code> (<strong>required for public clients</strong>) (§158081944642). Redirect back adds <code>role</code>, <code>entity</code>, <code>company</code> params.</td></tr>
+  <tr><td>Auth-code tokens</td><td>Exchange: <code>grant_type=authorization_code</code> + <code>code</code> + <code>redirect_uri</code> + <code>code_verifier</code>; public client sends <code>client_id</code> in body, no Basic auth. Access token 3600&nbsp;s. Public-client refresh tokens are <strong>one-time-use and rotate</strong>: refresh response contains a NEW refresh_token — persist it every time (default validity 48&nbsp;h, max rotation window 168&nbsp;h) (§158081952044, §158082518856).</td></tr>
+  <tr><td>Record CRUD</td><td><code>/services/rest/record/v1/{type}</code>. GET single: params <code>fields</code>, <code>expandSubResources</code>, <code>simpleEnumFormat</code>. POST create → <strong>204 No Content, new ID only in <code>Location</code> header</strong>. PATCH update → 204 (merge semantics; <code>replace</code> param = sublists to replace). PUT upsert → <code>/{type}/eid:{externalId}</code> → 204. DELETE → 204. External IDs usable anywhere via <code>eid:</code> prefix (§1545141395, §1545142173, §156335203191).</td></tr>
+  <tr><td>List envelope</td><td>GET collection: params <code>q</code>, <code>limit</code> (default 1000), <code>offset</code> (must be divisible by limit). Response: <code>{links, count, hasMore, items:[{links,id}], offset, totalResults}</code> — items are ID stubs only (§1540810951, §156414087576). <code>q</code> syntax: <code>field OPERATOR value</code>, AND/OR, quoted strings (§1545222128).</td></tr>
+  <tr><td>Metadata catalog</td><td><code>GET /services/rest/record/v1/metadata-catalog</code> (Accept <code>application/json</code>) lists <code>items[].name</code>; <code>?select=a,b</code> filters. Per-type <code>/metadata-catalog/{type}</code> with Accept <code>application/schema+json</code> (JSON Schema draft-06) or <code>application/swagger+json</code> (OpenAPI 3.0) (§1540810174).</td></tr>
+  <tr><td>SuiteQL</td><td><code>POST /services/rest/query/v1/suiteql?limit=&amp;offset=</code>, header <strong><code>Prefer: transient</code> required</strong>, body <code>{"q":"SELECT …"}</code>. Same envelope as lists incl. <code>hasMore</code>/<code>totalResults</code>; max 100k results; column values arrive as strings (§157909186990).</td></tr>
+  <tr><td>Async</td><td>Any record request + <code>Prefer: respond-async</code> → <code>202</code> with <code>Location: …/services/rest/async/v1/job/{jobId}</code> (<strong>may be relative or absolute</strong>). <code>GET async/v1/job/{id}</code> → <code>{completed, id, progress, task}</code>; <code>…/job/{id}/task/</code> lists tasks; <code>…/task/{taskId}/result</code> returns the payload. Optional <code>X-NetSuite-Idempotency-Key</code> (UUID); duplicate → error code <code>IDEMPOTENCY_ERROR</code> with prior job in Location (§161278579295, §161252896355, §161252889998).</td></tr>
+  <tr><td>RESTlets</td><td><code>https://{domain}.restlets.api.netsuite.com/app/site/hosting/restlet.nl?script={id}&amp;deploy={id}</code>, <code>Authorization: Bearer</code> (scope <code>restlets</code>). GET/DELETE args via query params; POST/PUT via JSON body with <code>Content-Type: application/json</code> (case-sensitive header; missing → 415) (§4618456734, §158272429269).</td></tr>
+  <tr><td>Errors</td><td>Error responses: Content-Type <code>application/vnd.oracle.resource+json; type=error</code>, body <code>{type,title,status,"o:errorDetails":[{detail,"o:errorCode"}]}</code>. Detect idempotency duplicates by <code>o:errorCode</code>, not HTTP status.</td></tr>
+</table>
+
+<h2>File structure</h2>
+<pre><code>Cargo.toml
+src/main.rs            entry: tokio main, run(), exit-code mapping
+src/cli.rs             clap derive tree + dispatch to commands
+src/error.rs           CliError (api/auth/usage/network) + exit codes + JSON envelope
+src/output.rs          print_json / print_error
+src/account.rs         domain mapping + base-URL builders
+src/config.rs          TOML config (aliases, default), account resolution
+src/secrets.rs         SecretStore trait, KeyringStore, MemoryStore, AccountSecrets
+src/auth/mod.rs        TokenProvider trait, TokenResponse
+src/auth/m2m.rs        JWT assertion + client_credentials exchange, M2mProvider
+src/auth/authcode.rs   PKCE, authorize URL, HTTPS loopback listener, refresh rotation, AuthCodeProvider
+src/client.rs          NsClient: request(), retry/backoff, error mapping, NsResponse
+src/context.rs         wires config+secrets+provider into an NsClient for a resolved account
+src/commands/{account,record,suiteql,describe,restlet,job,raw,update,config}.rs
+tests/                 wiremock integration tests per surface + live_smoke.rs (ignored)
+.github/workflows/{ci.yml,release.yml}
+</code></pre>
+
+<h2 class="task">Task 1: Scaffold, error model, JSON output</h2>
+<div class="files"><strong>Files:</strong> Modify <code>Cargo.toml</code> · Create <code>src/error.rs</code>, <code>src/output.rs</code> · Replace <code>src/main.rs</code></div>
+<div class="iface"><strong>Produces:</strong> <code>CliError</code> enum with <code>exit_code() -&gt; u8</code> and <code>to_json() -&gt; serde_json::Value</code>; <code>output::print_json(&amp;Value, pretty: bool)</code>; <code>output::print_error(&amp;CliError)</code>. Every later task returns <code>Result&lt;_, CliError&gt;</code>.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Replace Cargo.toml</strong> with the full dependency set (workspace-wide; later tasks add nothing):
+<pre><code>[package]
+name = "netsuite-cli"
+version = "0.1.0"
+edition = "2024"
+description = "NetSuite REST API CLI for AI agents — multi-account OAuth, records, SuiteQL, metadata"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+jsonwebtoken = "9"
+directories = "6"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+toml = "0.8"
+webbrowser = "1"
+rcgen = "0.13"
+rustls = "0.23"
+tokio-rustls = "0.26"
+self_update = { version = "0.42", default-features = false, features = ["rustls", "archive-zip", "compression-zip-deflate"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+</code></pre>
+Run <code>cargo build</code>; expect success (unused-dep warnings are fine).</li>
+
+<li><input type="checkbox"> <strong>Step 2: Write failing tests</strong> in <code>src/error.rs</code> (module + tests together):
+<pre><code>#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn exit_codes_match_error_kinds() {
+        assert_eq!(CliError::Api { status: 400, message: "bad".into(), details: vec![] }.exit_code(), 1);
+        assert_eq!(CliError::Usage("no account".into()).exit_code(), 2);
+        assert_eq!(CliError::Auth("expired".into()).exit_code(), 3);
+        assert_eq!(CliError::Network("timeout".into()).exit_code(), 4);
+    }
+
+    #[test]
+    fn api_error_serializes_full_envelope() {
+        let error = CliError::Api {
+            status: 400,
+            message: "Invalid record".into(),
+            details: vec![json!({"detail": "field x", "o:errorCode": "USER_ERROR"})],
+        };
+        assert_eq!(error.to_json(), json!({
+            "kind": "api", "status": 400, "message": "Invalid record",
+            "details": [{"detail": "field x", "o:errorCode": "USER_ERROR"}],
+        }));
+    }
+
+    #[test]
+    fn auth_error_serializes_without_status() {
+        assert_eq!(CliError::Auth("refresh expired".into()).to_json(),
+            json!({"kind": "auth", "message": "refresh expired"}));
+    }
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 3: Run to verify failure:</strong> <code>cargo test</code> → compile error, <code>CliError</code> not defined.</li>
+
+<li><input type="checkbox"> <strong>Step 4: Implement <code>src/error.rs</code></strong> above the tests:
+<pre><code>use serde_json::{json, Value};
+
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    #[error("{message}")]
+    Api { status: u16, message: String, details: Vec&lt;Value&gt; },
+    #[error("{0}")]
+    Usage(String),
+    #[error("{0}")]
+    Auth(String),
+    #[error("{0}")]
+    Network(String),
+}
+
+impl CliError {
+    pub fn exit_code(&amp;self) -&gt; u8 {
+        match self {
+            CliError::Api { .. } =&gt; 1,
+            CliError::Usage(_) =&gt; 2,
+            CliError::Auth(_) =&gt; 3,
+            CliError::Network(_) =&gt; 4,
+        }
+    }
+
+    pub fn to_json(&amp;self) -&gt; Value {
+        match self {
+            CliError::Api { status, message, details } =&gt;
+                json!({"kind": "api", "status": status, "message": message, "details": details}),
+            CliError::Usage(message) =&gt; json!({"kind": "usage", "message": message}),
+            CliError::Auth(message) =&gt; json!({"kind": "auth", "message": message}),
+            CliError::Network(message) =&gt; json!({"kind": "network", "message": message}),
+        }
+    }
+}
+</code></pre>
+Implement <code>src/output.rs</code>:
+<pre><code>use crate::error::CliError;
+use serde_json::Value;
+
+pub fn print_json(value: &amp;Value, pretty: bool) {
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(value).expect("serializable"));
+    } else {
+        println!("{}", serde_json::to_string(value).expect("serializable"));
+    }
+}
+
+pub fn print_error(error: &amp;CliError) {
+    eprintln!("{}", error.to_json());
+}
+</code></pre>
+Replace <code>src/main.rs</code> (cli module arrives in Task 6; until then dispatch a placeholder):
+<pre><code>mod error;
+mod output;
+
+use error::CliError;
+
+#[tokio::main]
+async fn main() {
+    std::process::exit(run().await);
+}
+
+async fn run() -&gt; i32 {
+    match execute().await {
+        Ok(()) =&gt; 0,
+        Err(error) =&gt; {
+            output::print_error(&amp;error);
+            error.exit_code() as i32
+        }
+    }
+}
+
+async fn execute() -&gt; Result&lt;(), CliError&gt; {
+    Err(CliError::Usage("no command implemented yet".into()))
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 5: Verify:</strong> <code>cargo test</code> → 3 passed. <code>cargo run -q; echo $?</code> → JSON usage error on stderr, exit 2.</li>
+<li><input type="checkbox"> <strong>Step 6: Commit:</strong> <code>git add -A &amp;&amp; git commit -m "feat: error model, JSON output, exit codes"</code> (plus co-author trailer, as on every commit).</li>
+</ul>
+
+<h2 class="task">Task 2: Account domains + TOML config store</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/account.rs</code>, <code>src/config.rs</code> · Modify <code>src/main.rs</code> (add <code>mod account; mod config;</code>)</div>
+<div class="iface"><strong>Consumes:</strong> <code>CliError</code>. <strong>Produces:</strong> <code>account::{account_domain_id, rest_base, restlet_base, app_base}(account_id: &amp;str) -&gt; String</code>; <code>config::{Config, AccountEntry, AuthFlow}</code> with <code>Config::load(path) -&gt; Result&lt;Config, CliError&gt;</code>, <code>Config::save(&amp;self, path)</code>, <code>Config::resolve_alias(&amp;self, flag: Option&lt;&amp;str&gt;, env: Option&lt;&amp;str&gt;) -&gt; Result&lt;String, CliError&gt;</code>, <code>config::default_config_path() -&gt; PathBuf</code>.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> in <code>src/account.rs</code>:
+<pre><code>#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_account_ids_map_to_hyphenated_lowercase_domains() {
+        assert_eq!(account_domain_id("123456_SB1"), "123456-sb1");
+        assert_eq!(account_domain_id("1234567"), "1234567");
+        assert_eq!(rest_base("123456_SB1"), "https://123456-sb1.suitetalk.api.netsuite.com");
+        assert_eq!(restlet_base("123456_SB1"), "https://123456-sb1.restlets.api.netsuite.com");
+        assert_eq!(app_base("123456_SB1"), "https://123456-sb1.app.netsuite.com");
+    }
+}
+</code></pre>
+And in <code>src/config.rs</code>:
+<pre><code>#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -&gt; Config {
+        let mut config = Config::default();
+        config.accounts.insert("prod".into(), AccountEntry { account_id: "1234567".into(), flow: AuthFlow::M2m });
+        config.accounts.insert("sb1".into(), AccountEntry { account_id: "1234567_SB1".into(), flow: AuthFlow::AuthCode });
+        config.default_account = Some("prod".into());
+        config
+    }
+
+    #[test]
+    fn config_round_trips_through_toml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        sample_config().save(&amp;path).unwrap();
+        let loaded = Config::load(&amp;path).unwrap();
+        assert_eq!(loaded.default_account.as_deref(), Some("prod"));
+        assert_eq!(loaded.accounts["sb1"].account_id, "1234567_SB1");
+        assert!(matches!(loaded.accounts["sb1"].flow, AuthFlow::AuthCode));
+    }
+
+    #[test]
+    fn missing_config_file_loads_as_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = Config::load(&amp;dir.path().join("nope.toml")).unwrap();
+        assert!(loaded.accounts.is_empty());
+    }
+
+    #[test]
+    fn alias_resolution_prefers_flag_then_env_then_default() {
+        let config = sample_config();
+        assert_eq!(config.resolve_alias(Some("sb1"), Some("ignored")).unwrap(), "sb1");
+        assert_eq!(config.resolve_alias(None, Some("sb1")).unwrap(), "sb1");
+        assert_eq!(config.resolve_alias(None, None).unwrap(), "prod");
+        assert!(matches!(config.resolve_alias(Some("nope"), None), Err(crate::error::CliError::Usage(_))));
+        let empty = Config::default();
+        assert!(matches!(empty.resolve_alias(None, None), Err(crate::error::CliError::Usage(_))));
+    }
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test</code> → compile failure (types missing).</li>
+<li><input type="checkbox"> <strong>Step 3: Implement.</strong> <code>src/account.rs</code>:
+<pre><code>pub fn rest_base(account_id: &amp;str) -&gt; String {
+    format!("https://{}.suitetalk.api.netsuite.com", account_domain_id(account_id))
+}
+
+pub fn restlet_base(account_id: &amp;str) -&gt; String {
+    format!("https://{}.restlets.api.netsuite.com", account_domain_id(account_id))
+}
+
+pub fn app_base(account_id: &amp;str) -&gt; String {
+    format!("https://{}.app.netsuite.com", account_domain_id(account_id))
+}
+
+pub fn account_domain_id(account_id: &amp;str) -&gt; String {
+    account_id.to_lowercase().replace('_', "-")
+}
+</code></pre>
+<code>src/config.rs</code>:
+<pre><code>use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::CliError;
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Config {
+    pub default_account: Option&lt;String&gt;,
+    #[serde(default)]
+    pub accounts: BTreeMap&lt;String, AccountEntry&gt;,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountEntry {
+    pub account_id: String,
+    pub flow: AuthFlow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthFlow {
+    M2m,
+    AuthCode,
+}
+
+impl Config {
+    pub fn load(path: &amp;Path) -&gt; Result&lt;Config, CliError&gt; {
+        if !path.exists() {
+            return Ok(Config::default());
+        }
+        let raw = std::fs::read_to_string(path)
+            .map_err(|read_error| CliError::Usage(format!("cannot read config {}: {read_error}", path.display())))?;
+        toml::from_str(&amp;raw)
+            .map_err(|parse_error| CliError::Usage(format!("invalid config {}: {parse_error}", path.display())))
+    }
+
+    pub fn save(&amp;self, path: &amp;Path) -&gt; Result&lt;(), CliError&gt; {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|io_error| CliError::Usage(format!("cannot create {}: {io_error}", parent.display())))?;
+        }
+        let raw = toml::to_string_pretty(self).expect("config serializable");
+        std::fs::write(path, raw)
+            .map_err(|io_error| CliError::Usage(format!("cannot write {}: {io_error}", path.display())))
+    }
+
+    pub fn resolve_alias(&amp;self, flag: Option&lt;&amp;str&gt;, env: Option&lt;&amp;str&gt;) -&gt; Result&lt;String, CliError&gt; {
+        let alias = flag
+            .map(str::to_string)
+            .or_else(|| env.map(str::to_string))
+            .or_else(|| self.default_account.clone())
+            .ok_or_else(|| CliError::Usage(
+                "no account selected: pass --account, set NETSUITE_ACCOUNT, or run `netsuite-cli account set-default`".into()))?;
+        if !self.accounts.contains_key(&amp;alias) {
+            return Err(CliError::Usage(format!(
+                "unknown account alias '{alias}'; run `netsuite-cli account list`")));
+        }
+        Ok(alias)
+    }
+}
+
+pub fn default_config_path() -&gt; PathBuf {
+    directories::ProjectDirs::from("com", "CreativePlanning", "netsuite-cli")
+        .expect("resolvable home directory")
+        .config_dir()
+        .join("config.toml")
+}
+
+pub fn default_cache_dir() -&gt; PathBuf {
+    directories::ProjectDirs::from("com", "CreativePlanning", "netsuite-cli")
+        .expect("resolvable home directory")
+        .cache_dir()
+        .to_path_buf()
+}
+</code></pre>
+Add <code>mod account; mod config;</code> to <code>src/main.rs</code>.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass (Task 1's 3 + these 5).</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git add -A &amp;&amp; git commit -m "feat: account domain mapping and TOML config store"</code>.</li>
+</ul>
+
+<h2 class="task">Task 3: SecretStore (keyring + in-memory)</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/secrets.rs</code> · Modify <code>src/main.rs</code> (<code>mod secrets;</code>)</div>
+<div class="iface"><strong>Produces:</strong> <code>AccountSecrets</code> enum (<code>M2m { client_id, cert_id, private_key_pem }</code> · <code>AuthCode { client_id, refresh_token: Option&lt;String&gt; }</code>), <code>CachedToken { access_token, expires_at_epoch: u64 }</code>, and <code>trait SecretStore { get, set, delete, get_token, set_token, delete_token }</code> with <code>KeyringStore</code> (prod) and <code>MemoryStore</code> (tests). Auth providers in Tasks 4/9 persist through this trait.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> in <code>src/secrets.rs</code>:
+<pre><code>#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_store_round_trips_secrets_and_tokens() {
+        let store = MemoryStore::default();
+        let secrets = AccountSecrets::M2m {
+            client_id: "cid".into(), cert_id: "kid123".into(), private_key_pem: "PEM".into(),
+        };
+        store.set("prod", &amp;secrets).unwrap();
+        match store.get("prod").unwrap().expect("stored") {
+            AccountSecrets::M2m { cert_id, .. } =&gt; assert_eq!(cert_id, "kid123"),
+            other =&gt; panic!("wrong variant: {other:?}"),
+        }
+        assert!(store.get("absent").unwrap().is_none());
+
+        let token = CachedToken { access_token: "tok".into(), expires_at_epoch: 999 };
+        store.set_token("prod", &amp;token).unwrap();
+        assert_eq!(store.get_token("prod").unwrap().unwrap().access_token, "tok");
+        store.delete("prod").unwrap();
+        assert!(store.get("prod").unwrap().is_none());
+    }
+
+    #[test]
+    fn cached_token_expiry_check_uses_leeway() {
+        let now = 1_000_000;
+        let live = CachedToken { access_token: "a".into(), expires_at_epoch: now + 120 };
+        let stale = CachedToken { access_token: "b".into(), expires_at_epoch: now + 10 };
+        assert!(live.is_valid_at(now));
+        assert!(!stale.is_valid_at(now)); // 60s leeway
+    }
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement</strong>:
+<pre><code>use std::collections::HashMap;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::CliError;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum AccountSecrets {
+    M2m { client_id: String, cert_id: String, private_key_pem: String },
+    AuthCode { client_id: String, refresh_token: Option&lt;String&gt; },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedToken {
+    pub access_token: String,
+    pub expires_at_epoch: u64,
+}
+
+impl CachedToken {
+    const LEEWAY_SECONDS: u64 = 60;
+
+    pub fn is_valid_at(&amp;self, now_epoch: u64) -&gt; bool {
+        self.expires_at_epoch &gt; now_epoch + Self::LEEWAY_SECONDS
+    }
+}
+
+pub trait SecretStore: Send + Sync {
+    fn get(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;AccountSecrets&gt;, CliError&gt;;
+    fn set(&amp;self, alias: &amp;str, secrets: &amp;AccountSecrets) -&gt; Result&lt;(), CliError&gt;;
+    fn delete(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt;;
+    fn get_token(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;CachedToken&gt;, CliError&gt;;
+    fn set_token(&amp;self, alias: &amp;str, token: &amp;CachedToken) -&gt; Result&lt;(), CliError&gt;;
+    fn delete_token(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt;;
+}
+
+pub struct KeyringStore;
+
+const KEYRING_SERVICE: &amp;str = "netsuite-cli";
+
+impl KeyringStore {
+    fn entry(user: &amp;str) -&gt; Result&lt;keyring::Entry, CliError&gt; {
+        keyring::Entry::new(KEYRING_SERVICE, user)
+            .map_err(|keyring_error| CliError::Auth(format!("keychain unavailable: {keyring_error}")))
+    }
+
+    fn read&lt;T: for&lt;'de&gt; Deserialize&lt;'de&gt;&gt;(user: &amp;str) -&gt; Result&lt;Option&lt;T&gt;, CliError&gt; {
+        match Self::entry(user)?.get_password() {
+            Ok(raw) =&gt; serde_json::from_str(&amp;raw)
+                .map(Some)
+                .map_err(|parse_error| CliError::Auth(format!("corrupt keychain entry '{user}': {parse_error}"))),
+            Err(keyring::Error::NoEntry) =&gt; Ok(None),
+            Err(keyring_error) =&gt; Err(CliError::Auth(format!("keychain read failed: {keyring_error}"))),
+        }
+    }
+
+    fn write&lt;T: Serialize&gt;(user: &amp;str, value: &amp;T) -&gt; Result&lt;(), CliError&gt; {
+        Self::entry(user)?
+            .set_password(&amp;serde_json::to_string(value).expect("serializable"))
+            .map_err(|keyring_error| CliError::Auth(format!("keychain write failed: {keyring_error}")))
+    }
+
+    fn remove(user: &amp;str) -&gt; Result&lt;(), CliError&gt; {
+        match Self::entry(user)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) =&gt; Ok(()),
+            Err(keyring_error) =&gt; Err(CliError::Auth(format!("keychain delete failed: {keyring_error}"))),
+        }
+    }
+}
+
+impl SecretStore for KeyringStore {
+    fn get(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;AccountSecrets&gt;, CliError&gt; { KeyringStore::read(alias) }
+    fn set(&amp;self, alias: &amp;str, secrets: &amp;AccountSecrets) -&gt; Result&lt;(), CliError&gt; { KeyringStore::write(alias, secrets) }
+    fn delete(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt; {
+        KeyringStore::remove(alias)?;
+        KeyringStore::remove(&amp;format!("{alias}#token"))
+    }
+    fn get_token(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;CachedToken&gt;, CliError&gt; { KeyringStore::read(&amp;format!("{alias}#token")) }
+    fn set_token(&amp;self, alias: &amp;str, token: &amp;CachedToken) -&gt; Result&lt;(), CliError&gt; { KeyringStore::write(&amp;format!("{alias}#token"), token) }
+    fn delete_token(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt; { KeyringStore::remove(&amp;format!("{alias}#token")) }
+}
+
+#[derive(Default)]
+pub struct MemoryStore {
+    entries: Mutex&lt;HashMap&lt;String, String&gt;&gt;,
+}
+
+impl MemoryStore {
+    fn read&lt;T: for&lt;'de&gt; Deserialize&lt;'de&gt;&gt;(&amp;self, key: &amp;str) -&gt; Result&lt;Option&lt;T&gt;, CliError&gt; {
+        Ok(self.entries.lock().unwrap().get(key)
+            .map(|raw| serde_json::from_str(raw).expect("valid stored json")))
+    }
+
+    fn write&lt;T: Serialize&gt;(&amp;self, key: &amp;str, value: &amp;T) -&gt; Result&lt;(), CliError&gt; {
+        self.entries.lock().unwrap().insert(key.into(), serde_json::to_string(value).unwrap());
+        Ok(())
+    }
+}
+
+impl SecretStore for MemoryStore {
+    fn get(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;AccountSecrets&gt;, CliError&gt; { self.read(alias) }
+    fn set(&amp;self, alias: &amp;str, secrets: &amp;AccountSecrets) -&gt; Result&lt;(), CliError&gt; { self.write(alias, secrets) }
+    fn delete(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt; {
+        let mut entries = self.entries.lock().unwrap();
+        entries.remove(alias);
+        entries.remove(&amp;format!("{alias}#token"));
+        Ok(())
+    }
+    fn get_token(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;CachedToken&gt;, CliError&gt; { self.read(&amp;format!("{alias}#token")) }
+    fn set_token(&amp;self, alias: &amp;str, token: &amp;CachedToken) -&gt; Result&lt;(), CliError&gt; { self.write(&amp;format!("{alias}#token"), token) }
+    fn delete_token(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt; {
+        self.entries.lock().unwrap().remove(&amp;format!("{alias}#token"));
+        Ok(())
+    }
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass. Note: <code>KeyringStore</code> is deliberately untested here (touches the real keychain); it is exercised by the live smoke test in Task 14.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: SecretStore trait with keyring and in-memory backends"</code>.</li>
+</ul>
+
+<h2 class="task">Task 4: M2M auth (JWT assertion + token exchange)</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/auth/mod.rs</code>, <code>src/auth/m2m.rs</code> · Modify <code>src/main.rs</code> (<code>mod auth;</code>) · Test <code>tests/m2m_auth.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>SecretStore</code>, <code>CachedToken</code>, <code>account::rest_base</code>. <strong>Produces:</strong> <code>auth::TokenResponse { access_token, expires_in }</code>; <code>trait TokenProvider { async fn access_token(&amp;self) -&gt; Result&lt;String, CliError&gt;; fn invalidate(&amp;self); }</code> (object-safe via <code>async_trait</code>-free boxing — see impl); <code>m2m::build_assertion(config, now_epoch) -&gt; Result&lt;String, CliError&gt;</code>; <code>m2m::M2mProvider::new(http, token_url, alias, secrets, store) </code> implementing <code>TokenProvider</code> with keychain-backed token cache.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests.</strong> <code>src/auth/m2m.rs</code> unit tests (EC key generated with rcgen — fast, no fixtures):
+<pre><code>#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    fn test_key_pem() -&gt; String {
+        rcgen::KeyPair::generate().unwrap().serialize_pem() // ECDSA P-256 by default
+    }
+
+    fn decode_segment(segment: &amp;str) -&gt; serde_json::Value {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(segment).unwrap();
+        serde_json::from_slice(&amp;bytes).unwrap()
+    }
+
+    #[test]
+    fn assertion_has_verified_header_and_claims() {
+        let config = M2mConfig {
+            token_url: "https://123456-sb1.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token".into(),
+            client_id: "myclientid".into(),
+            cert_id: "certkid123".into(),
+            private_key_pem: test_key_pem(),
+            scopes: vec!["rest_webservices".into(), "restlets".into()],
+        };
+        let assertion = build_assertion(&amp;config, 1_700_000_000).unwrap();
+        let segments: Vec&lt;&amp;str&gt; = assertion.split('.').collect();
+        assert_eq!(segments.len(), 3);
+
+        let header = decode_segment(segments[0]);
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["kid"], "certkid123");
+
+        let claims = decode_segment(segments[1]);
+        assert_eq!(claims["iss"], "myclientid");
+        assert_eq!(claims["aud"], config.token_url);
+        assert_eq!(claims["scope"], serde_json::json!(["rest_webservices", "restlets"]));
+        assert_eq!(claims["iat"], 1_700_000_000_u64);
+        assert_eq!(claims["exp"], 1_700_000_000_u64 + 3300);
+        assert!(claims["jti"].as_str().unwrap().len() &gt;= 16);
+    }
+
+    #[test]
+    fn unparseable_key_is_an_auth_error() {
+        let config = M2mConfig {
+            token_url: "https://x/token".into(), client_id: "c".into(), cert_id: "k".into(),
+            private_key_pem: "not a pem".into(), scopes: vec![],
+        };
+        assert!(matches!(build_assertion(&amp;config, 0), Err(crate::error::CliError::Auth(_))));
+    }
+}
+</code></pre>
+Integration test <code>tests/m2m_auth.rs</code> (crate must expose modules: add <code>src/lib.rs</code> with <code>pub mod account; pub mod auth; pub mod client; pub mod config; pub mod error; pub mod output; pub mod secrets; pub mod context; pub mod commands;</code> as modules land, and slim <code>main.rs</code> to call <code>netsuite_cli::cli_main()</code> — do that conversion in this task):
+<pre><code>use std::sync::Arc;
+
+use netsuite_cli::auth::m2m::{M2mConfig, M2mProvider};
+use netsuite_cli::auth::TokenProvider;
+use netsuite_cli::secrets::MemoryStore;
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn test_config(token_url: String) -&gt; M2mConfig {
+    M2mConfig {
+        token_url,
+        client_id: "cid".into(),
+        cert_id: "kid".into(),
+        private_key_pem: rcgen::KeyPair::generate().unwrap().serialize_pem(),
+        scopes: vec!["rest_webservices".into()],
+    }
+}
+
+#[tokio::test]
+async fn exchanges_assertion_for_token_and_caches_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/services/rest/auth/oauth2/v1/token"))
+        .and(body_string_contains("grant_type=client_credentials"))
+        .and(body_string_contains("client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "ACCESS_1", "expires_in": 3600, "token_type": "Bearer"
+        })))
+        .expect(1) // second call must come from cache
+        .mount(&amp;server).await;
+
+    let token_url = format!("{}/services/rest/auth/oauth2/v1/token", server.uri());
+    let provider = M2mProvider::new(reqwest::Client::new(), "prod".into(),
+        test_config(token_url), Arc::new(MemoryStore::default()));
+
+    assert_eq!(provider.access_token().await.unwrap(), "ACCESS_1");
+    assert_eq!(provider.access_token().await.unwrap(), "ACCESS_1");
+}
+
+#[tokio::test]
+async fn token_endpoint_error_maps_to_auth_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/services/rest/auth/oauth2/v1/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant"
+        })))
+        .mount(&amp;server).await;
+
+    let token_url = format!("{}/services/rest/auth/oauth2/v1/token", server.uri());
+    let provider = M2mProvider::new(reqwest::Client::new(), "prod".into(),
+        test_config(token_url), Arc::new(MemoryStore::default()));
+
+    let error = provider.access_token().await.unwrap_err();
+    assert!(matches!(error, netsuite_cli::error::CliError::Auth(_)));
+    assert!(error.to_string().contains("invalid_grant"));
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement.</strong> <code>src/auth/mod.rs</code>:
+<pre><code>pub mod m2m;
+
+use serde::Deserialize;
+
+use crate::error::CliError;
+
+#[derive(Debug, Deserialize)]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub expires_in: u64,
+    #[serde(default)]
+    pub refresh_token: Option&lt;String&gt;,
+}
+
+pub trait TokenProvider: Send + Sync {
+    fn access_token(&amp;self) -&gt; impl std::future::Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send
+    where Self: Sized;
+    fn invalidate(&amp;self);
+}
+</code></pre>
+<div class="callout">Object-safety note: <code>NsClient</code> (Task 5) needs <code>Arc&lt;dyn …&gt;</code>. Since async trait methods aren't object-safe without boxing, define the trait exactly like this instead of the sketch above:
+<pre><code>use std::future::Future;
+use std::pin::Pin;
+
+pub trait TokenProvider: Send + Sync {
+    fn access_token&lt;'life&gt;(&amp;'life self)
+        -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + 'life&gt;&gt;;
+    fn invalidate(&amp;self);
+}
+</code></pre>
+All provider impls return <code>Box::pin(async move { … })</code>. The tests above call <code>provider.access_token().await</code> either way.</div>
+<code>src/auth/m2m.rs</code>:
+<pre><code>use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use serde_json::json;
+
+use crate::auth::{TokenProvider, TokenResponse};
+use crate::error::CliError;
+use crate::secrets::{CachedToken, SecretStore};
+
+pub struct M2mConfig {
+    pub token_url: String,
+    pub client_id: String,
+    pub cert_id: String,
+    pub private_key_pem: String,
+    pub scopes: Vec&lt;String&gt;,
+}
+
+pub struct M2mProvider {
+    http: reqwest::Client,
+    alias: String,
+    config: M2mConfig,
+    store: Arc&lt;dyn SecretStore&gt;,
+}
+
+impl M2mProvider {
+    pub fn new(http: reqwest::Client, alias: String, config: M2mConfig, store: Arc&lt;dyn SecretStore&gt;) -&gt; Self {
+        M2mProvider { http, alias, config, store }
+    }
+
+    async fn fetch_fresh_token(&amp;self) -&gt; Result&lt;String, CliError&gt; {
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let assertion = build_assertion(&amp;self.config, now_epoch)?;
+        let response = self.http.post(&amp;self.config.token_url)
+            .form(&amp;[
+                ("grant_type", "client_credentials"),
+                ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                ("client_assertion", assertion.as_str()),
+            ])
+            .send().await
+            .map_err(|send_error| CliError::Network(format!("token request failed: {send_error}")))?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(CliError::Auth(format!("token endpoint returned {status}: {body}")));
+        }
+        let token: TokenResponse = serde_json::from_str(&amp;body)
+            .map_err(|parse_error| CliError::Auth(format!("bad token response: {parse_error}")))?;
+        self.store.set_token(&amp;self.alias, &amp;CachedToken {
+            access_token: token.access_token.clone(),
+            expires_at_epoch: now_epoch + token.expires_in,
+        })?;
+        Ok(token.access_token)
+    }
+}
+
+impl TokenProvider for M2mProvider {
+    fn access_token&lt;'life&gt;(&amp;'life self)
+        -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + 'life&gt;&gt; {
+        Box::pin(async move {
+            let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if let Some(cached) = self.store.get_token(&amp;self.alias)? {
+                if cached.is_valid_at(now_epoch) {
+                    return Ok(cached.access_token);
+                }
+            }
+            self.fetch_fresh_token().await
+        })
+    }
+
+    fn invalidate(&amp;self) {
+        let _ = self.store.delete_token(&amp;self.alias);
+    }
+}
+
+pub fn build_assertion(config: &amp;M2mConfig, now_epoch: u64) -&gt; Result&lt;String, CliError&gt; {
+    let (encoding_key, algorithm) = encoding_key_for_pem(&amp;config.private_key_pem)?;
+    let mut header = Header::new(algorithm);
+    header.kid = Some(config.cert_id.clone());
+    let claims = json!({
+        "iss": config.client_id,
+        "scope": config.scopes,
+        "aud": config.token_url,
+        "iat": now_epoch,
+        "exp": now_epoch + 3300, // must stay under the documented iat+3600 ceiling
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    jsonwebtoken::encode(&amp;header, &amp;claims, &amp;encoding_key)
+        .map_err(|sign_error| CliError::Auth(format!("cannot sign assertion: {sign_error}")))
+}
+
+// NetSuite accepts PS256/384/512 and ES256/384/512 — never plain RS256.
+fn encoding_key_for_pem(pem: &amp;str) -&gt; Result&lt;(EncodingKey, Algorithm), CliError&gt; {
+    if let Ok(rsa_key) = EncodingKey::from_rsa_pem(pem.as_bytes()) {
+        return Ok((rsa_key, Algorithm::PS256));
+    }
+    if let Ok(ec_key) = EncodingKey::from_ec_pem(pem.as_bytes()) {
+        return Ok((ec_key, Algorithm::ES256));
+    }
+    Err(CliError::Auth("private key is not a valid RSA or EC PEM".into()))
+}
+</code></pre>
+Also in this step: create <code>src/lib.rs</code> exposing existing modules (<code>pub mod account; pub mod auth; pub mod config; pub mod error; pub mod output; pub mod secrets;</code>) and change <code>src/main.rs</code> to <code>use netsuite_cli::…</code>. Add <code>rcgen</code> to <code>[dev-dependencies]</code> too (it's already a main dependency; the unit test uses it directly).</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass (unit: header/claims, bad key; integration: exchange+cache, error mapping).</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: OAuth2 M2M provider with signed JWT assertion and token cache"</code>.</li>
+</ul>
+
+<h2 class="task">Task 5: NsClient — bearer, retries, error mapping</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/client.rs</code> · Modify <code>src/lib.rs</code> · Test <code>tests/client.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>TokenProvider</code>, <code>CliError</code>. <strong>Produces:</strong>
+<pre><code>pub struct NsClient { /* http, base, tokens */ }
+pub struct NsResponse { pub status: u16, pub body: Option&lt;serde_json::Value&gt;, pub location: Option&lt;String&gt; }
+impl NsClient {
+    pub fn new(http: reqwest::Client, base: String, tokens: Arc&lt;dyn TokenProvider&gt;) -&gt; NsClient
+    pub fn base(&amp;self) -&gt; &amp;str
+    pub async fn request(&amp;self, method: reqwest::Method, path: &amp;str,
+        query: &amp;[(&amp;str, String)], headers: &amp;[(&amp;str, &amp;str)],
+        body: Option&lt;&amp;serde_json::Value&gt;) -&gt; Result&lt;NsResponse, CliError&gt;
+}
+</code></pre>
+<code>path</code> may be relative (joined to base) or an absolute <code>https://</code> URL (used as-is — needed for RESTlet domain and absolute async Location values). All Task 6–11 command functions call only <code>request()</code>.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> <code>tests/client.rs</code>. Helper provider:
+<pre><code>use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
+use netsuite_cli::auth::TokenProvider;
+use netsuite_cli::client::NsClient;
+use netsuite_cli::error::CliError;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[derive(Default)]
+struct FakeTokens { minted: AtomicU32 }
+
+impl TokenProvider for FakeTokens {
+    fn access_token&lt;'life&gt;(&amp;'life self)
+        -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + 'life&gt;&gt; {
+        let count = self.minted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(format!("TOKEN_{count}")) })
+    }
+    fn invalidate(&amp;self) {}
+}
+
+fn client(server: &amp;MockServer) -&gt; NsClient {
+    NsClient::new(reqwest::Client::new(), server.uri(), Arc::new(FakeTokens::default()))
+}
+
+#[tokio::test]
+async fn sends_bearer_and_parses_json_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/customer/42"))
+        .and(header("Authorization", "Bearer TOKEN_0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "42"})))
+        .mount(&amp;server).await;
+
+    let response = client(&amp;server)
+        .request(reqwest::Method::GET, "/services/rest/record/v1/customer/42", &amp;[], &amp;[], None)
+        .await.unwrap();
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body.unwrap()["id"], "42");
+}
+
+#[tokio::test]
+async fn captures_location_on_204_create() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/services/rest/record/v1/customer"))
+        .respond_with(ResponseTemplate::new(204)
+            .insert_header("Location", "https://x.suitetalk.api.netsuite.com/services/rest/record/v1/customer/647"))
+        .mount(&amp;server).await;
+
+    let response = client(&amp;server)
+        .request(reqwest::Method::POST, "/services/rest/record/v1/customer", &amp;[], &amp;[],
+            Some(&amp;serde_json::json!({"companyName": "Acme"})))
+        .await.unwrap();
+    assert_eq!(response.status, 204);
+    assert!(response.body.is_none());
+    assert!(response.location.unwrap().ends_with("/customer/647"));
+}
+
+#[tokio::test]
+async fn retries_429_honoring_retry_after_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/limited"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .up_to_n_times(1).mount(&amp;server).await;
+    Mock::given(method("GET")).and(path("/limited"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&amp;server).await;
+
+    let response = client(&amp;server)
+        .request(reqwest::Method::GET, "/limited", &amp;[], &amp;[], None).await.unwrap();
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn maps_netsuite_error_envelope() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/bad"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "type": "https://www.rfc-editor.org/rfc/rfc9110.html#name-400-bad-request",
+            "title": "Bad Request", "status": 400,
+            "o:errorDetails": [{"detail": "Invalid field somefield.", "o:errorCode": "INVALID_CONTENT"}]
+        })))
+        .mount(&amp;server).await;
+
+    match client(&amp;server).request(reqwest::Method::GET, "/bad", &amp;[], &amp;[], None).await.unwrap_err() {
+        CliError::Api { status, message, details } =&gt; {
+            assert_eq!(status, 400);
+            assert!(message.contains("Invalid field somefield."));
+            assert_eq!(details[0]["o:errorCode"], "INVALID_CONTENT");
+        }
+        other =&gt; panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn retries_once_with_fresh_token_on_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/auth")).and(header("Authorization", "Bearer TOKEN_0"))
+        .respond_with(ResponseTemplate::new(401)).mount(&amp;server).await;
+    Mock::given(method("GET")).and(path("/auth")).and(header("Authorization", "Bearer TOKEN_1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+        .mount(&amp;server).await;
+
+    let response = client(&amp;server)
+        .request(reqwest::Method::GET, "/auth", &amp;[], &amp;[], None).await.unwrap();
+    assert_eq!(response.status, 200);
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test --test client</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement <code>src/client.rs</code>:</strong>
+<pre><code>use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::Value;
+
+use crate::auth::TokenProvider;
+use crate::error::CliError;
+
+const MAX_ATTEMPTS: u32 = 4;
+const BASE_BACKOFF_MILLIS: u64 = 500;
+
+pub struct NsClient {
+    http: reqwest::Client,
+    base: String,
+    tokens: Arc&lt;dyn TokenProvider&gt;,
+}
+
+pub struct NsResponse {
+    pub status: u16,
+    pub body: Option&lt;Value&gt;,
+    pub location: Option&lt;String&gt;,
+}
+
+impl NsClient {
+    pub fn new(http: reqwest::Client, base: String, tokens: Arc&lt;dyn TokenProvider&gt;) -&gt; NsClient {
+        NsClient { http, base: base.trim_end_matches('/').to_string(), tokens }
+    }
+
+    pub fn base(&amp;self) -&gt; &amp;str { &amp;self.base }
+
+    pub async fn request(&amp;self, method: reqwest::Method, path: &amp;str,
+        query: &amp;[(&amp;str, String)], headers: &amp;[(&amp;str, &amp;str)], body: Option&lt;&amp;Value&gt;,
+    ) -&gt; Result&lt;NsResponse, CliError&gt; {
+        let url = if path.starts_with("https://") || path.starts_with("http://") {
+            path.to_string()
+        } else {
+            format!("{}{}", self.base, path)
+        };
+
+        let mut reauthorized = false;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let token = self.tokens.access_token().await?;
+            let mut request = self.http.request(method.clone(), &amp;url)
+                .bearer_auth(&amp;token)
+                .query(query);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            if let Some(json_body) = body {
+                request = request.json(json_body);
+            }
+
+            let response = request.send().await
+                .map_err(|send_error| CliError::Network(format!("request to {url} failed: {send_error}")))?;
+            let status = response.status();
+
+            if status.as_u16() == 401 &amp;&amp; !reauthorized {
+                self.tokens.invalidate();
+                reauthorized = true;
+                continue;
+            }
+            if (status.as_u16() == 429 || status.is_server_error()) &amp;&amp; attempt &lt; MAX_ATTEMPTS {
+                let delay = retry_after_seconds(&amp;response)
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_millis(BASE_BACKOFF_MILLIS * 2u64.pow(attempt - 1)));
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let location = response.headers().get("location")
+                .and_then(|value| value.to_str().ok()).map(str::to_string);
+            let raw = response.text().await.unwrap_or_default();
+            let parsed: Option&lt;Value&gt; = if raw.trim().is_empty() { None } else { serde_json::from_str(&amp;raw).ok() };
+
+            if status.is_success() {
+                return Ok(NsResponse { status: status.as_u16(), body: parsed, location });
+            }
+            return Err(api_error(status.as_u16(), parsed, raw));
+        }
+    }
+}
+
+fn retry_after_seconds(response: &amp;reqwest::Response) -&gt; Option&lt;u64&gt; {
+    response.headers().get("retry-after")?.to_str().ok()?.parse().ok()
+}
+
+fn api_error(status: u16, parsed: Option&lt;Value&gt;, raw: String) -&gt; CliError {
+    let Some(body) = parsed else {
+        return CliError::Api { status, message: raw, details: vec![] };
+    };
+    let details: Vec&lt;Value&gt; = body["o:errorDetails"].as_array().cloned().unwrap_or_default();
+    let title = body["title"].as_str().unwrap_or("request failed");
+    let first_detail = details.first().and_then(|detail| detail["detail"].as_str()).unwrap_or("");
+    let message = if first_detail.is_empty() { title.to_string() } else { format!("{title}: {first_detail}") };
+    CliError::Api { status, message, details }
+}
+</code></pre>
+Add <code>pub mod client;</code> to <code>src/lib.rs</code>.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass (5 new client tests).</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: NsClient with bearer auth, retry/backoff, error mapping"</code>.</li>
+</ul>
+
+<h2 class="task">Task 6: clap tree, context wiring, record commands</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/cli.rs</code>, <code>src/context.rs</code>, <code>src/commands/mod.rs</code>, <code>src/commands/record.rs</code> · Modify <code>src/lib.rs</code>, <code>src/main.rs</code> · Test <code>tests/record_commands.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>NsClient</code>, <code>Config</code>, <code>SecretStore</code>, providers. <strong>Produces:</strong> <code>cli_main() -&gt; impl Future&lt;Output = i32&gt;</code> (called by <code>main.rs</code>); <code>context::client_for_account(alias_flag: Option&lt;&amp;str&gt;) -&gt; Result&lt;(NsClient, String), CliError&gt;</code> building the right provider from config+keyring; <code>commands::record::{get, list, create, update, upsert, delete}</code> — each takes <code>&amp;NsClient</code> plus typed args and returns <code>Result&lt;Value, CliError&gt;</code> (delete returns <code>json!({"deleted": true, "id": id})</code>; create returns <code>json!({"id": …, "location": …})</code> parsed from the Location header); <code>commands::read_data_arg(raw: &amp;str) -&gt; Result&lt;Value, CliError&gt;</code> supporting inline JSON, <code>@file.json</code>, and <code>-</code> (stdin).</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> <code>tests/record_commands.rs</code> (reuse the <code>FakeTokens</code> pattern from <code>tests/client.rs</code> via a small <code>tests/common/mod.rs</code>):
+<pre><code>mod common;
+
+use common::client_for;
+use netsuite_cli::commands::record;
+use wiremock::matchers::{body_json, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn get_passes_fields_and_expand_params() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/customer/42"))
+        .and(query_param("fields", "companyName,email"))
+        .and(query_param("expandSubResources", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "42"})))
+        .mount(&amp;server).await;
+
+    let record_value = record::get(&amp;client_for(&amp;server), "customer", "42",
+        Some("companyName,email".into()), true).await.unwrap();
+    assert_eq!(record_value["id"], "42");
+}
+
+#[tokio::test]
+async fn create_returns_id_from_location_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/services/rest/record/v1/customer"))
+        .and(body_json(serde_json::json!({"companyName": "Acme"})))
+        .respond_with(ResponseTemplate::new(204)
+            .insert_header("Location", "https://x/services/rest/record/v1/customer/647"))
+        .mount(&amp;server).await;
+
+    let created = record::create(&amp;client_for(&amp;server), "customer",
+        serde_json::json!({"companyName": "Acme"})).await.unwrap();
+    assert_eq!(created, serde_json::json!({
+        "id": "647", "location": "https://x/services/rest/record/v1/customer/647"
+    }));
+}
+
+#[tokio::test]
+async fn list_all_follows_pagination_and_merges_items() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/customer"))
+        .and(query_param("offset", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 2, "hasMore": true, "offset": 0, "totalResults": 3,
+            "items": [{"id": "1"}, {"id": "2"}], "links": []
+        }))).mount(&amp;server).await;
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/customer"))
+        .and(query_param("offset", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 1, "hasMore": false, "offset": 2, "totalResults": 3,
+            "items": [{"id": "3"}], "links": []
+        }))).mount(&amp;server).await;
+
+    let listing = record::list(&amp;client_for(&amp;server), "customer", None, Some(2), None, true).await.unwrap();
+    assert_eq!(listing["totalResults"], 3);
+    assert_eq!(listing["items"].as_array().unwrap().len(), 3);
+    assert_eq!(listing["count"], 3);
+    assert_eq!(listing["hasMore"], false);
+}
+
+#[tokio::test]
+async fn upsert_uses_eid_path_and_update_sends_replace_param() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT")).and(path("/services/rest/record/v1/customer/eid:ACME-1"))
+        .respond_with(ResponseTemplate::new(204)).mount(&amp;server).await;
+    Mock::given(method("PATCH")).and(path("/services/rest/record/v1/salesOrder/7"))
+        .and(query_param("replace", "item"))
+        .respond_with(ResponseTemplate::new(204)).mount(&amp;server).await;
+
+    let ns_client = client_for(&amp;server);
+    let upserted = record::upsert(&amp;ns_client, "customer", "ACME-1",
+        serde_json::json!({"companyName": "Acme"})).await.unwrap();
+    assert_eq!(upserted["externalId"], "ACME-1");
+    let updated = record::update(&amp;ns_client, "salesOrder", "7",
+        serde_json::json!({"item": {"items": []}}), Some("item".into())).await.unwrap();
+    assert_eq!(updated["updated"], true);
+}
+</code></pre>
+<code>tests/common/mod.rs</code>:
+<pre><code>use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use netsuite_cli::auth::TokenProvider;
+use netsuite_cli::client::NsClient;
+use netsuite_cli::error::CliError;
+use wiremock::MockServer;
+
+pub struct StaticToken;
+
+impl TokenProvider for StaticToken {
+    fn access_token&lt;'life&gt;(&amp;'life self)
+        -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + 'life&gt;&gt; {
+        Box::pin(async { Ok("TEST_TOKEN".into()) })
+    }
+    fn invalidate(&amp;self) {}
+}
+
+pub fn client_for(server: &amp;MockServer) -&gt; NsClient {
+    NsClient::new(reqwest::Client::new(), server.uri(), Arc::new(StaticToken))
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test --test record_commands</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement <code>src/commands/record.rs</code>:</strong>
+<pre><code>use serde_json::{json, Value};
+
+use crate::client::NsClient;
+use crate::error::CliError;
+
+const DEFAULT_PAGE_LIMIT: u64 = 1000;
+
+pub async fn get(client: &amp;NsClient, record_type: &amp;str, record_id: &amp;str,
+    fields: Option&lt;String&gt;, expand_sub_resources: bool) -&gt; Result&lt;Value, CliError&gt; {
+    let mut query: Vec&lt;(&amp;str, String)&gt; = Vec::new();
+    if let Some(field_list) = fields { query.push(("fields", field_list)); }
+    if expand_sub_resources { query.push(("expandSubResources", "true".into())); }
+    let response = client.request(reqwest::Method::GET,
+        &amp;format!("/services/rest/record/v1/{record_type}/{record_id}"), &amp;query, &amp;[], None).await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+
+pub async fn list(client: &amp;NsClient, record_type: &amp;str, q_filter: Option&lt;String&gt;,
+    limit: Option&lt;u64&gt;, offset: Option&lt;u64&gt;, fetch_all: bool) -&gt; Result&lt;Value, CliError&gt; {
+    let page_limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    let mut page_offset = offset.unwrap_or(0);
+    let mut merged_items: Vec&lt;Value&gt; = Vec::new();
+    loop {
+        let mut query: Vec&lt;(&amp;str, String)&gt; = vec![
+            ("limit", page_limit.to_string()), ("offset", page_offset.to_string()),
+        ];
+        if let Some(ref filter) = q_filter { query.push(("q", filter.clone())); }
+        let response = client.request(reqwest::Method::GET,
+            &amp;format!("/services/rest/record/v1/{record_type}"), &amp;query, &amp;[], None).await?;
+        let page = response.body.unwrap_or(Value::Null);
+        if !fetch_all {
+            return Ok(page);
+        }
+        merged_items.extend(page["items"].as_array().cloned().unwrap_or_default());
+        if page["hasMore"].as_bool() != Some(true) {
+            let total = page["totalResults"].clone();
+            return Ok(json!({
+                "items": merged_items, "count": merged_items.len(),
+                "hasMore": false, "totalResults": total,
+            }));
+        }
+        page_offset += page_limit;
+    }
+}
+
+pub async fn create(client: &amp;NsClient, record_type: &amp;str, body: Value) -&gt; Result&lt;Value, CliError&gt; {
+    let response = client.request(reqwest::Method::POST,
+        &amp;format!("/services/rest/record/v1/{record_type}"), &amp;[], &amp;[], Some(&amp;body)).await?;
+    let location = response.location.unwrap_or_default();
+    let new_id = location.rsplit('/').next().unwrap_or_default().to_string();
+    Ok(json!({"id": new_id, "location": location}))
+}
+
+pub async fn update(client: &amp;NsClient, record_type: &amp;str, record_id: &amp;str,
+    body: Value, replace_sublists: Option&lt;String&gt;) -&gt; Result&lt;Value, CliError&gt; {
+    let mut query: Vec&lt;(&amp;str, String)&gt; = Vec::new();
+    if let Some(sublists) = replace_sublists { query.push(("replace", sublists)); }
+    client.request(reqwest::Method::PATCH,
+        &amp;format!("/services/rest/record/v1/{record_type}/{record_id}"), &amp;query, &amp;[], Some(&amp;body)).await?;
+    Ok(json!({"updated": true, "id": record_id}))
+}
+
+pub async fn upsert(client: &amp;NsClient, record_type: &amp;str, external_id: &amp;str,
+    body: Value) -&gt; Result&lt;Value, CliError&gt; {
+    client.request(reqwest::Method::PUT,
+        &amp;format!("/services/rest/record/v1/{record_type}/eid:{external_id}"), &amp;[], &amp;[], Some(&amp;body)).await?;
+    Ok(json!({"upserted": true, "externalId": external_id}))
+}
+
+pub async fn delete(client: &amp;NsClient, record_type: &amp;str, record_id: &amp;str) -&gt; Result&lt;Value, CliError&gt; {
+    client.request(reqwest::Method::DELETE,
+        &amp;format!("/services/rest/record/v1/{record_type}/{record_id}"), &amp;[], &amp;[], None).await?;
+    Ok(json!({"deleted": true, "id": record_id}))
+}
+</code></pre>
+<code>src/commands/mod.rs</code>:
+<pre><code>pub mod record;
+
+use std::io::Read;
+
+use serde_json::Value;
+
+use crate::error::CliError;
+
+pub fn read_data_arg(raw: &amp;str) -&gt; Result&lt;Value, CliError&gt; {
+    let text = if raw == "-" {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&amp;mut buffer)
+            .map_err(|io_error| CliError::Usage(format!("cannot read stdin: {io_error}")))?;
+        buffer
+    } else if let Some(file_path) = raw.strip_prefix('@') {
+        std::fs::read_to_string(file_path)
+            .map_err(|io_error| CliError::Usage(format!("cannot read {file_path}: {io_error}")))?
+    } else {
+        raw.to_string()
+    };
+    serde_json::from_str(&amp;text)
+        .map_err(|parse_error| CliError::Usage(format!("--data is not valid JSON: {parse_error}")))
+}
+</code></pre>
+<code>src/context.rs</code> (used by the clap layer, not by tests — tests build <code>NsClient</code> directly):
+<pre><code>use std::sync::Arc;
+
+use crate::account;
+use crate::auth::m2m::{M2mConfig, M2mProvider};
+use crate::auth::TokenProvider;
+use crate::client::NsClient;
+use crate::config::{AuthFlow, Config};
+use crate::error::CliError;
+use crate::secrets::{AccountSecrets, KeyringStore, SecretStore};
+
+pub const M2M_DEFAULT_SCOPES: &amp;[&amp;str] = &amp;["rest_webservices", "restlets"];
+
+pub struct AccountContext {
+    pub alias: String,
+    pub account_id: String,
+    pub client: NsClient,
+}
+
+pub fn context_for(alias_flag: Option&lt;&amp;str&gt;) -&gt; Result&lt;AccountContext, CliError&gt; {
+    let config = Config::load(&amp;crate::config::default_config_path())?;
+    let env_alias = std::env::var("NETSUITE_ACCOUNT").ok();
+    let alias = config.resolve_alias(alias_flag, env_alias.as_deref())?;
+    let entry = &amp;config.accounts[&amp;alias];
+    let store: Arc&lt;dyn SecretStore&gt; = Arc::new(KeyringStore);
+    let provider = provider_for(&amp;alias, entry.account_id.as_str(), entry.flow, store.clone())?;
+    let client = NsClient::new(reqwest::Client::new(), account::rest_base(&amp;entry.account_id), provider);
+    Ok(AccountContext { alias, account_id: entry.account_id.clone(), client })
+}
+
+fn provider_for(alias: &amp;str, account_id: &amp;str, flow: AuthFlow, store: Arc&lt;dyn SecretStore&gt;)
+    -&gt; Result&lt;Arc&lt;dyn TokenProvider&gt;, CliError&gt; {
+    let secrets = store.get(alias)?
+        .ok_or_else(|| CliError::Auth(format!("no credentials stored for '{alias}'; run `netsuite-cli account add`")))?;
+    let token_url = format!("{}/services/rest/auth/oauth2/v1/token", account::rest_base(account_id));
+    match (flow, secrets) {
+        (AuthFlow::M2m, AccountSecrets::M2m { client_id, cert_id, private_key_pem }) =&gt; {
+            let config = M2mConfig {
+                token_url, client_id, cert_id, private_key_pem,
+                scopes: M2M_DEFAULT_SCOPES.iter().map(|scope| scope.to_string()).collect(),
+            };
+            Ok(Arc::new(M2mProvider::new(reqwest::Client::new(), alias.to_string(), config, store)))
+        }
+        (AuthFlow::AuthCode, AccountSecrets::AuthCode { .. }) =&gt;
+            Err(CliError::Auth("auth-code provider lands in Task 9".into())), // replaced in Task 9
+        _ =&gt; Err(CliError::Auth(format!("stored credentials for '{alias}' do not match its configured flow"))),
+    }
+}
+</code></pre>
+<code>src/cli.rs</code> — full clap tree for the surfaces that exist so far; later tasks extend the enum. Every subcommand gets <code>after_help</code> examples:
+<pre><code>use clap::{Parser, Subcommand};
+
+use crate::commands::{self, record};
+use crate::context::context_for;
+use crate::error::CliError;
+use crate::output;
+
+#[derive(Parser)]
+#[command(name = "netsuite-cli", version, about = "NetSuite REST API CLI for AI agents",
+    propagate_version = true)]
+pub struct Cli {
+    /// Account alias (falls back to $NETSUITE_ACCOUNT, then the configured default)
+    #[arg(long, global = true)]
+    pub account: Option&lt;String&gt;,
+    /// Pretty-print JSON output
+    #[arg(long, global = true)]
+    pub pretty: bool,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Record CRUD against record/v1 (record types are plain strings, e.g. customer)
+    Record {
+        #[command(subcommand)]
+        action: RecordAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RecordAction {
+    #[command(after_help = "Example: netsuite-cli record get customer 1234 --fields companyName,email")]
+    Get { record_type: String, id: String,
+        #[arg(long)] fields: Option&lt;String&gt;,
+        #[arg(long)] expand_sub_resources: bool },
+    #[command(after_help = "Example: netsuite-cli record list customer --q 'email CONTAIN \"@acme.com\"' --all")]
+    List { record_type: String,
+        #[arg(long)] q: Option&lt;String&gt;,
+        #[arg(long)] limit: Option&lt;u64&gt;,
+        #[arg(long)] offset: Option&lt;u64&gt;,
+        #[arg(long)] all: bool },
+    #[command(after_help = "Example: netsuite-cli record create customer --data '{\"companyName\":\"Acme\"}'")]
+    Create { record_type: String, #[arg(long)] data: String },
+    #[command(after_help = "Example: netsuite-cli record update customer 1234 --data @patch.json --replace addressBook")]
+    Update { record_type: String, id: String,
+        #[arg(long)] data: String,
+        #[arg(long)] replace: Option&lt;String&gt; },
+    #[command(after_help = "Example: netsuite-cli record upsert customer ACME-001 --data '{\"companyName\":\"Acme\"}'")]
+    Upsert { record_type: String, external_id: String, #[arg(long)] data: String },
+    #[command(after_help = "Example: netsuite-cli record delete customer 1234")]
+    Delete { record_type: String, id: String },
+}
+
+pub async fn cli_main() -&gt; i32 {
+    let cli = Cli::parse();
+    match dispatch(&amp;cli).await {
+        Ok(result) =&gt; { output::print_json(&amp;result, cli.pretty); 0 }
+        Err(error) =&gt; { output::print_error(&amp;error); error.exit_code() as i32 }
+    }
+}
+
+async fn dispatch(cli: &amp;Cli) -&gt; Result&lt;serde_json::Value, CliError&gt; {
+    match &amp;cli.command {
+        Command::Record { action } =&gt; {
+            let context = context_for(cli.account.as_deref())?;
+            match action {
+                RecordAction::Get { record_type, id, fields, expand_sub_resources } =&gt;
+                    record::get(&amp;context.client, record_type, id, fields.clone(), *expand_sub_resources).await,
+                RecordAction::List { record_type, q, limit, offset, all } =&gt;
+                    record::list(&amp;context.client, record_type, q.clone(), *limit, *offset, *all).await,
+                RecordAction::Create { record_type, data } =&gt;
+                    record::create(&amp;context.client, record_type, commands::read_data_arg(data)?).await,
+                RecordAction::Update { record_type, id, data, replace } =&gt;
+                    record::update(&amp;context.client, record_type, id, commands::read_data_arg(data)?, replace.clone()).await,
+                RecordAction::Upsert { record_type, external_id, data } =&gt;
+                    record::upsert(&amp;context.client, record_type, external_id, commands::read_data_arg(data)?).await,
+                RecordAction::Delete { record_type, id } =&gt;
+                    record::delete(&amp;context.client, record_type, id).await,
+            }
+        }
+    }
+}
+</code></pre>
+<code>src/main.rs</code> becomes:
+<pre><code>#[tokio::main]
+async fn main() {
+    std::process::exit(netsuite_cli::cli::cli_main().await);
+}
+</code></pre>
+Add <code>pub mod cli; pub mod commands; pub mod context;</code> to <code>src/lib.rs</code>.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass. Manual check: <code>cargo run -q -- record get customer 1 ; echo $?</code> → usage error "no account selected", exit 2; <code>cargo run -q -- record --help</code> shows the examples.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: clap tree, account context wiring, record CRUD commands"</code>.</li>
+</ul>
+
+<h2 class="task">Task 7: SuiteQL command</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/commands/suiteql.rs</code> · Modify <code>src/commands/mod.rs</code>, <code>src/cli.rs</code> · Test <code>tests/suiteql.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>NsClient</code>. <strong>Produces:</strong> <code>commands::suiteql::run(client, query: &amp;str, limit: Option&lt;u64&gt;, offset: Option&lt;u64&gt;, fetch_all: bool) -&gt; Result&lt;Value, CliError&gt;</code>; CLI <code>netsuite-cli suiteql "&lt;query&gt;" [--limit] [--offset] [--all]</code>.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> <code>tests/suiteql.rs</code>:
+<pre><code>mod common;
+
+use common::client_for;
+use netsuite_cli::commands::suiteql;
+use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn posts_query_with_transient_prefer_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/services/rest/query/v1/suiteql"))
+        .and(header("Prefer", "transient"))
+        .and(body_json(serde_json::json!({"q": "SELECT id FROM customer"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 1, "hasMore": false, "offset": 0, "totalResults": 1,
+            "items": [{"id": "1"}], "links": []
+        })))
+        .mount(&amp;server).await;
+
+    let result = suiteql::run(&amp;client_for(&amp;server), "SELECT id FROM customer", None, None, false).await.unwrap();
+    assert_eq!(result["items"][0]["id"], "1");
+}
+
+#[tokio::test]
+async fn all_flag_pages_until_has_more_is_false() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/services/rest/query/v1/suiteql"))
+        .and(query_param("offset", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 2, "hasMore": true, "offset": 0, "totalResults": 3,
+            "items": [{"id": "1"}, {"id": "2"}], "links": []
+        }))).mount(&amp;server).await;
+    Mock::given(method("POST")).and(path("/services/rest/query/v1/suiteql"))
+        .and(query_param("offset", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "count": 1, "hasMore": false, "offset": 2, "totalResults": 3,
+            "items": [{"id": "3"}], "links": []
+        }))).mount(&amp;server).await;
+
+    let result = suiteql::run(&amp;client_for(&amp;server), "SELECT id FROM customer", Some(2), None, true).await.unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 3);
+    assert_eq!(result["hasMore"], false);
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test --test suiteql</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement <code>src/commands/suiteql.rs</code></strong> (same merge shape as <code>record::list</code>):
+<pre><code>use serde_json::{json, Value};
+
+use crate::client::NsClient;
+use crate::error::CliError;
+
+const DEFAULT_PAGE_LIMIT: u64 = 1000;
+
+pub async fn run(client: &amp;NsClient, query_text: &amp;str, limit: Option&lt;u64&gt;,
+    offset: Option&lt;u64&gt;, fetch_all: bool) -&gt; Result&lt;Value, CliError&gt; {
+    let page_limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    let mut page_offset = offset.unwrap_or(0);
+    let mut merged_items: Vec&lt;Value&gt; = Vec::new();
+    let body = json!({"q": query_text});
+    loop {
+        let query_params: Vec&lt;(&amp;str, String)&gt; = vec![
+            ("limit", page_limit.to_string()), ("offset", page_offset.to_string()),
+        ];
+        let response = client.request(reqwest::Method::POST, "/services/rest/query/v1/suiteql",
+            &amp;query_params, &amp;[("Prefer", "transient")], Some(&amp;body)).await?;
+        let page = response.body.unwrap_or(Value::Null);
+        if !fetch_all {
+            return Ok(page);
+        }
+        merged_items.extend(page["items"].as_array().cloned().unwrap_or_default());
+        if page["hasMore"].as_bool() != Some(true) {
+            let total = page["totalResults"].clone();
+            return Ok(json!({
+                "items": merged_items, "count": merged_items.len(),
+                "hasMore": false, "totalResults": total,
+            }));
+        }
+        page_offset += page_limit;
+    }
+}
+</code></pre>
+Wire into <code>cli.rs</code>: add variant
+<pre><code>    /// Run a SuiteQL query (POST query/v1/suiteql with Prefer: transient)
+    #[command(after_help = "Example: netsuite-cli suiteql \"SELECT id, entityid FROM customer\" --all")]
+    Suiteql { query: String,
+        #[arg(long)] limit: Option&lt;u64&gt;,
+        #[arg(long)] offset: Option&lt;u64&gt;,
+        #[arg(long)] all: bool },
+</code></pre>
+and dispatch arm calling <code>suiteql::run(&amp;context.client, query, *limit, *offset, *all)</code>.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: suiteql command with transient prefer header and pagination"</code>.</li>
+</ul>
+
+<h2 class="task">Task 8: describe — metadata catalog with cache</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/commands/describe.rs</code> · Modify <code>src/commands/mod.rs</code>, <code>src/cli.rs</code> · Test <code>tests/describe.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>NsClient</code>, <code>config::default_cache_dir()</code>. <strong>Produces:</strong> <code>commands::describe::{list_types(client) -&gt; Result&lt;Value, CliError&gt;, describe_type(client, record_type, format: MetadataFormat, cache_dir: &amp;Path, refresh: bool, ttl: Duration) -&gt; Result&lt;Value, CliError&gt;}</code>; <code>enum MetadataFormat { Schema, Openapi }</code> (clap <code>ValueEnum</code>). CLI: <code>netsuite-cli describe --list</code> · <code>netsuite-cli describe customer [--format schema|openapi] [--refresh]</code>.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> <code>tests/describe.rs</code>:
+<pre><code>mod common;
+
+use std::time::Duration;
+
+use common::client_for;
+use netsuite_cli::commands::describe::{self, MetadataFormat};
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn list_types_returns_names_from_catalog() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/metadata-catalog"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{"name": "account", "links": []}, {"name": "customer", "links": []}]
+        })))
+        .mount(&amp;server).await;
+
+    let types = describe::list_types(&amp;client_for(&amp;server)).await.unwrap();
+    assert_eq!(types, serde_json::json!({"recordTypes": ["account", "customer"]}));
+}
+
+#[tokio::test]
+async fn describe_sends_schema_accept_header_and_caches() {
+    let server = MockServer::start().await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/metadata-catalog/customer"))
+        .and(header("Accept", "application/schema+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "type": "object", "properties": {"companyName": {"type": "string"}}
+        })))
+        .expect(1) // second call must hit the cache
+        .mount(&amp;server).await;
+
+    let ns_client = client_for(&amp;server);
+    let ttl = Duration::from_secs(3600);
+    let first = describe::describe_type(&amp;ns_client, "customer", MetadataFormat::Schema,
+        cache_dir.path(), false, ttl).await.unwrap();
+    let second = describe::describe_type(&amp;ns_client, "customer", MetadataFormat::Schema,
+        cache_dir.path(), false, ttl).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first["properties"]["companyName"]["type"], "string");
+}
+
+#[tokio::test]
+async fn refresh_flag_bypasses_cache() {
+    let server = MockServer::start().await;
+    let cache_dir = tempfile::tempdir().unwrap();
+    Mock::given(method("GET")).and(path("/services/rest/record/v1/metadata-catalog/customer"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"v": 1})))
+        .expect(2)
+        .mount(&amp;server).await;
+
+    let ns_client = client_for(&amp;server);
+    let ttl = Duration::from_secs(3600);
+    describe::describe_type(&amp;ns_client, "customer", MetadataFormat::Schema, cache_dir.path(), false, ttl).await.unwrap();
+    describe::describe_type(&amp;ns_client, "customer", MetadataFormat::Schema, cache_dir.path(), true, ttl).await.unwrap();
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test --test describe</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement <code>src/commands/describe.rs</code>:</strong>
+<pre><code>use std::path::Path;
+use std::time::{Duration, SystemTime};
+
+use serde_json::{json, Value};
+
+use crate::client::NsClient;
+use crate::error::CliError;
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum MetadataFormat {
+    Schema,
+    Openapi,
+}
+
+impl MetadataFormat {
+    fn accept(self) -&gt; &amp;'static str {
+        match self {
+            MetadataFormat::Schema =&gt; "application/schema+json",
+            MetadataFormat::Openapi =&gt; "application/swagger+json",
+        }
+    }
+
+    fn cache_suffix(self) -&gt; &amp;'static str {
+        match self {
+            MetadataFormat::Schema =&gt; "schema",
+            MetadataFormat::Openapi =&gt; "openapi",
+        }
+    }
+}
+
+pub async fn list_types(client: &amp;NsClient) -&gt; Result&lt;Value, CliError&gt; {
+    let response = client.request(reqwest::Method::GET,
+        "/services/rest/record/v1/metadata-catalog", &amp;[], &amp;[("Accept", "application/json")], None).await?;
+    let names: Vec&lt;Value&gt; = response.body.unwrap_or(Value::Null)["items"]
+        .as_array().cloned().unwrap_or_default()
+        .iter().filter_map(|item| item["name"].as_str().map(Value::from)).collect();
+    Ok(json!({"recordTypes": names}))
+}
+
+pub async fn describe_type(client: &amp;NsClient, record_type: &amp;str, format: MetadataFormat,
+    cache_dir: &amp;Path, refresh: bool, cache_ttl: Duration) -&gt; Result&lt;Value, CliError&gt; {
+    let cache_file = cache_dir.join(format!("{record_type}.{}.json", format.cache_suffix()));
+    if !refresh {
+        if let Some(cached) = read_fresh_cache(&amp;cache_file, cache_ttl) {
+            return Ok(cached);
+        }
+    }
+    let response = client.request(reqwest::Method::GET,
+        &amp;format!("/services/rest/record/v1/metadata-catalog/{record_type}"),
+        &amp;[], &amp;[("Accept", format.accept())], None).await?;
+    let metadata = response.body.unwrap_or(Value::Null);
+    let _ = std::fs::create_dir_all(cache_dir);
+    let _ = std::fs::write(&amp;cache_file, serde_json::to_vec(&amp;metadata).expect("serializable"));
+    Ok(metadata)
+}
+
+fn read_fresh_cache(cache_file: &amp;Path, cache_ttl: Duration) -&gt; Option&lt;Value&gt; {
+    let modified = std::fs::metadata(cache_file).ok()?.modified().ok()?;
+    if SystemTime::now().duration_since(modified).ok()? &gt; cache_ttl {
+        return None;
+    }
+    serde_json::from_slice(&amp;std::fs::read(cache_file).ok()?).ok()
+}
+</code></pre>
+CLI variant (cache dir: <code>default_cache_dir().join("metadata").join(alias)</code>, TTL 24&nbsp;h):
+<pre><code>    /// Discover record types and per-type schemas from this account's metadata catalog
+    #[command(after_help = "Examples:\n  netsuite-cli describe --list\n  netsuite-cli describe customer\n  netsuite-cli describe salesOrder --format openapi --refresh")]
+    Describe {
+        record_type: Option&lt;String&gt;,
+        #[arg(long)] list: bool,
+        #[arg(long, value_enum, default_value = "schema")] format: MetadataFormat,
+        #[arg(long)] refresh: bool,
+    },
+</code></pre>
+Dispatch: <code>--list</code> (or no record_type) → <code>list_types</code>; otherwise <code>describe_type</code>. Passing neither a type nor <code>--list</code> is a usage error with a helpful message.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: describe command backed by metadata catalog with TTL cache"</code>.</li>
+</ul>
+
+<h2 class="task">Task 9: Auth-code flow (PKCE, HTTPS loopback, refresh rotation)</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/auth/authcode.rs</code> · Modify <code>src/auth/mod.rs</code>, <code>src/context.rs</code> · Tests inline + <code>tests/authcode.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>SecretStore</code>, <code>TokenResponse</code>, <code>account::app_base</code>. <strong>Produces:</strong>
+<code>authcode::{Pkce { verifier, challenge }, generate_pkce(), generate_state(), authorize_url(app_base, client_id, redirect_uri, scopes, state, challenge) -&gt; String, exchange_code(http, token_url, client_id, code, redirect_uri, verifier) -&gt; Result&lt;TokenResponse, CliError&gt;, refresh(http, token_url, client_id, refresh_token) -&gt; Result&lt;TokenResponse, CliError&gt;, run_login_flow(http, app_base, token_url, client_id, port, paste_mode) -&gt; Result&lt;TokenResponse, CliError&gt;}</code> and <code>AuthCodeProvider</code> (implements <code>TokenProvider</code>; persists rotated refresh tokens through <code>SecretStore</code>). <code>context::provider_for</code>'s AuthCode arm is replaced to construct it.</div>
+
+<div class="callout"><strong>Why HTTPS loopback:</strong> NetSuite rejects plain <code>http://</code> redirect URIs, so the listener serves TLS on <code>https://localhost:{port}/callback</code> with a throwaway rcgen self-signed cert (browser shows a one-time warning). <code>--paste</code> mode skips the listener entirely: print the authorize URL, user logs in, then pastes the final redirect URL (browser will show a connection error page — the URL still contains <code>code</code> and <code>state</code>). The redirect URI registered on the integration record must be <code>https://localhost:8899/callback</code> (or the chosen port). The CLI is a <strong>public client</strong>: PKCE S256 always; <code>client_id</code> in token-request bodies; no client secret stored.</div>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing unit tests</strong> in <code>src/auth/authcode.rs</code> — RFC 7636 appendix B vector plus URL/state rules:
+<pre><code>#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_challenge_matches_rfc7636_test_vector() {
+        let challenge = challenge_for_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn generated_pkce_and_state_meet_netsuite_rules() {
+        let pkce = generate_pkce();
+        assert!(pkce.verifier.len() &gt;= 43 &amp;&amp; pkce.verifier.len() &lt;= 128);
+        assert!(pkce.verifier.chars().all(|ch| ch.is_ascii_alphanumeric() || "-._~".contains(ch)));
+        let state = generate_state();
+        assert!(state.len() &gt;= 22 &amp;&amp; state.len() &lt;= 1024);
+    }
+
+    #[test]
+    fn authorize_url_contains_all_required_params() {
+        let url = authorize_url("https://123456-sb1.app.netsuite.com", "cid",
+            "https://localhost:8899/callback", &amp;["rest_webservices".into(), "restlets".into()],
+            "STATESTATESTATESTATE22", "CHALLENGE");
+        assert!(url.starts_with("https://123456-sb1.app.netsuite.com/app/login/oauth2/authorize.nl?"));
+        for expected in ["response_type=code", "client_id=cid", "code_challenge_method=S256",
+            "code_challenge=CHALLENGE", "state=STATESTATESTATESTATE22",
+            "scope=rest_webservices+restlets",
+            "redirect_uri=https%3A%2F%2Flocalhost%3A8899%2Fcallback"] {
+            assert!(url.contains(expected), "missing {expected} in {url}");
+        }
+    }
+
+    #[test]
+    fn callback_query_parsing_extracts_code_and_validates_state() {
+        let parsed = parse_callback_query("code=abc123&amp;state=EXPECTED&amp;role=3&amp;entity=9", "EXPECTED").unwrap();
+        assert_eq!(parsed, "abc123");
+        assert!(parse_callback_query("code=abc&amp;state=WRONG", "EXPECTED").is_err());
+        assert!(parse_callback_query("error=access_denied&amp;state=EXPECTED", "EXPECTED").is_err());
+    }
+}
+</code></pre>
+Integration tests <code>tests/authcode.rs</code> (wiremock token endpoint; no browser/listener involved):
+<pre><code>use std::sync::Arc;
+
+use netsuite_cli::auth::authcode::{exchange_code, refresh, AuthCodeProvider};
+use netsuite_cli::auth::TokenProvider;
+use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
+use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn exchange_sends_pkce_verifier_and_public_client_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/token"))
+        .and(body_string_contains("grant_type=authorization_code"))
+        .and(body_string_contains("code=CODE1"))
+        .and(body_string_contains("code_verifier=VERIFIER"))
+        .and(body_string_contains("client_id=cid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "AT1", "refresh_token": "RT1", "expires_in": 3600, "token_type": "bearer"
+        })))
+        .mount(&amp;server).await;
+
+    let token = exchange_code(&amp;reqwest::Client::new(), &amp;format!("{}/token", server.uri()),
+        "cid", "CODE1", "https://localhost:8899/callback", "VERIFIER").await.unwrap();
+    assert_eq!(token.access_token, "AT1");
+    assert_eq!(token.refresh_token.as_deref(), Some("RT1"));
+}
+
+#[tokio::test]
+async fn provider_refreshes_and_persists_rotated_refresh_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .and(body_string_contains("refresh_token=RT_OLD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "AT2", "refresh_token": "RT_NEW", "expires_in": 3600, "token_type": "bearer"
+        })))
+        .mount(&amp;server).await;
+
+    let store: Arc&lt;dyn SecretStore&gt; = Arc::new(MemoryStore::default());
+    store.set("dev", &amp;AccountSecrets::AuthCode {
+        client_id: "cid".into(), refresh_token: Some("RT_OLD".into()),
+    }).unwrap();
+
+    let provider = AuthCodeProvider::new(reqwest::Client::new(), "dev".into(),
+        format!("{}/token", server.uri()), "cid".into(), store.clone());
+    assert_eq!(provider.access_token().await.unwrap(), "AT2");
+
+    match store.get("dev").unwrap().unwrap() {
+        AccountSecrets::AuthCode { refresh_token, .. } =&gt;
+            assert_eq!(refresh_token.as_deref(), Some("RT_NEW")), // rotation persisted
+        other =&gt; panic!("wrong variant: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_refresh_token_yields_actionable_auth_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "invalid_grant"})))
+        .mount(&amp;server).await;
+
+    let store: Arc&lt;dyn SecretStore&gt; = Arc::new(MemoryStore::default());
+    store.set("dev", &amp;AccountSecrets::AuthCode {
+        client_id: "cid".into(), refresh_token: Some("RT_DEAD".into()),
+    }).unwrap();
+
+    let provider = AuthCodeProvider::new(reqwest::Client::new(), "dev".into(),
+        format!("{}/token", server.uri()), "cid".into(), store);
+    let error = provider.access_token().await.unwrap_err();
+    assert!(error.to_string().contains("account add"), "should tell the user to re-authenticate: {error}");
+}
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement <code>src/auth/authcode.rs</code>.</strong> Pure parts:
+<pre><code>use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use rand::Rng;
+use sha2::{Digest, Sha256};
+
+use crate::auth::{TokenProvider, TokenResponse};
+use crate::error::CliError;
+use crate::secrets::{AccountSecrets, CachedToken, SecretStore};
+
+pub struct Pkce {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+pub fn generate_pkce() -&gt; Pkce {
+    let verifier = random_token(64);
+    Pkce { challenge: challenge_for_verifier(&amp;verifier), verifier }
+}
+
+pub fn generate_state() -&gt; String {
+    random_token(32)
+}
+
+fn random_token(length: usize) -&gt; String {
+    const CHARSET: &amp;[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut rng = rand::rng();
+    (0..length).map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char).collect()
+}
+
+fn challenge_for_verifier(verifier: &amp;str) -&gt; String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+pub fn authorize_url(app_base: &amp;str, client_id: &amp;str, redirect_uri: &amp;str,
+    scopes: &amp;[String], state: &amp;str, challenge: &amp;str) -&gt; String {
+    let mut url = url::Url::parse(&amp;format!("{app_base}/app/login/oauth2/authorize.nl")).expect("valid base");
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", &amp;scopes.join(" "))
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    url.to_string()
+}
+
+pub fn parse_callback_query(query: &amp;str, expected_state: &amp;str) -&gt; Result&lt;String, CliError&gt; {
+    let pairs: Vec&lt;(String, String)&gt; = url::form_urlencoded::parse(query.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned())).collect();
+    let lookup = |name: &amp;str| pairs.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+    if let Some(oauth_error) = lookup("error") {
+        return Err(CliError::Auth(format!("authorization denied: {oauth_error}")));
+    }
+    if lookup("state").as_deref() != Some(expected_state) {
+        return Err(CliError::Auth("state mismatch in OAuth callback — possible CSRF, aborting".into()));
+    }
+    lookup("code").ok_or_else(|| CliError::Auth("no authorization code in callback".into()))
+}
+</code></pre>
+Token requests (public client: <code>client_id</code> in body, no Basic auth):
+<pre><code>pub async fn exchange_code(http: &amp;reqwest::Client, token_url: &amp;str, client_id: &amp;str,
+    code: &amp;str, redirect_uri: &amp;str, verifier: &amp;str) -&gt; Result&lt;TokenResponse, CliError&gt; {
+    post_token(http, token_url, &amp;[
+        ("grant_type", "authorization_code"), ("code", code),
+        ("redirect_uri", redirect_uri), ("code_verifier", verifier), ("client_id", client_id),
+    ]).await
+}
+
+pub async fn refresh(http: &amp;reqwest::Client, token_url: &amp;str, client_id: &amp;str,
+    refresh_token: &amp;str) -&gt; Result&lt;TokenResponse, CliError&gt; {
+    post_token(http, token_url, &amp;[
+        ("grant_type", "refresh_token"), ("refresh_token", refresh_token), ("client_id", client_id),
+    ]).await
+}
+
+async fn post_token(http: &amp;reqwest::Client, token_url: &amp;str, form: &amp;[(&amp;str, &amp;str)])
+    -&gt; Result&lt;TokenResponse, CliError&gt; {
+    let response = http.post(token_url).form(form).send().await
+        .map_err(|send_error| CliError::Network(format!("token request failed: {send_error}")))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(CliError::Auth(format!("token endpoint returned {status}: {body}")));
+    }
+    serde_json::from_str(&amp;body)
+        .map_err(|parse_error| CliError::Auth(format!("bad token response: {parse_error}")))
+}
+</code></pre>
+<code>AuthCodeProvider</code> — cached token → refresh grant → persist rotation; on refresh failure, actionable error:
+<pre><code>pub struct AuthCodeProvider {
+    http: reqwest::Client,
+    alias: String,
+    token_url: String,
+    client_id: String,
+    store: Arc&lt;dyn SecretStore&gt;,
+}
+
+impl AuthCodeProvider {
+    pub fn new(http: reqwest::Client, alias: String, token_url: String,
+        client_id: String, store: Arc&lt;dyn SecretStore&gt;) -&gt; Self {
+        AuthCodeProvider { http, alias, token_url, client_id, store }
+    }
+
+    async fn refresh_access_token(&amp;self) -&gt; Result&lt;String, CliError&gt; {
+        let Some(AccountSecrets::AuthCode { refresh_token: Some(current_refresh), .. }) =
+            self.store.get(&amp;self.alias)? else {
+            return Err(CliError::Auth(format!(
+                "no refresh token for '{}'; run `netsuite-cli account add {} --flow auth-code …` to re-authenticate",
+                self.alias, self.alias)));
+        };
+        let token = refresh(&amp;self.http, &amp;self.token_url, &amp;self.client_id, &amp;current_refresh).await
+            .map_err(|refresh_error| CliError::Auth(format!(
+                "refresh failed ({refresh_error}); re-authenticate with `netsuite-cli account add {} --flow auth-code …`",
+                self.alias)))?;
+        if let Some(rotated_refresh) = &amp;token.refresh_token {
+            self.store.set(&amp;self.alias, &amp;AccountSecrets::AuthCode {
+                client_id: self.client_id.clone(), refresh_token: Some(rotated_refresh.clone()),
+            })?;
+        }
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        self.store.set_token(&amp;self.alias, &amp;CachedToken {
+            access_token: token.access_token.clone(),
+            expires_at_epoch: now_epoch + token.expires_in,
+        })?;
+        Ok(token.access_token)
+    }
+}
+
+impl TokenProvider for AuthCodeProvider {
+    fn access_token&lt;'life&gt;(&amp;'life self)
+        -&gt; Pin&lt;Box&lt;dyn Future&lt;Output = Result&lt;String, CliError&gt;&gt; + Send + 'life&gt;&gt; {
+        Box::pin(async move {
+            let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            if let Some(cached) = self.store.get_token(&amp;self.alias)? {
+                if cached.is_valid_at(now_epoch) {
+                    return Ok(cached.access_token);
+                }
+            }
+            self.refresh_access_token().await
+        })
+    }
+
+    fn invalidate(&amp;self) {
+        let _ = self.store.delete_token(&amp;self.alias);
+    }
+}
+</code></pre>
+Interactive login (<code>run_login_flow</code>) — generate PKCE + state, build URL for <code>https://localhost:{port}/callback</code>, open browser (<code>webbrowser::open</code>), then either (a) paste mode: prompt on stderr, read redirect URL from stdin, extract query; or (b) listener: rcgen self-signed cert for <code>localhost</code> → <code>rustls::ServerConfig</code> → <code>tokio_rustls::TlsAcceptor</code> over a <code>TcpListener</code> on <code>127.0.0.1:{port}</code>; accept connections in a loop, read the request head, ignore favicon requests, answer <code>HTTP/1.1 200</code> with a short "Login complete — return to your terminal" HTML body, then <code>parse_callback_query</code> and <code>exchange_code</code>. Both paths print progress messages to <strong>stderr</strong> only. This function is exercised by the Task 14 live smoke test, not unit tests (browser + TLS handshake); keep it under ~80 lines and isolate all pure logic in the tested helpers above.
+<br>Finally replace the AuthCode arm in <code>context::provider_for</code>:
+<pre><code>        (AuthFlow::AuthCode, AccountSecrets::AuthCode { client_id, .. }) =&gt;
+            Ok(Arc::new(AuthCodeProvider::new(reqwest::Client::new(), alias.to_string(),
+                token_url, client_id, store))),
+</code></pre></li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass (4 unit + 3 integration new).</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: OAuth2 auth-code flow with PKCE, HTTPS loopback, refresh rotation"</code>.</li>
+</ul>
+
+<h2 class="task">Task 10: account commands</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/commands/account.rs</code> · Modify <code>src/cli.rs</code>, <code>src/commands/mod.rs</code> · Test <code>tests/account_commands.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>Config</code>, <code>SecretStore</code>, <code>authcode::run_login_flow</code>, <code>NsClient</code>. <strong>Produces:</strong> <code>commands::account::{add_m2m, add_auth_code, list, remove, set_default, test}</code> — all take explicit <code>&amp;Path</code> config path and <code>Arc&lt;dyn SecretStore&gt;</code> so tests use tempdirs + <code>MemoryStore</code>. CLI:
+<pre><code>netsuite-cli account add prod --account-id 1234567 --flow m2m \
+    --client-id CID --cert-id KID --key ./netsuite-m2m.pem
+netsuite-cli account add dev --account-id 1234567_SB1 --flow auth-code \
+    --client-id CID [--port 8899] [--paste]
+netsuite-cli account list | set-default &lt;alias&gt; | remove &lt;alias&gt; | test [--alias &lt;alias&gt;]
+</code></pre></div>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> — <code>add_m2m</code> reads the key file, stores <code>AccountSecrets::M2m</code> in the store and the alias/flow in config (assert key file contents land in the store and config gains the entry, first added account becomes default); <code>list</code> returns <code>{"accounts":[{"alias","accountId","flow","default":bool}]}</code> with no secrets; <code>remove</code> deletes config entry + secrets (+ clears default if it pointed there); <code>set_default</code> validates the alias exists; <code>test</code> is exercised at client level with wiremock: it calls <code>GET /services/rest/record/v1/metadata-catalog?select=customer</code> and returns <code>{"alias","ok":true}</code> on 200. Write them following the established wiremock/tempfile patterns.</li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test --test account_commands</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement.</strong> Signatures:
+<pre><code>pub fn add_m2m(config_path: &amp;Path, store: &amp;dyn SecretStore, alias: &amp;str, account_id: &amp;str,
+    client_id: &amp;str, cert_id: &amp;str, key_path: &amp;Path) -&gt; Result&lt;Value, CliError&gt;
+pub async fn add_auth_code(config_path: &amp;Path, store: Arc&lt;dyn SecretStore&gt;, alias: &amp;str,
+    account_id: &amp;str, client_id: &amp;str, port: u16, paste_mode: bool) -&gt; Result&lt;Value, CliError&gt;
+pub fn list(config_path: &amp;Path) -&gt; Result&lt;Value, CliError&gt;
+pub fn remove(config_path: &amp;Path, store: &amp;dyn SecretStore, alias: &amp;str) -&gt; Result&lt;Value, CliError&gt;
+pub fn set_default(config_path: &amp;Path, alias: &amp;str) -&gt; Result&lt;Value, CliError&gt;
+pub async fn test(client: &amp;NsClient, alias: &amp;str) -&gt; Result&lt;Value, CliError&gt;
+</code></pre>
+<code>add_m2m</code>: validate the PEM parses via <code>m2m::build_assertion</code>-style key detection before storing (reject bad keys at add time, not first use). <code>add_auth_code</code>: run <code>run_login_flow</code> immediately, persist <code>AccountSecrets::AuthCode</code> with the obtained refresh token, then write config. Both set <code>default_account</code> if it was <code>None</code>. Wire the clap <code>Account</code> subcommand with the flags shown in the interface block; <code>account add</code> chooses the code path from <code>--flow</code> and errors (usage) if M2M flags are missing for <code>m2m</code> or vice versa.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → pass. Manual: <code>cargo run -q -- account list --pretty</code> → <code>{"accounts": []}</code>.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: account add/list/remove/set-default/test commands"</code>.</li>
+</ul>
+
+<h2 class="task">Task 11: restlet, raw, job commands</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/commands/restlet.rs</code>, <code>src/commands/raw.rs</code>, <code>src/commands/job.rs</code> · Modify <code>src/cli.rs</code>, <code>src/commands/mod.rs</code>, <code>src/context.rs</code> (expose <code>restlet_base</code> on <code>AccountContext</code>) · Test <code>tests/restlet_raw_job.rs</code></div>
+<div class="iface"><strong>Consumes:</strong> <code>NsClient</code> (absolute-URL support from Task 5), <code>account::restlet_base</code>. <strong>Produces:</strong>
+<pre><code>restlet::call(client, restlet_base, script: &amp;str, deploy: &amp;str, http_method: reqwest::Method,
+    params: &amp;[(String, String)], body: Option&lt;Value&gt;) -&gt; Result&lt;Value, CliError&gt;
+raw::run(client, http_method, path: &amp;str, query: &amp;[(String, String)],
+    headers: &amp;[(String, String)], body: Option&lt;Value&gt;) -&gt; Result&lt;Value, CliError&gt;
+job::submit(client, http_method, path, body, idempotency_key: Option&lt;String&gt;) -&gt; Result&lt;Value, CliError&gt;
+job::status(client, job_id) / job::tasks(client, job_id) / job::result(client, job_id, task_id: Option&lt;String&gt;)
+</code></pre>
+CLI: <code>restlet call --script 482 --deploy 1 [--method POST] [--param k=v]... [--data …]</code> · <code>raw GET /services/rest/record/v1/customer/1 [--query k=v] [--header 'Name: value'] [--data …]</code> · <code>job submit POST /services/rest/record/v1/customer --data … [--idempotency-key UUID]</code>, <code>job status &lt;id&gt;</code>, <code>job tasks &lt;id&gt;</code>, <code>job result &lt;id&gt; [--task &lt;taskId&gt;]</code>.</div>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> <code>tests/restlet_raw_job.rs</code>:
+<ul>
+<li><code>restlet::call</code> GET: request goes to <code>{restlet_base}/app/site/hosting/restlet.nl</code> with <code>script</code>/<code>deploy</code>/extra params in the query, bearer header present (mount a wiremock on a second MockServer acting as the restlets domain, pass its uri as <code>restlet_base</code>).</li>
+<li><code>restlet::call</code> POST sends JSON body with <code>Content-Type: application/json</code>.</li>
+<li><code>raw::run</code> forwards method, custom query, custom headers, body; returns the response JSON (raw responses that aren't JSON come back as <code>{"raw": "&lt;text&gt;"}</code> — implement by trying JSON parse first; adjust NsResponse handling by returning <code>Value::String</code>? No — keep NsClient as-is and have <code>raw::run</code> wrap <code>response.body.unwrap_or(json!({"status": response.status}))</code>).</li>
+<li><code>job::submit</code>: mock returns 202 with <code>Location: /services/rest/async/v1/job/9001</code> (relative on purpose) → result <code>{"jobId": "9001", "location": "…", "status": 202}</code>; assert the request carried <code>Prefer: respond-async</code> and, when given, <code>X-NetSuite-Idempotency-Key</code>.</li>
+<li><code>job::status</code>/<code>job::result</code>: plain GETs to <code>/services/rest/async/v1/job/9001</code> and <code>…/task/9001.1/result</code>; <code>job::result</code> without <code>--task</code> first lists tasks and, if exactly one, fetches its result.</li>
+</ul></li>
+<li><input type="checkbox"> <strong>Step 2:</strong> <code>cargo test --test restlet_raw_job</code> → compile failure.</li>
+<li><input type="checkbox"> <strong>Step 3: Implement.</strong> Key details: restlet URL is <code>format!("{restlet_base}/app/site/hosting/restlet.nl")</code> hit via <code>client.request</code> with the absolute URL (bearer comes along automatically); <code>job::submit</code> extracts the job id as <code>location.rsplit('/').next()</code>; job id path building: <code>/services/rest/async/v1/job/{job_id}</code>, tasks <code>…/task/</code>, result <code>…/task/{task_id}/result</code>. <code>--param</code>/<code>--query</code> parse <code>key=value</code> (usage error otherwise); <code>--header</code> parses <code>Name: value</code>. Clap wiring mirrors earlier tasks with <code>after_help</code> examples as shown in the interface block.</li>
+<li><input type="checkbox"> <strong>Step 4:</strong> <code>cargo test</code> → all pass.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit:</strong> <code>git commit -am "feat: restlet, raw passthrough, and async job commands"</code>.</li>
+</ul>
+
+<h2 class="task">Task 12: self-update + config command</h2>
+<div class="files"><strong>Files:</strong> Create <code>src/commands/update.rs</code>, <code>src/commands/config_cmd.rs</code> · Modify <code>src/cli.rs</code>, <code>src/commands/mod.rs</code> · Test <code>tests/config_cmd.rs</code></div>
+<div class="iface"><strong>Produces:</strong> <code>update::run(check_only: bool) -&gt; Result&lt;Value, CliError&gt;</code> (constants <code>REPO_OWNER</code>/<code>REPO_NAME</code> — set from <code>git remote get-url origin</code>; Task 13 creates the repo first if none exists, so implement this task AFTER confirming the remote, or set the constants then); <code>config_cmd::{get, set}</code> for keys <code>default_account</code> and <code>cache_ttl_hours</code> (extend <code>Config</code> with <code>cache_ttl_hours: Option&lt;u64&gt;</code>, default 24, and use it in the describe dispatch).</div>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Failing tests</strong> for <code>config_cmd</code> (tempdir config): <code>set("cache_ttl_hours", "48")</code> then <code>get</code> returns <code>{"cache_ttl_hours": 48}</code>; unknown key → usage error listing valid keys; <code>set("default_account", alias)</code> validates the alias exists (reuse <code>resolve_alias</code> semantics).</li>
+<li><input type="checkbox"> <strong>Step 2:</strong> verify failure, then implement. <code>update::run</code> uses <code>self_update::backends::github::Update::configure().repo_owner(REPO_OWNER).repo_name(REPO_NAME).bin_name("netsuite-cli").show_download_progress(false).current_version(env!("CARGO_PKG_VERSION")).build()</code>; <code>check_only</code> → <code>get_latest_release()</code> and report <code>{"current", "latest", "updateAvailable"}</code> without installing; otherwise <code>update()?</code> → <code>{"updated": bool, "version"}</code>. Wrap all its errors into <code>CliError::Network</code>. Run it via <code>tokio::task::spawn_blocking</code> (self_update is blocking). No unit test for the GitHub call — verified in Task 13 CI smoke.</li>
+<li><input type="checkbox"> <strong>Step 3:</strong> <code>cargo test</code> → pass. Manual: <code>cargo run -q -- update --check</code> → network/API error until a release exists (that's expected; confirm the error is a clean JSON envelope, exit 4).</li>
+<li><input type="checkbox"> <strong>Step 4: Commit:</strong> <code>git commit -am "feat: self-update from GitHub Releases and config get/set"</code>.</li>
+</ul>
+
+<h2 class="task">Task 13: GitHub repo, CI, release pipeline</h2>
+<div class="files"><strong>Files:</strong> Create <code>.github/workflows/ci.yml</code>, <code>.github/workflows/release.yml</code></div>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Ensure the GitHub repo exists.</strong> <code>git remote get-url origin</code> — if it fails: <code>gh repo create netsuite-cli --private --source . --push</code> (confirm the owner org with the user if <code>gh api user</code> shows multiple orgs; default to the personal/org account that owns their other CP repos). Record owner/name into Task 12's <code>REPO_OWNER</code>/<code>REPO_NAME</code> constants now and amend if needed.</li>
+<li><input type="checkbox"> <strong>Step 2: <code>ci.yml</code></strong> — on push/PR: jobs <code>test</code> (matrix: <code>macos-latest</code>, <code>windows-latest</code>, <code>ubuntu-latest</code>; <code>dtolnay/rust-toolchain@stable</code>, <code>Swatinem/rust-cache@v2</code>, <code>cargo test --locked</code>) and <code>lint</code> (ubuntu: <code>cargo fmt --check</code> + <code>cargo clippy --all-targets -- -D warnings</code>). Note: keyring is never touched by tests, so headless CI is fine.</li>
+<li><input type="checkbox"> <strong>Step 3: <code>release.yml</code></strong> — on tag <code>v*</code>: matrix build for <code>aarch64-apple-darwin</code>, <code>x86_64-apple-darwin</code> (both on <code>macos-latest</code>), <code>x86_64-pc-windows-msvc</code> (<code>windows-latest</code>); <code>cargo build --release --target $TARGET</code>; zip each binary as <code>netsuite-cli-${{ github.ref_name }}-${TARGET}.zip</code> (self_update matches assets by target triple substring); publish with <code>softprops/action-gh-release@v2</code>.</li>
+<li><input type="checkbox"> <strong>Step 4: Verify:</strong> commit + push, watch <code>gh run watch</code> until CI is green on all three OSes. Then <code>git tag v0.1.0 &amp;&amp; git push --tags</code>, watch the release job produce three assets, and run <code>cargo run -q -- update --check</code> → <code>{"updateAvailable": false, …}</code> (or true if version drifted) — this is the end-to-end validation of Task 12.</li>
+<li><input type="checkbox"> <strong>Step 5: Commit</strong> any fixes: <code>git commit -am "ci: test matrix and release pipeline"</code>.</li>
+</ul>
+
+<h2 class="task">Task 14: README, live smoke test, final gate</h2>
+<div class="files"><strong>Files:</strong> Modify <code>README.md</code> · Create <code>tests/live_smoke.rs</code></div>
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: <code>tests/live_smoke.rs</code></strong> — all <code>#[ignore]</code>, run only via <code>cargo test --test live_smoke -- --ignored</code> with env <code>NETSUITE_LIVE_ALIAS</code> set: <code>account test</code> equivalent (metadata-catalog fetch through <code>context_for</code>), a <code>suiteql "SELECT id FROM currency"</code> call, and a <code>describe currency</code> call. These exercise the real keychain + real OAuth (M2M) end to end against a sandbox.</li>
+<li><input type="checkbox"> <strong>Step 2: README</strong> — replace the scaffold README: install (release download + <code>netsuite-cli update</code>), NetSuite setup for both flows (integration record, certificate generation with the documented OpenSSL commands — RSA-PSS 4096 or EC P-256, 2-year max validity, upload via OAuth 2.0 Client Credentials (M2M) Setup, Certificate ID = <code>kid</code>; auth-code redirect URI <code>https://localhost:8899/callback</code>), agent-oriented usage examples for every subcommand, output/exit-code contract table, and the account-switching mechanics. Keep the Basecamp link.</li>
+<li><input type="checkbox"> <strong>Step 3: Final verification gate</strong> (superpowers:verification-before-completion): <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> all green locally, CI green on both target OSes, and — with the user's sandbox credentials — the live smoke suite passes. Show the actual outputs.</li>
+<li><input type="checkbox"> <strong>Step 4: Commit:</strong> <code>git commit -am "docs: agent-oriented README; live smoke suite"</code>.</li>
+</ul>
+
+<h2>Plan self-review (done at authoring time)</h2>
+<ul>
+  <li><strong>Spec coverage:</strong> accounts/switching → Tasks 2/10 · keychain storage → 3 · M2M → 4 · auth-code → 9 · records → 6 · SuiteQL → 7 · describe/metadata → 8 · RESTlets/async/raw → 11 · self-update + config → 12/13 · JSON/exit codes → 1 · agent help text → 6–11 <code>after_help</code> · TDD/wiremock → every task · CI mac+windows → 13 · live sandbox check → 14. Out-of-scope items from the spec remain out.</li>
+  <li><strong>Known judgment calls:</strong> (a) M2M JWT <code>scope</code> uses the JSON-array form from Oracle's own example; if a sandbox rejects it, fall back to a comma-joined string — single line in <code>build_assertion</code>. (b) HTTPS-loopback listener is unavoidable given NetSuite's https-only redirect rule; <code>--paste</code> is the fallback. (c) <code>TokenProvider</code> uses manual <code>Pin&lt;Box&lt;…&gt;&gt;</code> futures for object safety instead of adding an <code>async-trait</code> dependency.</li>
+  <li><strong>Type consistency check:</strong> signatures in the Interfaces blocks are the source of truth; later tasks reference only names defined there (<code>NsClient::request</code>, <code>read_data_arg</code>, <code>context_for</code>, <code>SecretStore</code> methods, provider constructors).</li>
+</ul>
+
+<div class="buttons">
+  <span>Execution:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-driven" target="_blank">Subagent-driven (recommended) — fresh subagent per task, review between tasks</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline" target="_blank">Inline — execute in this session with checkpoints</a>
+</div>
+
+</body>
+</html>

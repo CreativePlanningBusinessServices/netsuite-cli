@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli — Design Spec (2026-07-09)</title>
+<style>
+  :root {
+    --ink: #1e2430;
+    --muted: #5c6675;
+    --accent: #0a6e5c;
+    --accent-soft: #e3f2ee;
+    --border: #d9dee6;
+    --code-bg: #f4f6f9;
+    --warn-bg: #fdf3e3;
+    --warn-border: #e6c98a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto; max-width: 860px; padding: 2.5rem 1.5rem 4rem;
+    font: 16px/1.6 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--ink); background: #fff;
+  }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.25rem; margin: 2.2rem 0 .6rem; border-bottom: 2px solid var(--accent-soft); padding-bottom: .3rem; }
+  h3 { font-size: 1.02rem; margin: 1.4rem 0 .4rem; }
+  .meta { color: var(--muted); font-size: .9rem; margin-bottom: 1.5rem; }
+  .meta a { color: var(--accent); }
+  code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .86em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-size: .93rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .65rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  ul { padding-left: 1.3rem; }
+  li { margin: .25rem 0; }
+  .decisions td:first-child { white-space: nowrap; font-weight: 600; }
+  .verify { background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 8px; padding: .8rem 1rem; }
+  .verify h3 { margin-top: 0; }
+  .buttons { display: flex; gap: .75rem; flex-wrap: wrap; background: var(--accent-soft); border: 1px solid var(--accent); border-radius: 10px; padding: 1rem; margin: 1.2rem 0; align-items: center; }
+  .buttons span { font-weight: 600; }
+  .buttons a {
+    display: inline-block; padding: .5rem 1.1rem; border-radius: 8px; text-decoration: none;
+    font-weight: 600; border: 1px solid var(--accent);
+  }
+  .buttons a.primary { background: var(--accent); color: #fff; }
+  .buttons a.secondary { background: #fff; color: var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>netsuite-cli — Design Spec</h1>
+<div class="meta">
+  2026-07-09 · Rust CLI for the NetSuite REST API, built for AI agents on macOS &amp; Windows ·
+  <a href="https://basecamp.com/2808802/projects/8218129/todos/518729835">Basecamp task 518729835</a>
+</div>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes (tell Claude what to change)</a>
+</div>
+
+<h2>1. Purpose &amp; goals</h2>
+<p>
+A single-binary CLI, <code>netsuite-cli</code>, that gives AI agents full programmatic access to the
+NetSuite REST API: record CRUD, SuiteQL, the metadata catalog, RESTlet execution, async job
+handling, and a raw-request escape hatch. Each invocation targets one of several remembered
+accounts; credentials are stored securely per account. Output is machine-readable JSON with
+deterministic exit codes.
+</p>
+<p>
+A core requirement is surviving NetSuite's twice-yearly API releases without code changes:
+the CLI is <strong>dynamic</strong> — record types are runtime arguments and schemas are discovered from each
+account's own metadata catalog, never hardcoded or code-generated.
+</p>
+
+<h2>2. Decisions made</h2>
+<table class="decisions">
+  <tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+  <tr><td>Auth</td><td>OAuth 2.0 only: M2M client-credentials (JWT assertion, RSA key) and interactive auth-code flow</td><td>M2M is fully unattended for agents; auth-code covers acting as a named user. No OAuth 1.0a.</td></tr>
+  <tr><td>Secret storage</td><td>OS keychain via <code>keyring</code> crate</td><td>macOS Keychain / Windows Credential Manager encrypt at rest; config file keeps only non-secrets.</td></tr>
+  <tr><td>API modeling</td><td>Dynamic generic commands + live metadata <code>describe</code></td><td>Zero regeneration when NetSuite releases new versions; the account is the source of truth.</td></tr>
+  <tr><td>Scope</td><td>Records, SuiteQL, metadata, RESTlets, async jobs, raw passthrough</td><td>Full agreed v1 surface.</td></tr>
+  <tr><td>Distribution</td><td>GitHub Releases (mac + windows binaries) + <code>netsuite-cli update</code> self-update</td><td>One command for agents/machines to stay current.</td></tr>
+</table>
+
+<h2>3. Command surface</h2>
+<pre><code># Accounts
+netsuite-cli account add &lt;alias&gt; --account-id 1234567 --flow m2m|auth-code [flags]
+netsuite-cli account list | remove &lt;alias&gt; | set-default &lt;alias&gt; | test [&lt;alias&gt;]
+
+# Records (record type is a runtime string, e.g. customer, salesOrder)
+netsuite-cli record get    &lt;type&gt; &lt;id&gt; [--fields a,b] [--expand-sub-resources]
+netsuite-cli record list   &lt;type&gt; [--q "&lt;filter&gt;"] [--limit N] [--offset N] [--all]
+netsuite-cli record create &lt;type&gt; --data '&lt;json&gt;' | --data @file.json | --data -
+netsuite-cli record update &lt;type&gt; &lt;id&gt; --data ...
+netsuite-cli record upsert &lt;type&gt; &lt;external-id&gt; --data ...
+netsuite-cli record delete &lt;type&gt; &lt;id&gt;
+
+# SuiteQL (auto-pagination with --all)
+netsuite-cli suiteql "SELECT id, entityid FROM customer" [--limit N] [--offset N] [--all]
+
+# Metadata discovery (cached locally, --refresh to bust)
+netsuite-cli describe --list            # all record types in this account
+netsuite-cli describe &lt;type&gt;            # field/sublist schema for one type
+
+# RESTlets
+netsuite-cli restlet call --script &lt;id&gt; --deploy &lt;id&gt; [--method GET|POST|PUT|DELETE] [--data ...]
+
+# Async jobs
+netsuite-cli job submit &lt;METHOD&gt; &lt;path&gt; [--data ...]    # Prefer: respond-async
+netsuite-cli job status &lt;job-id&gt;
+netsuite-cli job result &lt;job-id&gt;
+
+# Escape hatch — any REST path with account auth applied
+netsuite-cli raw GET|POST|PATCH|PUT|DELETE &lt;path&gt; [--data ...] [--header k:v]
+
+# Maintenance
+netsuite-cli update [--check]           # self-update from GitHub Releases
+netsuite-cli config get|set &lt;key&gt; [value]
+</code></pre>
+<p><strong>Account targeting precedence:</strong> <code>--account &lt;alias&gt;</code> flag →
+<code>NETSUITE_ACCOUNT</code> env var → configured default. Every command behaves identically
+regardless of which account is selected.</p>
+
+<h2>4. Auth &amp; credential storage</h2>
+<h3>M2M (client credentials) — primary, unattended</h3>
+<ul>
+  <li>Setup: user creates an Integration record in NetSuite, generates/uploads a certificate, then runs <code>account add --flow m2m</code> supplying client ID, certificate ID, and private-key path. The key is read once and moved into the keychain.</li>
+  <li>Runtime: CLI signs a JWT assertion with the stored private key and exchanges it at the account's OAuth2 token endpoint (<code>.../services/rest/auth/oauth2/v1/token</code>) for an access token (~60&nbsp;min).</li>
+</ul>
+<h3>Auth-code — interactive, named user</h3>
+<ul>
+  <li>Setup: <code>account add --flow auth-code</code> starts a localhost redirect listener, opens the browser to NetSuite's consent page, and stores the resulting refresh token in the keychain.</li>
+  <li>Runtime: access tokens minted from the refresh token; if the refresh token itself expires, the CLI fails with a structured error telling the agent/user to re-run <code>account test --reauth</code>.</li>
+</ul>
+<h3>Storage split</h3>
+<ul>
+  <li><strong>Keychain</strong> (service <code>netsuite-cli</code>, one entry per account alias): private keys, client secrets, refresh tokens, cached access tokens.</li>
+  <li><strong>Config file</strong> (TOML in the platform config dir via <code>directories</code>): account aliases, NetSuite account IDs, flow type, default account, cache settings. No secrets, ever.</li>
+  <li>Access tokens auto-refresh transparently; exactly one retry after re-auth on a 401.</li>
+</ul>
+
+<h2>5. Agent ergonomics</h2>
+<ul>
+  <li><strong>stdout:</strong> JSON, always (compact by default, <code>--pretty</code> for humans). Response bodies pass through unmodified; list commands with <code>--all</code> merge pages into one <code>items</code> array.</li>
+  <li><strong>stderr:</strong> structured JSON errors: <code>{ "kind": "api|auth|network|usage", "status": 400, "message": "...", "details": [...] }</code> with NetSuite's <code>o:errorDetails</code> mapped through.</li>
+  <li><strong>Exit codes:</strong> 0 success · 1 API error · 2 usage error · 3 auth error · 4 network error.</li>
+  <li><strong>Discoverability:</strong> every subcommand's <code>--help</code> includes copy-pasteable examples; <code>describe</code> gives live per-account schemas so agents never guess field names.</li>
+</ul>
+
+<h2>6. Internals</h2>
+<pre><code>src/
+  main.rs          # clap entry, exit-code mapping
+  cli.rs           # clap derive command tree
+  commands/        # one module per subcommand group (thin: parse → client call → print)
+  client.rs        # NsClient: reqwest+tokio, auth middleware, retry/backoff, pagination
+  auth/            # m2m JWT assertion, auth-code flow, token cache
+  store/           # keyring secrets + TOML config + metadata cache (platform cache dir)
+  output.rs        # JSON printing, error envelope, exit codes
+</code></pre>
+<ul>
+  <li>Key crates: <code>clap</code> (derive), <code>tokio</code>, <code>reqwest</code> (rustls), <code>serde</code>/<code>serde_json</code>, <code>keyring</code>, <code>jsonwebtoken</code>, <code>directories</code>, <code>self_update</code>, <code>thiserror</code>.</li>
+  <li>Retries: 429 and 5xx with exponential backoff, honoring <code>Retry-After</code>; bounded attempts.</li>
+  <li>Metadata cache: per account + record type in the platform cache dir with TTL; <code>--refresh</code> forces a refetch.</li>
+</ul>
+
+<h2>7. Testing &amp; CI</h2>
+<ul>
+  <li>TDD throughout (superpowers test-driven-development).</li>
+  <li>Unit tests: JWT assertion construction, config/keychain abstraction (trait-mocked), error mapping, exit codes.</li>
+  <li>Integration tests: <code>wiremock</code> fake NetSuite covering auth exchange, CRUD, SuiteQL pagination, 429 retry, async job lifecycle.</li>
+  <li>Optional live smoke tests against a real sandbox, gated behind <code>NETSUITE_LIVE_TEST=1</code>.</li>
+  <li>CI (GitHub Actions): build + test on macOS and Windows; on tag, publish release binaries for both platforms (targets for <code>self_update</code>).</li>
+</ul>
+
+<div class="verify">
+<h3>To verify during planning (agent-browser triage of Oracle docs)</h3>
+<ul>
+  <li>Exact JWT assertion claims/algorithms (PS256 vs ES256) and token endpoint URL shape for M2M.</li>
+  <li>Metadata catalog paths and required <code>Accept</code> headers (JSON schema vs OpenAPI variants).</li>
+  <li>Async endpoints: <code>Prefer: respond-async</code> support and job-status/result URL shapes.</li>
+  <li>RESTlet base URL (<code>*.restlets.api.netsuite.com</code>) and OAuth2 scope requirements (<code>rest_webservices</code>, <code>restlets</code>, <code>suite_analytics</code>).</li>
+  <li>SuiteQL pagination envelope (<code>links</code>, <code>hasMore</code>, <code>offset</code>) details.</li>
+</ul>
+</div>
+
+<h2>8. Out of scope (v1)</h2>
+<ul>
+  <li>OAuth 1.0a / Token-Based Authentication.</li>
+  <li>Code generation from the REST API Browser.</li>
+  <li>SOAP/SuiteTalk, analytics workbooks, file cabinet uploads (reachable via <code>raw</code> if needed).</li>
+  <li>Linux builds (nothing precludes them; just not a target).</li>
+</ul>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes (tell Claude what to change)</a>
+</div>
+
+</body>
+</html>
