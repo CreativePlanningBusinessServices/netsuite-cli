@@ -7,15 +7,24 @@ pub async fn submit(
     client: &NsClient,
     http_method: reqwest::Method,
     path: &str,
+    query: &[(String, String)],
+    extra_headers: &[(String, String)],
     body: Option<Value>,
     idempotency_key: Option<String>,
 ) -> Result<Value, CliError> {
-    let mut headers: Vec<(&str, &str)> = vec![("Prefer", "respond-async")];
-    if let Some(ref key) = idempotency_key {
-        headers.push(("X-NetSuite-Idempotency-Key", key.as_str()));
-    }
+    // `Prefer: respond-async` is always forced (async is the point of a job); caller
+    // headers like the batch collection content-type are appended after it.
+    let owned_headers = submit_headers(idempotency_key.as_deref(), extra_headers);
+    let headers: Vec<(&str, &str)> = owned_headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let query_pairs: Vec<(&str, String)> = query
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.clone()))
+        .collect();
     let response = client
-        .request(http_method, path, &[], &headers, body.as_ref())
+        .request(http_method, path, &query_pairs, &headers, body.as_ref())
         .await?;
     let Some(location) = response.location else {
         return Err(CliError::Api {
@@ -27,6 +36,59 @@ pub async fn submit(
     };
     let job_id = location.rsplit('/').next().unwrap_or_default().to_string();
     Ok(json!({"jobId": job_id, "location": location, "status": response.status}))
+}
+
+/// Assembles the headers for an async submit: the mandatory `Prefer: respond-async`
+/// first, then an optional idempotency key, then any caller-supplied `--header`
+/// values (e.g. the `application/vnd.oracle.resource+json; type=collection`
+/// content-type required for a batch record-collection write).
+pub fn submit_headers(
+    idempotency_key: Option<&str>,
+    extra: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut headers = vec![("Prefer".to_string(), "respond-async".to_string())];
+    if let Some(key) = idempotency_key {
+        headers.push(("X-NetSuite-Idempotency-Key".to_string(), key.to_string()));
+    }
+    headers.extend(extra.iter().cloned());
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::submit_headers;
+
+    #[test]
+    fn forces_async_prefer_first() {
+        let headers = submit_headers(None, &[]);
+        assert_eq!(
+            headers,
+            vec![("Prefer".to_string(), "respond-async".to_string())]
+        );
+    }
+
+    #[test]
+    fn appends_idempotency_key_then_caller_headers() {
+        let extra = vec![(
+            "Content-Type".to_string(),
+            "application/vnd.oracle.resource+json; type=collection".to_string(),
+        )];
+        let headers = submit_headers(Some("abc-123"), &extra);
+        assert_eq!(
+            headers,
+            vec![
+                ("Prefer".to_string(), "respond-async".to_string()),
+                (
+                    "X-NetSuite-Idempotency-Key".to_string(),
+                    "abc-123".to_string()
+                ),
+                (
+                    "Content-Type".to_string(),
+                    "application/vnd.oracle.resource+json; type=collection".to_string()
+                ),
+            ]
+        );
+    }
 }
 
 pub async fn status(client: &NsClient, job_id: &str) -> Result<Value, CliError> {
