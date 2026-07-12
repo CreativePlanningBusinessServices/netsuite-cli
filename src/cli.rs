@@ -196,12 +196,19 @@ pub enum RestletAction {
 #[derive(Subcommand)]
 pub enum JobAction {
     #[command(
-        after_help = "Example: netsuite-cli job submit POST /services/rest/record/v1/customer --data '{\"companyName\":\"Acme\"}' --idempotency-key 8f14e-uuid"
+        after_help = "Examples:\n  netsuite-cli job submit POST /services/rest/record/v1/customer --data '{\"companyName\":\"Acme\"}' --idempotency-key 8f14e-uuid\n  # Batch record-collection write (<=100 records): --header sets the collection content-type, --query carries ?ids= for GET/DELETE\n  netsuite-cli job submit POST /services/rest/record/v1/customer --header 'Content-Type: application/vnd.oracle.resource+json; type=collection' --data '{\"items\":[{\"companyName\":\"A\"},{\"companyName\":\"B\"}]}'"
     )]
     Submit {
         #[arg(value_enum, ignore_case = true)]
         method: HttpMethodArg,
         path: String,
+        /// Repeatable key=value query parameter (e.g. ids=1,2,3 for a batch GET/DELETE)
+        #[arg(long = "query")]
+        query: Vec<String>,
+        /// Repeatable 'Name: value' header. `Prefer: respond-async` is always sent;
+        /// use this for the batch collection content-type or other custom headers.
+        #[arg(long = "header")]
+        header: Vec<String>,
         #[arg(long)]
         data: Option<String>,
         #[arg(long = "idempotency-key")]
@@ -538,14 +545,20 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 JobAction::Submit {
                     method,
                     path,
+                    query,
+                    header,
                     data,
                     idempotency_key,
                 } => {
+                    let query_pairs = commands::parse_key_value_pairs(query, "--query")?;
+                    let header_pairs = commands::parse_header_pairs(header)?;
                     let body = data.as_deref().map(commands::read_data_arg).transpose()?;
                     job::submit(
                         &context.client,
                         method.to_method(),
                         path,
+                        &query_pairs,
+                        &header_pairs,
                         body,
                         idempotency_key.clone(),
                     )

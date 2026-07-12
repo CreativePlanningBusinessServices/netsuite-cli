@@ -156,6 +156,12 @@ async fn job_submit_extracts_job_id_from_relative_location_and_sends_prefer_and_
             "X-NetSuite-Idempotency-Key",
             "11111111-1111-1111-1111-111111111111",
         ))
+        // A caller-supplied --header (here the batch collection content-type) is sent
+        // alongside the forced Prefer header — this is what enables batch writes.
+        .and(header(
+            "Content-Type",
+            "application/vnd.oracle.resource+json; type=collection",
+        ))
         .and(body_json(serde_json::json!({"companyName": "Acme"})))
         .respond_with(
             ResponseTemplate::new(202)
@@ -168,6 +174,11 @@ async fn job_submit_extracts_job_id_from_relative_location_and_sends_prefer_and_
         &client_for(&server),
         reqwest::Method::POST,
         "/services/rest/record/v1/customer",
+        &[],
+        &[(
+            "Content-Type".to_string(),
+            "application/vnd.oracle.resource+json; type=collection".to_string(),
+        )],
         Some(serde_json::json!({"companyName": "Acme"})),
         Some("11111111-1111-1111-1111-111111111111".to_string()),
     )
@@ -196,6 +207,8 @@ async fn job_submit_errors_when_location_header_missing() {
         &client_for(&server),
         reqwest::Method::GET,
         "/services/rest/record/v1/customer",
+        &[],
+        &[],
         None,
         None,
     )
