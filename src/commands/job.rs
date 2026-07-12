@@ -54,43 +54,6 @@ pub fn submit_headers(
     headers
 }
 
-#[cfg(test)]
-mod tests {
-    use super::submit_headers;
-
-    #[test]
-    fn forces_async_prefer_first() {
-        let headers = submit_headers(None, &[]);
-        assert_eq!(
-            headers,
-            vec![("Prefer".to_string(), "respond-async".to_string())]
-        );
-    }
-
-    #[test]
-    fn appends_idempotency_key_then_caller_headers() {
-        let extra = vec![(
-            "Content-Type".to_string(),
-            "application/vnd.oracle.resource+json; type=collection".to_string(),
-        )];
-        let headers = submit_headers(Some("abc-123"), &extra);
-        assert_eq!(
-            headers,
-            vec![
-                ("Prefer".to_string(), "respond-async".to_string()),
-                (
-                    "X-NetSuite-Idempotency-Key".to_string(),
-                    "abc-123".to_string()
-                ),
-                (
-                    "Content-Type".to_string(),
-                    "application/vnd.oracle.resource+json; type=collection".to_string()
-                ),
-            ]
-        );
-    }
-}
-
 pub async fn status(client: &NsClient, job_id: &str) -> Result<Value, CliError> {
     let response = client
         .request(
@@ -186,4 +149,41 @@ fn self_link_href(item: &Value) -> Option<&str> {
         .find(|link| link["rel"] == "self")
         .or_else(|| links.first())?;
     self_link["href"].as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::submit_headers;
+
+    #[test]
+    fn forces_async_prefer_first() {
+        let headers = submit_headers(None, &[]);
+        assert_eq!(
+            headers,
+            vec![("Prefer".to_string(), "respond-async".to_string())]
+        );
+    }
+
+    #[test]
+    fn appends_idempotency_key_then_caller_headers() {
+        let extra = vec![(
+            "Content-Type".to_string(),
+            "application/vnd.oracle.resource+json; type=collection".to_string(),
+        )];
+        let headers = submit_headers(Some("abc-123"), &extra);
+        assert_eq!(
+            headers,
+            vec![
+                ("Prefer".to_string(), "respond-async".to_string()),
+                (
+                    "X-NetSuite-Idempotency-Key".to_string(),
+                    "abc-123".to_string()
+                ),
+                (
+                    "Content-Type".to_string(),
+                    "application/vnd.oracle.resource+json; type=collection".to_string()
+                ),
+            ]
+        );
+    }
 }
