@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli Special Operations (transform, forms, select-options, attach/detach, system) — Design Spec (2026-07-14)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:860px; padding:2.5rem 1.5rem 4rem; font:16px/1.6 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.5rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.86em; }
+  code { background:var(--code-bg); padding:.1em .35em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.9rem 1rem; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:.8rem 0; font-size:.93rem; }
+  th, td { border:1px solid var(--border); padding:.45rem .65rem; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul { padding-left:1.3rem; } li { margin:.25rem 0; }
+  .buttons { display:flex; gap:.75rem; flex-wrap:wrap; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:1rem; margin:1.2rem 0; align-items:center; }
+  .buttons span { font-weight:600; }
+  .buttons a { display:inline-block; padding:.5rem 1.1rem; border-radius:8px; text-decoration:none; font-weight:600; border:1px solid var(--accent); }
+  .buttons a.primary { background:var(--accent); color:#fff; }
+  .buttons a.secondary { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>netsuite-cli Special Operations — Design Spec</h1>
+<div class="meta">2026-07-14 · Adds first-class subcommands for NetSuite REST "special" operations currently reachable only via <code>raw</code> · Goal: agents discover these capabilities through <code>--help</code> and the skill, and never hand-build the custom Oracle mediaType headers.</div>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+<h2>1. Motivation &amp; scope</h2>
+<p>Five NetSuite REST operations from the SuiteTalk help (create-form/edit-form, selectOptions, attach/detach, serverTime, governanceLimits) plus transform execution are all reachable today through <code>raw</code>, but nothing tells an agent they exist, and three of them require the fiddly
+<code>Accept: application/vnd.oracle.resource+json; type=…</code> mediaType that agents get wrong. This change encodes each as a first-class subcommand (Approach A — full coverage, namespace-aligned) and documents them in README + SKILL.md.</p>
+
+<h2>2. Command surface</h2>
+<table>
+  <tr><th>Command</th><th>HTTP mapping</th><th>Output</th></tr>
+  <tr><td><code>record transform &lt;srcType&gt; &lt;srcId&gt; &lt;targetType&gt; [--data] [--form] [--fields] [--expand-sub-resources]</code></td><td><code>POST /services/rest/record/v1/{srcType}/{srcId}/!transform/{targetType}</code>; with <code>--form</code> adds <code>Accept: …type=create-form</code> (preview, creates nothing)</td><td>execute: <code>{"id","location"}</code> parsed from Location (error if header missing, like <code>record create</code>); <code>--form</code>: response body passthrough</td></tr>
+  <tr><td><code>record create-form &lt;type&gt; [--data] [--fields] [--expand-sub-resources]</code></td><td><code>POST /services/rest/record/v1/{type}</code> + <code>Accept: …type=create-form</code></td><td>body passthrough (pre-populated form JSON)</td></tr>
+  <tr><td><code>record edit-form &lt;type&gt; &lt;id&gt; [--data] [--fields] [--expand-sub-resources]</code></td><td><code>PATCH /services/rest/record/v1/{type}/{id}</code> + <code>Accept: …type=edit-form</code></td><td>body passthrough</td></tr>
+  <tr><td><code>record select-options &lt;type&gt; [&lt;id&gt;] --fields f1,f2 [--q] [--limit] [--offset] [--data]</code></td><td>no id: <code>POST /services/rest/record/v1/{type}</code>; with id: <code>PATCH …/{type}/{id}</code> (existing-record context). Both + <code>Accept: …type=select-options</code>; <code>fields</code>/<code>q</code>/<code>limit</code>/<code>offset</code> as query params</td><td>body passthrough (per-field <code>_selectOptions</code> items with pagination metadata)</td></tr>
+  <tr><td><code>record attach &lt;type&gt; &lt;id&gt; &lt;attachType&gt; &lt;attachId&gt; [--role &lt;id&gt;]</code></td><td><code>POST /services/rest/record/v1/{type}/{id}/!attach/{attachType}/{attachId}</code>; <code>--role</code> sends body <code>{"role":{"id":"…"}}</code></td><td>204 → <code>{"attached":true,"type","id","attachedType","attachedId"}</code></td></tr>
+  <tr><td><code>record detach &lt;type&gt; &lt;id&gt; &lt;detachType&gt; &lt;detachId&gt;</code></td><td><code>POST /services/rest/record/v1/{type}/{id}/!detach/{detachType}/{detachId}</code></td><td>204 → <code>{"detached":true, …}</code> (same shape)</td></tr>
+  <tr><td><code>system server-time</code></td><td><code>GET /services/rest/system/v1/serverTime</code></td><td>body passthrough (<code>{"serverTime":"…Z"}</code>)</td></tr>
+  <tr><td><code>system governance-limits</code></td><td><code>GET /services/rest/system/v1/governanceLimits</code></td><td>body passthrough</td></tr>
+</table>
+<ul>
+  <li><strong>External ids work for free:</strong> all id positionals pass through verbatim, so NetSuite's <code>eid:ACME-001</code> form works in every position (documented, not special-cased).</li>
+  <li><strong>Attach direction:</strong> the first pair is the record being attached <em>to</em> (e.g. <code>record attach customer 660 contact 106</code> attaches contact 106 to customer 660) — <code>after_help</code> examples make this unambiguous.</li>
+  <li>Only attach supports <code>--role</code> (per the doc page); detach takes no options.</li>
+  <li>On <code>record transform</code>, <code>--fields</code>/<code>--expand-sub-resources</code> shape the <em>form response</em> and are only valid together with <code>--form</code>; using them without it is a usage error (exit 2).</li>
+</ul>
+
+<h2>3. Behavior details</h2>
+<ul>
+  <li><strong>Accept headers set internally.</strong> Commands pass the mediaType through the existing <code>NsClient::request</code> headers slice, same as <code>describe.rs</code> does with <code>Accept: application/json</code>. No client changes needed (the reqwest client sets no default Accept).</li>
+  <li><strong><code>--data</code> optional everywhere here</strong>, accepting inline JSON / <code>@file</code> / <code>-</code> via the existing <code>read_data_arg</code>. When omitted on POST/PATCH-based ops, send <code>{}</code> — matches Oracle's own examples and avoids empty-body edge cases.</li>
+  <li><strong><code>--q</code> passes through raw</strong> (e.g. <code>entitystatus START_WITH LEAD-, location IS "United States"</code>) exactly like <code>record list --q</code>; no client-side parsing.</li>
+  <li><strong>Errors:</strong> no new error kinds; API failures flow through the existing <code>api_error</code> mapping and exit-code contract (1/2/3/4).</li>
+  <li><strong>Mutation safety:</strong> <code>transform</code> without <code>--form</code>, <code>attach</code>, and <code>detach</code> mutate; help text says so plainly (matching the "no surprising side effects" stance of <code>restlet call --method</code>).</li>
+</ul>
+
+<h2>4. Code structure</h2>
+<table>
+  <tr><th>File</th><th>Change</th></tr>
+  <tr><td><code>src/commands/record.rs</code></td><td>Add <code>transform</code>, <code>create_form</code>, <code>edit_form</code>, <code>select_options</code>, <code>attach</code>, <code>detach</code> — thin wrappers in the existing style (build path + query + headers, call <code>client.request</code>, shape output). Shared mediaType constants at top of file.</td></tr>
+  <tr><td><code>src/commands/system.rs</code> (new)</td><td><code>server_time</code>, <code>governance_limits</code> — two ~10-line GET wrappers; registered in <code>commands/mod.rs</code>.</td></tr>
+  <tr><td><code>src/cli.rs</code></td><td>New <code>RecordAction</code> variants; new <code>Command::System { action: SystemAction }</code>; dispatch arms; copy-paste-correct <code>after_help</code> examples on every new verb (SKILL.md promises help examples are exact).</td></tr>
+</table>
+
+<h2>5. Testing</h2>
+<ul>
+  <li><strong>Wiremock integration tests:</strong> new <code>tests/record_special_ops.rs</code> and <code>tests/system_commands.rs</code>, following the existing suites — assert method, full path (incl. <code>!transform</code>/<code>!attach</code>/<code>!detach</code> segments), Accept header value, query params, request body (incl. the <code>{}</code> default and <code>--role</code> shape), and output JSON (incl. 204 handling, Location-derived id, and the create-like error when Location is absent).</li>
+  <li><strong>CLI parse tests</strong> in <code>cli.rs</code> for the new verbs (e.g. select-options requires <code>--fields</code>; attach arg order).</li>
+  <li><strong>Live smoke:</strong> add read-only ops only — <code>system server-time</code>, <code>system governance-limits</code>, <code>record select-options</code> on a safe type. Mutating ops (transform/attach/detach) stay wiremock-only.</li>
+  <li><strong>Gate:</strong> <code>cargo fmt --check</code> · <code>cargo clippy --all-targets -- -D warnings</code> · <code>cargo test</code>.</li>
+</ul>
+
+<h2>6. Documentation (the discoverability goal)</h2>
+<ul>
+  <li><strong>README:</strong> extend the <code>record</code> section with transform / forms / select-options / attach-detach examples; new <code>system</code> section; keep the existing structure and tone.</li>
+  <li><strong>SKILL.md:</strong> new "Pick the right command" rows — "Turn one record into another (SO→invoice)" → <code>record transform</code>; "Preview defaults before create/update" → <code>record create-form</code>/<code>edit-form</code>; "Valid dropdown values for a field" → <code>record select-options</code>; "Link/unlink a contact or file" → <code>record attach</code>/<code>detach</code>; "Server clock / concurrency limits" → <code>system …</code>. Short recipe note: <code>--form</code> previews a transform without creating; select-options <code>--data</code> carries dependent-field context. The existing batch-collections recipe stays on <code>raw</code>, unchanged.</li>
+</ul>
+
+<h2>7. Constraints &amp; non-goals</h2>
+<ul>
+  <li>No changes to <code>NsClient</code>, auth, error kinds, or the output contract.</li>
+  <li>No Creative Planning account identifiers in any repo artifact (public repo).</li>
+  <li>Non-goals: no batch/collection convenience verbs (stays a <code>raw</code> recipe), no saved-search or report support (NetSuite has no REST API for those), no <code>--expand</code> pass-through beyond the flags listed (add later if needed).</li>
+  <li>Delivery: feature branch → PR → pr-review-loop to green.</li>
+</ul>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+</body>
+</html>
