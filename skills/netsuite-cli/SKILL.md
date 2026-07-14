@@ -19,6 +19,11 @@ and the repo README.
 | Unknown record type or field names | `describe --list`, then `describe <type>` |
 | Create / update / delete a record | `record create` / `record update` / `record delete` |
 | Upsert keyed on your own id | `record upsert <type> <externalId>` |
+| Turn one record into another (SO→invoice, order→fulfillment) | `record transform <srcType> <srcId> <targetType>` |
+| Preview defaulted fields, write nothing | `record create-form <type>` / `record edit-form <type> <id>` / `record transform ... --form` |
+| Valid dropdown values for a field | `record select-options <type> --fields <f1,f2>` |
+| Link/unlink a contact or file | `record attach` / `record detach` |
+| Server clock / concurrency limits | `system server-time` / `system governance-limits` |
 | An endpoint the CLI lacks | `raw <METHOD> /services/rest/...` |
 | Long-running request | `job submit <METHOD> <path>` → `job status <id>` → `job result <id>` |
 | Bulk create/update/delete (≤100 records) | `raw` batch collection — see **Batch** below (NOT `job submit`) |
@@ -58,6 +63,14 @@ netsuite-cli account test --account <alias>   # proves auth end to end
 - **Sublists on update:** `record update ... --replace item` replaces the whole
   `item` sublist; without `--replace`, body lines merge into existing ones.
 - **Data input:** `--data '<json>'`, `--data @file.json`, or `--data -` (stdin).
+- **Forms preview, never write:** `create-form` / `edit-form` / `transform --form`
+  return the record as NetSuite would default it, without saving — use before a
+  risky create or transform.
+- **select-options dependent fields:** pass current values via
+  `--data '{"subsidiary":{"id":1}}'`; add a record id positional
+  (`record select-options salesOrder 123 --fields item`) for an existing
+  record's context.
+- **External ids everywhere:** any id positional accepts `eid:<yourId>`.
 
 ## Batch / bulk (record collections)
 
