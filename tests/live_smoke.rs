@@ -14,7 +14,9 @@
 use std::time::Duration;
 
 use netsuite_cli::commands::describe::{self, MetadataFormat};
+use netsuite_cli::commands::record;
 use netsuite_cli::commands::suiteql;
+use netsuite_cli::commands::system;
 use netsuite_cli::context::context_for;
 
 fn live_alias() -> String {
@@ -106,5 +108,65 @@ async fn describe_currency_returns_schema_metadata() {
     assert_eq!(
         metadata["type"], "object",
         "expected a JSON Schema object for currency: {metadata}"
+    );
+}
+
+/// Equivalent of `netsuite-cli system server-time`.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; run with NETSUITE_LIVE_ALIAS=<alias> cargo test --test live_smoke -- --ignored"]
+async fn server_time_returns_utc_timestamp() {
+    let alias = live_alias();
+    let context = context_for(Some(&alias)).expect("account context resolves from local config");
+
+    let server_time = system::server_time(&context.client)
+        .await
+        .expect("serverTime request succeeds");
+
+    let timestamp = server_time["serverTime"]
+        .as_str()
+        .expect("serverTime is a string");
+    assert!(
+        timestamp.ends_with('Z'),
+        "expected UTC timestamp: {timestamp}"
+    );
+}
+
+/// Equivalent of `netsuite-cli system governance-limits`.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; run with NETSUITE_LIVE_ALIAS=<alias> cargo test --test live_smoke -- --ignored"]
+async fn governance_limits_reports_concurrency() {
+    let alias = live_alias();
+    let context = context_for(Some(&alias)).expect("account context resolves from local config");
+
+    let limits = system::governance_limits(&context.client)
+        .await
+        .expect("governanceLimits request succeeds");
+
+    assert!(limits.is_object(), "expected a limits object: {limits}");
+}
+
+/// Equivalent of `netsuite-cli record select-options customer --fields entitystatus --limit 5`.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; run with NETSUITE_LIVE_ALIAS=<alias> cargo test --test live_smoke -- --ignored"]
+async fn select_options_lists_customer_entity_statuses() {
+    let alias = live_alias();
+    let context = context_for(Some(&alias)).expect("account context resolves from local config");
+
+    let options = record::select_options(
+        &context.client,
+        "customer",
+        None,
+        "entitystatus",
+        None,
+        Some(5),
+        None,
+        None,
+    )
+    .await
+    .expect("select-options request succeeds");
+
+    assert!(
+        options["entitystatus"]["_selectOptions"]["items"].is_array(),
+        "expected _selectOptions items for entitystatus: {options}"
     );
 }
