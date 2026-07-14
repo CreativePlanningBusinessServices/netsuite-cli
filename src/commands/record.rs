@@ -6,6 +6,7 @@ use crate::error::CliError;
 const DEFAULT_PAGE_LIMIT: u64 = 1000;
 const CREATE_FORM_ACCEPT: &str = "application/vnd.oracle.resource+json; type=create-form";
 const EDIT_FORM_ACCEPT: &str = "application/vnd.oracle.resource+json; type=edit-form";
+const SELECT_OPTIONS_ACCEPT: &str = "application/vnd.oracle.resource+json; type=select-options";
 
 pub async fn get(
     client: &NsClient,
@@ -317,4 +318,48 @@ pub async fn detach(
         "detached": true, "type": record_type, "id": record_id,
         "detachedType": detach_type, "detachedId": detach_id,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn select_options(
+    client: &NsClient,
+    record_type: &str,
+    record_id: Option<&str>,
+    fields: &str,
+    q_filter: Option<String>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    body: Option<Value>,
+) -> Result<Value, CliError> {
+    let mut query: Vec<(&str, String)> = vec![("fields", fields.to_string())];
+    if let Some(filter) = q_filter {
+        query.push(("q", filter));
+    }
+    if let Some(limit_value) = limit {
+        query.push(("limit", limit_value.to_string()));
+    }
+    if let Some(offset_value) = offset {
+        query.push(("offset", offset_value.to_string()));
+    }
+    let (http_method, path) = match record_id {
+        Some(id) => (
+            reqwest::Method::PATCH,
+            format!("/services/rest/record/v1/{record_type}/{id}"),
+        ),
+        None => (
+            reqwest::Method::POST,
+            format!("/services/rest/record/v1/{record_type}"),
+        ),
+    };
+    let request_body = body.unwrap_or_else(|| json!({}));
+    let response = client
+        .request(
+            http_method,
+            &path,
+            &query,
+            &[("Accept", SELECT_OPTIONS_ACCEPT)],
+            Some(&request_body),
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
 }

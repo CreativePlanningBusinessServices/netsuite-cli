@@ -375,6 +375,28 @@ pub enum RecordAction {
         #[arg(long)]
         expand_sub_resources: bool,
     },
+    /// Valid dropdown (select) values for record fields
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record select-options customer --fields entitystatus,location\n  netsuite-cli record select-options customer --fields entitystatus --q 'entitystatus START_WITH LEAD-'\n  netsuite-cli record select-options salesOrder 123 --fields item --data '{\"subsidiary\":{\"id\":1}}'"
+    )]
+    SelectOptions {
+        record_type: String,
+        /// Existing record id: evaluates options in that record's context (uses PATCH)
+        id: Option<String>,
+        /// Comma-separated field names to fetch options for (sublist fields as line.field)
+        #[arg(long)]
+        fields: String,
+        /// Filter, e.g. 'entitystatus START_WITH LEAD-' (operators: CONTAIN, IS, START_WITH)
+        #[arg(long)]
+        q: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Values for fields the requested options depend on
+        #[arg(long)]
+        data: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -617,6 +639,28 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                         body,
                         fields.clone(),
                         *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::SelectOptions {
+                    record_type,
+                    id,
+                    fields,
+                    q,
+                    limit,
+                    offset,
+                    data,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::select_options(
+                        &context.client,
+                        record_type,
+                        id.as_deref(),
+                        fields,
+                        q.clone(),
+                        *limit,
+                        *offset,
+                        body,
                     )
                     .await
                 }
@@ -1088,5 +1132,19 @@ mod tests {
             .expect("create-form parses");
         Cli::try_parse_from(["netsuite-cli", "record", "edit-form", "salesOrder", "12"])
             .expect("edit-form parses");
+    }
+
+    #[test]
+    fn record_select_options_requires_fields_flag() {
+        expect_parse_error(&["netsuite-cli", "record", "select-options", "customer"]);
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "select-options",
+            "customer",
+            "--fields",
+            "entitystatus",
+        ])
+        .expect("select-options with --fields parses");
     }
 }

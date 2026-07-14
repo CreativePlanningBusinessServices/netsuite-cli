@@ -244,3 +244,78 @@ async fn edit_form_patches_with_accept_header_and_body() {
     .unwrap();
     assert_eq!(form["total"], 99.5);
 }
+
+#[tokio::test]
+async fn select_options_without_id_posts_with_filters() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/customer"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=select-options",
+        ))
+        .and(query_param("fields", "entitystatus,location"))
+        .and(query_param("q", "entitystatus START_WITH LEAD-"))
+        .and(query_param("limit", "50"))
+        .and(query_param("offset", "0"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entitystatus": {
+                "_selectOptions": {
+                    "items": [{"id": 13, "refName": "CUSTOMER-Closed Won"}],
+                    "count": 1, "offset": 0, "hasMore": false, "totalResults": 1
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let options = record::select_options(
+        &client_for(&server),
+        "customer",
+        None,
+        "entitystatus,location",
+        Some("entitystatus START_WITH LEAD-".into()),
+        Some(50),
+        Some(0),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        options["entitystatus"]["_selectOptions"]["items"][0]["id"],
+        13
+    );
+}
+
+#[tokio::test]
+async fn select_options_with_id_patches_with_dependency_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/services/rest/record/v1/salesOrder/12"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=select-options",
+        ))
+        .and(query_param("fields", "item"))
+        .and(body_json(serde_json::json!({"subsidiary": {"id": 1}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "item": {"_selectOptions": {"items": []}}
+        })))
+        .mount(&server)
+        .await;
+
+    let options = record::select_options(
+        &client_for(&server),
+        "salesOrder",
+        Some("12"),
+        "item",
+        None,
+        None,
+        None,
+        Some(serde_json::json!({"subsidiary": {"id": 1}})),
+    )
+    .await
+    .unwrap();
+    assert!(options["item"]["_selectOptions"]["items"].is_array());
+}
