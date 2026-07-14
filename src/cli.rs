@@ -321,6 +321,27 @@ pub enum RecordAction {
         detach_type: String,
         detach_id: String,
     },
+    /// Turn one record into another (e.g. salesOrder -> invoice); creates the target record
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record transform salesOrder 123 invoice\n  netsuite-cli record transform salesOrder 123 itemFulfillment --form --fields item --expand-sub-resources"
+    )]
+    Transform {
+        source_type: String,
+        source_id: String,
+        target_type: String,
+        /// Field overrides applied to the transformed record
+        #[arg(long)]
+        data: Option<String>,
+        /// Return the create-form preview instead of executing (creates nothing)
+        #[arg(long)]
+        form: bool,
+        /// Limit the --form preview to these fields
+        #[arg(long, requires = "form")]
+        fields: Option<String>,
+        /// Expand sublists/subrecords in the --form preview
+        #[arg(long, requires = "form")]
+        expand_sub_resources: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -510,6 +531,28 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                     detach_type,
                     detach_id,
                 } => record::detach(&context.client, record_type, id, detach_type, detach_id).await,
+                RecordAction::Transform {
+                    source_type,
+                    source_id,
+                    target_type,
+                    data,
+                    form,
+                    fields,
+                    expand_sub_resources,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::transform(
+                        &context.client,
+                        source_type,
+                        source_id,
+                        target_type,
+                        body,
+                        *form,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
             }
         }
         Command::Suiteql {
@@ -944,5 +987,31 @@ mod tests {
             "-5",
         ])
         .expect("attach with negative role id should parse");
+    }
+
+    #[test]
+    fn record_transform_form_flags_require_form() {
+        expect_parse_error(&[
+            "netsuite-cli",
+            "record",
+            "transform",
+            "salesOrder",
+            "1",
+            "invoice",
+            "--fields",
+            "item",
+        ]);
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "transform",
+            "salesOrder",
+            "1",
+            "invoice",
+            "--form",
+            "--fields",
+            "item",
+        ])
+        .expect("--fields with --form should parse");
     }
 }

@@ -2,7 +2,8 @@ mod common;
 
 use common::client_for;
 use netsuite_cli::commands::record;
-use wiremock::matchers::{body_json, method, path};
+use netsuite_cli::error::CliError;
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
@@ -83,4 +84,111 @@ async fn detach_posts_empty_body_and_reports_linkage() {
             "detachedType": "file", "detachedId": "398"
         })
     );
+}
+
+#[tokio::test]
+async fn transform_returns_id_from_location_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/services/rest/record/v1/salesOrder/7/!transform/invoice",
+        ))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(
+            ResponseTemplate::new(204)
+                .insert_header("Location", "https://x/services/rest/record/v1/invoice/91"),
+        )
+        .mount(&server)
+        .await;
+
+    let transformed = record::transform(
+        &client_for(&server),
+        "salesOrder",
+        "7",
+        "invoice",
+        None,
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        transformed,
+        serde_json::json!({
+            "id": "91", "location": "https://x/services/rest/record/v1/invoice/91"
+        })
+    );
+}
+
+#[tokio::test]
+async fn transform_errors_when_location_header_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/services/rest/record/v1/salesOrder/7/!transform/invoice",
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let transform_result = record::transform(
+        &client_for(&server),
+        "salesOrder",
+        "7",
+        "invoice",
+        None,
+        false,
+        None,
+        false,
+    )
+    .await;
+
+    match transform_result {
+        Err(CliError::Api {
+            status, message, ..
+        }) => {
+            assert_eq!(status, 204);
+            assert!(
+                message.contains("no Location header was returned"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected CliError::Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn transform_form_sends_create_form_accept_and_passes_body_through() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/services/rest/record/v1/salesOrder/7/!transform/itemFulfillment",
+        ))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=create-form",
+        ))
+        .and(query_param("fields", "item"))
+        .and(query_param("expandSubResources", "true"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "item": {"items": [{"quantity": 3}]}
+        })))
+        .mount(&server)
+        .await;
+
+    let preview = record::transform(
+        &client_for(&server),
+        "salesOrder",
+        "7",
+        "itemFulfillment",
+        None,
+        true,
+        Some("item".into()),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview["item"]["items"][0]["quantity"], 3);
 }

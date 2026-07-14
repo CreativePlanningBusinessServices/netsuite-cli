@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
 
-use crate::client::NsClient;
+use crate::client::{NsClient, NsResponse};
 use crate::error::CliError;
 
 const DEFAULT_PAGE_LIMIT: u64 = 1000;
+const CREATE_FORM_ACCEPT: &str = "application/vnd.oracle.resource+json; type=create-form";
 
 pub async fn get(
     client: &NsClient,
@@ -12,13 +13,7 @@ pub async fn get(
     fields: Option<String>,
     expand_sub_resources: bool,
 ) -> Result<Value, CliError> {
-    let mut query: Vec<(&str, String)> = Vec::new();
-    if let Some(field_list) = fields {
-        query.push(("fields", field_list));
-    }
-    if expand_sub_resources {
-        query.push(("expandSubResources", "true".into()));
-    }
+    let query = view_query(fields, expand_sub_resources);
     let response = client
         .request(
             reqwest::Method::GET,
@@ -104,16 +99,7 @@ pub async fn create(client: &NsClient, record_type: &str, body: Value) -> Result
             Some(&body),
         )
         .await?;
-    let Some(location) = response.location else {
-        return Err(CliError::Api {
-            status: response.status,
-            message: "create succeeded but no Location header was returned; record id unknown"
-                .into(),
-            details: vec![],
-        });
-    };
-    let new_id = location.rsplit('/').next().unwrap_or_default().to_string();
-    Ok(json!({"id": new_id, "location": location}))
+    created_record_result(response, "create")
 }
 
 pub async fn update(
@@ -172,6 +158,68 @@ pub async fn delete(
         )
         .await?;
     Ok(json!({"deleted": true, "id": record_id}))
+}
+
+/// Builds the fields/expandSubResources query pairs shared by `get` and the
+/// form-preview operations.
+fn view_query(fields: Option<String>, expand_sub_resources: bool) -> Vec<(&'static str, String)> {
+    let mut query = Vec::new();
+    if let Some(field_list) = fields {
+        query.push(("fields", field_list));
+    }
+    if expand_sub_resources {
+        query.push(("expandSubResources", "true".into()));
+    }
+    query
+}
+
+/// Shapes the `{"id", "location"}` result for operations whose success is a 204
+/// with a Location header pointing at the record they created (create, transform).
+fn created_record_result(response: NsResponse, operation: &str) -> Result<Value, CliError> {
+    let Some(location) = response.location else {
+        return Err(CliError::Api {
+            status: response.status,
+            message: format!(
+                "{operation} succeeded but no Location header was returned; record id unknown"
+            ),
+            details: vec![],
+        });
+    };
+    let new_id = location.rsplit('/').next().unwrap_or_default().to_string();
+    Ok(json!({"id": new_id, "location": location}))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn transform(
+    client: &NsClient,
+    source_type: &str,
+    source_id: &str,
+    target_type: &str,
+    body: Option<Value>,
+    form: bool,
+    fields: Option<String>,
+    expand_sub_resources: bool,
+) -> Result<Value, CliError> {
+    let path =
+        format!("/services/rest/record/v1/{source_type}/{source_id}/!transform/{target_type}");
+    let request_body = body.unwrap_or_else(|| json!({}));
+    if form {
+        let query = view_query(fields, expand_sub_resources);
+        let response = client
+            .request(
+                reqwest::Method::POST,
+                &path,
+                &query,
+                &[("Accept", CREATE_FORM_ACCEPT)],
+                Some(&request_body),
+            )
+            .await?;
+        return Ok(response.body.unwrap_or(Value::Null));
+    }
+    let response = client
+        .request(reqwest::Method::POST, &path, &[], &[], Some(&request_body))
+        .await?;
+    created_record_result(response, "transform")
 }
 
 pub async fn attach(
