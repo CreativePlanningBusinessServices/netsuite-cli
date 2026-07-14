@@ -4,10 +4,10 @@ A NetSuite REST API command-line tool built for AI agents, not humans typing at 
 Every subcommand takes explicit, typed flags (no interactive prompts beyond the one-time OAuth
 login), emits a single JSON value on stdout on success, and reports failures as a single JSON
 object on stderr with a predictable exit code — so an agent can invoke it, parse the result, and
-branch on outcome without screen-scraping. It covers record CRUD and special operations (transform, form previews, select
-options, attach/detach), SuiteQL, RESTlets, metadata discovery, system endpoints,
-async jobs, and raw passthrough requests against any number of NetSuite accounts,
-switching between them with one flag.
+branch on outcome without screen-scraping. It covers record CRUD and special operations
+(transform, form previews, select options, attach/detach), SuiteQL, RESTlets, metadata
+discovery, system endpoints, async jobs, and raw passthrough requests against any number of
+NetSuite accounts, switching between them with one flag.
 
 ## Quick start for AI agents
 
