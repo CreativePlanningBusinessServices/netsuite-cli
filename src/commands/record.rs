@@ -5,6 +5,7 @@ use crate::error::CliError;
 
 const DEFAULT_PAGE_LIMIT: u64 = 1000;
 const CREATE_FORM_ACCEPT: &str = "application/vnd.oracle.resource+json; type=create-form";
+const EDIT_FORM_ACCEPT: &str = "application/vnd.oracle.resource+json; type=edit-form";
 
 pub async fn get(
     client: &NsClient,
@@ -158,6 +159,49 @@ pub async fn delete(
         )
         .await?;
     Ok(json!({"deleted": true, "id": record_id}))
+}
+
+pub async fn create_form(
+    client: &NsClient,
+    record_type: &str,
+    body: Option<Value>,
+    fields: Option<String>,
+    expand_sub_resources: bool,
+) -> Result<Value, CliError> {
+    let query = view_query(fields, expand_sub_resources);
+    let request_body = body.unwrap_or_else(|| json!({}));
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            &format!("/services/rest/record/v1/{record_type}"),
+            &query,
+            &[("Accept", CREATE_FORM_ACCEPT)],
+            Some(&request_body),
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+
+pub async fn edit_form(
+    client: &NsClient,
+    record_type: &str,
+    record_id: &str,
+    body: Option<Value>,
+    fields: Option<String>,
+    expand_sub_resources: bool,
+) -> Result<Value, CliError> {
+    let query = view_query(fields, expand_sub_resources);
+    let request_body = body.unwrap_or_else(|| json!({}));
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            &format!("/services/rest/record/v1/{record_type}/{record_id}"),
+            &query,
+            &[("Accept", EDIT_FORM_ACCEPT)],
+            Some(&request_body),
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
 }
 
 /// Builds the fields/expandSubResources query pairs shared by `get` and the

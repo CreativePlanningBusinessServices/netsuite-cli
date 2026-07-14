@@ -192,3 +192,55 @@ async fn transform_form_sends_create_form_accept_and_passes_body_through() {
     .unwrap();
     assert_eq!(preview["item"]["items"][0]["quantity"], 3);
 }
+
+#[tokio::test]
+async fn create_form_posts_accept_header_and_default_empty_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/salesOrder"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=create-form",
+        ))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "currency": {"id": "1", "refName": "USD"}
+        })))
+        .mount(&server)
+        .await;
+
+    let form = record::create_form(&client_for(&server), "salesOrder", None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(form["currency"]["refName"], "USD");
+}
+
+#[tokio::test]
+async fn edit_form_patches_with_accept_header_and_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/services/rest/record/v1/salesOrder/12"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=edit-form",
+        ))
+        .and(query_param("fields", "memo,total"))
+        .and(body_json(serde_json::json!({"memo": "rush"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "memo": "rush", "total": 99.5
+        })))
+        .mount(&server)
+        .await;
+
+    let form = record::edit_form(
+        &client_for(&server),
+        "salesOrder",
+        "12",
+        Some(serde_json::json!({"memo": "rush"})),
+        Some("memo,total".into()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(form["total"], 99.5);
+}

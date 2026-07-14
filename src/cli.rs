@@ -342,6 +342,39 @@ pub enum RecordAction {
         #[arg(long, requires = "form")]
         expand_sub_resources: bool,
     },
+    /// Preview a new record's defaulted fields without creating it
+    #[command(
+        after_help = "Example: netsuite-cli record create-form salesOrder --data '{\"entity\":{\"id\":107}}'"
+    )]
+    CreateForm {
+        record_type: String,
+        /// Field values the form defaults should take into account
+        #[arg(long)]
+        data: Option<String>,
+        /// Limit the preview to these fields
+        #[arg(long)]
+        fields: Option<String>,
+        /// Expand sublists/subrecords in the preview
+        #[arg(long)]
+        expand_sub_resources: bool,
+    },
+    /// Preview an update's effect on an existing record without saving it
+    #[command(
+        after_help = "Example: netsuite-cli record edit-form salesOrder 123 --data '{\"memo\":\"rush\"}'"
+    )]
+    EditForm {
+        record_type: String,
+        id: String,
+        /// Field values the previewed update would apply
+        #[arg(long)]
+        data: Option<String>,
+        /// Limit the preview to these fields
+        #[arg(long)]
+        fields: Option<String>,
+        /// Expand sublists/subrecords in the preview
+        #[arg(long)]
+        expand_sub_resources: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -548,6 +581,40 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                         target_type,
                         body,
                         *form,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::CreateForm {
+                    record_type,
+                    data,
+                    fields,
+                    expand_sub_resources,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::create_form(
+                        &context.client,
+                        record_type,
+                        body,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::EditForm {
+                    record_type,
+                    id,
+                    data,
+                    fields,
+                    expand_sub_resources,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::edit_form(
+                        &context.client,
+                        record_type,
+                        id,
+                        body,
                         fields.clone(),
                         *expand_sub_resources,
                     )
@@ -1013,5 +1080,13 @@ mod tests {
             "item",
         ])
         .expect("--fields with --form should parse");
+    }
+
+    #[test]
+    fn record_form_subcommands_parse_with_kebab_case_names() {
+        Cli::try_parse_from(["netsuite-cli", "record", "create-form", "salesOrder"])
+            .expect("create-form parses");
+        Cli::try_parse_from(["netsuite-cli", "record", "edit-form", "salesOrder", "12"])
+            .expect("edit-form parses");
     }
 }
