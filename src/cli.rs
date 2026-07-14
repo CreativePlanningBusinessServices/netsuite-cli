@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::commands::describe::MetadataFormat;
 use crate::commands::{
-    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, update,
+    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, system, update,
 };
 use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
@@ -98,6 +98,11 @@ pub enum Command {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// System-level endpoints (system/v1): server time, governance limits
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
+    },
     /// Check for or install the latest release from GitHub
     #[command(after_help = "Examples:\n  netsuite-cli update --check\n  netsuite-cli update")]
     Update {
@@ -124,6 +129,16 @@ pub enum ConfigAction {
         after_help = "Examples:\n  netsuite-cli config set default_account prod\n  netsuite-cli config set cache_ttl_hours 48"
     )]
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+pub enum SystemAction {
+    /// Current NetSuite server time in UTC (no permissions required)
+    #[command(after_help = "Example: netsuite-cli system server-time")]
+    ServerTime,
+    /// Concurrency limit allocation for this account and integration
+    #[command(after_help = "Example: netsuite-cli system governance-limits")]
+    GovernanceLimits,
 }
 
 /// Methods accepted by `raw` and `job submit` — NetSuite's REST endpoints (record/v1, async/v1,
@@ -571,6 +586,13 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 }
             }
         }
+        Command::System { action } => {
+            let context = context_for(cli.account.as_deref())?;
+            match action {
+                SystemAction::ServerTime => system::server_time(&context.client).await,
+                SystemAction::GovernanceLimits => system::governance_limits(&context.client).await,
+            }
+        }
         Command::Update { check } => update::run(*check).await,
         Command::Config { action } => {
             let config_path = crate::config::default_config_path();
@@ -855,5 +877,12 @@ mod tests {
             }
             other => panic!("expected Usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn system_subcommands_parse() {
+        Cli::try_parse_from(["netsuite-cli", "system", "server-time"]).expect("server-time parses");
+        Cli::try_parse_from(["netsuite-cli", "system", "governance-limits"])
+            .expect("governance-limits parses");
     }
 }
