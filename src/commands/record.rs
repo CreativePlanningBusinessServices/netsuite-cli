@@ -173,3 +173,56 @@ pub async fn delete(
         .await?;
     Ok(json!({"deleted": true, "id": record_id}))
 }
+
+pub async fn attach(
+    client: &NsClient,
+    record_type: &str,
+    record_id: &str,
+    attach_type: &str,
+    attach_id: &str,
+    role: Option<String>,
+) -> Result<Value, CliError> {
+    let body = match &role {
+        Some(role_id) => json!({"role": {"id": role_id}}),
+        None => json!({}),
+    };
+    client
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/services/rest/record/v1/{record_type}/{record_id}/!attach/{attach_type}/{attach_id}"
+            ),
+            &[],
+            &[],
+            Some(&body),
+        )
+        .await?;
+    Ok(json!({
+        "attached": true, "type": record_type, "id": record_id,
+        "attachedType": attach_type, "attachedId": attach_id,
+    }))
+}
+
+pub async fn detach(
+    client: &NsClient,
+    record_type: &str,
+    record_id: &str,
+    detach_type: &str,
+    detach_id: &str,
+) -> Result<Value, CliError> {
+    client
+        .request(
+            reqwest::Method::POST,
+            &format!(
+                "/services/rest/record/v1/{record_type}/{record_id}/!detach/{detach_type}/{detach_id}"
+            ),
+            &[],
+            &[],
+            Some(&json!({})),
+        )
+        .await?;
+    Ok(json!({
+        "detached": true, "type": record_type, "id": record_id,
+        "detachedType": detach_type, "detachedId": detach_id,
+    }))
+}

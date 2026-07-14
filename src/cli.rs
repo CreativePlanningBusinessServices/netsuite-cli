@@ -300,6 +300,27 @@ pub enum RecordAction {
     },
     #[command(after_help = "Example: netsuite-cli record delete customer 1234")]
     Delete { record_type: String, id: String },
+    /// Attach a record (e.g. a contact or file) to another record
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record attach customer 660 contact 106 --role -5\n  netsuite-cli record attach opportunity 379 file 398\n\nThe first pair is the record being attached TO; the second pair is what gets attached."
+    )]
+    Attach {
+        record_type: String,
+        id: String,
+        attach_type: String,
+        attach_id: String,
+        /// Contact role id for the attachment (accepts negative ids like -5)
+        #[arg(long, allow_hyphen_values = true)]
+        role: Option<String>,
+    },
+    /// Detach a previously attached record
+    #[command(after_help = "Example: netsuite-cli record detach opportunity 379 file 398")]
+    Detach {
+        record_type: String,
+        id: String,
+        detach_type: String,
+        detach_id: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -466,6 +487,29 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 RecordAction::Delete { record_type, id } => {
                     record::delete(&context.client, record_type, id).await
                 }
+                RecordAction::Attach {
+                    record_type,
+                    id,
+                    attach_type,
+                    attach_id,
+                    role,
+                } => {
+                    record::attach(
+                        &context.client,
+                        record_type,
+                        id,
+                        attach_type,
+                        attach_id,
+                        role.clone(),
+                    )
+                    .await
+                }
+                RecordAction::Detach {
+                    record_type,
+                    id,
+                    detach_type,
+                    detach_id,
+                } => record::detach(&context.client, record_type, id, detach_type, detach_id).await,
             }
         }
         Command::Suiteql {
@@ -884,5 +928,21 @@ mod tests {
         Cli::try_parse_from(["netsuite-cli", "system", "server-time"]).expect("server-time parses");
         Cli::try_parse_from(["netsuite-cli", "system", "governance-limits"])
             .expect("governance-limits parses");
+    }
+
+    #[test]
+    fn record_attach_parses_positional_pairs_and_negative_role() {
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "attach",
+            "customer",
+            "660",
+            "contact",
+            "106",
+            "--role",
+            "-5",
+        ])
+        .expect("attach with negative role id should parse");
     }
 }
