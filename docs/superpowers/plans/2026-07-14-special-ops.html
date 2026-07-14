@@ -1,0 +1,1352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Special Operations — Implementation Plan (2026-07-14)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e3; --warn-border:#e6c98a; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:920px; padding:2.5rem 1.5rem 4rem; font:15px/1.55 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); }
+  h1 { font-size:1.55rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2.2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h2.task { background:var(--accent-soft); padding:.45rem .7rem; border-radius:8px; border-bottom:none; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.2rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em; }
+  code { background:var(--code-bg); padding:.1em .3em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.8rem 1rem; overflow-x:auto; line-height:1.45; }
+  .callout { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+  ul.step { list-style:none; padding-left:0; } ul.step li { margin:.6rem 0; }
+  ul { padding-left:1.3rem; }
+</style>
+</head>
+<body>
+
+<h1>Special Operations — Implementation Plan</h1>
+<div class="meta">2026-07-14 · Executes docs/superpowers/specs/2026-07-14-special-ops-design.html · Branch: <code>feature/special-ops</code> (already exists, carries the spec commit)</div>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: superpowers:subagent-driven-development (recommended) or superpowers:executing-plans, task-by-task with checkboxes.</div>
+
+<p><strong>Goal:</strong> Add first-class subcommands for NetSuite REST special operations — <code>record transform / create-form / edit-form / select-options / attach / detach</code> and <code>system server-time / governance-limits</code> — with wiremock tests, live-smoke additions, and README/SKILL.md discoverability.</p>
+<p><strong>Architecture:</strong> Each verb is a thin wrapper over the existing <code>NsClient::request</code> (which already handles auth, retries, Location capture, and error mapping) — new functions in <code>src/commands/record.rs</code>, a new <code>src/commands/system.rs</code>, and clap variants + dispatch arms in <code>src/cli.rs</code>. The Oracle mediaType <code>Accept</code> headers are set internally, following the pattern <code>describe.rs</code> already uses.</p>
+<p><strong>Tech stack:</strong> Rust, clap v4 (derive), reqwest, wiremock, tokio tests.</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li>No Creative Planning identifiers (account IDs, aliases, URLs) in any repo artifact — placeholders/demo values only.</li>
+  <li>Gate before every commit: <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code>.</li>
+  <li>Commits end with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>.</li>
+  <li>Every <code>after_help</code> example must be copy-paste correct (SKILL.md promises this).</li>
+  <li>Output contract is untouched: JSON-only stdout, JSON errors on stderr, exit codes 1/2/3/4. No changes to <code>NsClient</code>, auth, or error kinds.</li>
+  <li>When <code>--data</code> is omitted on the new POST/PATCH-based ops, send <code>{}</code> (matches Oracle's documented examples).</li>
+</ul>
+
+<h2>File structure</h2>
+<ul>
+  <li><code>src/commands/system.rs</code> — NEW: <code>server_time</code>, <code>governance_limits</code> (system/v1 GETs).</li>
+  <li><code>src/commands/record.rs</code> — add <code>attach</code>, <code>detach</code>, <code>transform</code>, <code>create_form</code>, <code>edit_form</code>, <code>select_options</code>; extract shared helpers <code>view_query</code> (fields/expandSubResources pairs, reused by <code>get</code>) and <code>created_record_result</code> (Location→id, reused by <code>create</code>).</li>
+  <li><code>src/commands/mod.rs</code> — register <code>pub mod system;</code>.</li>
+  <li><code>src/cli.rs</code> — new <code>RecordAction</code> variants, new <code>Command::System</code>/<code>SystemAction</code>, dispatch arms, parse tests.</li>
+  <li><code>tests/system_commands.rs</code> — NEW wiremock suite.</li>
+  <li><code>tests/record_special_ops.rs</code> — NEW wiremock suite (attach/detach/transform/forms/select-options).</li>
+  <li><code>tests/live_smoke.rs</code> — add 3 read-only live tests.</li>
+  <li><code>README.md</code>, <code>skills/netsuite-cli/SKILL.md</code> — documentation.</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 1: <code>system</code> command group (server-time, governance-limits)</h2>
+<p><strong>Files:</strong> Create <code>src/commands/system.rs</code>, <code>tests/system_commands.rs</code> · Modify <code>src/commands/mod.rs</code>, <code>src/cli.rs</code></p>
+<p><strong>Interfaces produced:</strong> <code>pub async fn server_time(client: &amp;NsClient) -&gt; Result&lt;Value, CliError&gt;</code> · <code>pub async fn governance_limits(client: &amp;NsClient) -&gt; Result&lt;Value, CliError&gt;</code> · CLI: <code>netsuite-cli system server-time</code> / <code>system governance-limits</code>.</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Write the failing tests</strong> — create <code>tests/system_commands.rs</code>:
+<pre><code>mod common;
+
+use common::client_for;
+use netsuite_cli::commands::system;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn server_time_returns_body_passthrough() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/rest/system/v1/serverTime"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "serverTime": "2026-07-14T16:21:00.000Z"
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let server_time = system::server_time(&amp;client_for(&amp;server)).await.unwrap();
+    assert_eq!(server_time["serverTime"], "2026-07-14T16:21:00.000Z");
+}
+
+#[tokio::test]
+async fn governance_limits_returns_body_passthrough() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/services/rest/system/v1/governanceLimits"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "type": "accountLimit",
+            "accountConcurrencyLimit": 25,
+            "accountUnallocatedConcurrencyLimit": 10
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let limits = system::governance_limits(&amp;client_for(&amp;server)).await.unwrap();
+    assert_eq!(limits["accountConcurrencyLimit"], 25);
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: Verify failure</strong> — Run: <code>cargo test --test system_commands</code><br>Expected: compile error — <code>could not find `system` in `commands`</code>.</li>
+
+<li><input type="checkbox"> <strong>Step 3: Implement</strong> — create <code>src/commands/system.rs</code>:
+<pre><code>use serde_json::Value;
+
+use crate::client::NsClient;
+use crate::error::CliError;
+
+pub async fn server_time(client: &amp;NsClient) -&gt; Result&lt;Value, CliError&gt; {
+    let response = client
+        .request(
+            reqwest::Method::GET,
+            "/services/rest/system/v1/serverTime",
+            &amp;[],
+            &amp;[],
+            None,
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+
+pub async fn governance_limits(client: &amp;NsClient) -&gt; Result&lt;Value, CliError&gt; {
+    let response = client
+        .request(
+            reqwest::Method::GET,
+            "/services/rest/system/v1/governanceLimits",
+            &amp;[],
+            &amp;[],
+            None,
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+</code></pre>
+In <code>src/commands/mod.rs</code>, add <code>pub mod system;</code> to the module list (alphabetical: after <code>pub mod suiteql;</code>).</li>
+
+<li><input type="checkbox"> <strong>Step 4: Verify pass</strong> — Run: <code>cargo test --test system_commands</code> — Expected: 2 passed.</li>
+
+<li><input type="checkbox"> <strong>Step 5: Wire the CLI.</strong> In <code>src/cli.rs</code>:
+<p>(a) Add <code>system</code> to the commands import:</p>
+<pre><code>use crate::commands::{
+    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, system, update,
+};
+</code></pre>
+<p>(b) New variant in <code>enum Command</code> (after <code>Job</code>, before <code>Update</code>):</p>
+<pre><code>    /// System-level endpoints (system/v1): server time, governance limits
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
+    },
+</code></pre>
+<p>(c) New enum (clap derives kebab-case names <code>server-time</code>/<code>governance-limits</code> automatically) — place near <code>ConfigAction</code>:</p>
+<pre><code>#[derive(Subcommand)]
+pub enum SystemAction {
+    /// Current NetSuite server time in UTC (no permissions required)
+    #[command(after_help = "Example: netsuite-cli system server-time")]
+    ServerTime,
+    /// Concurrency limit allocation for this account and integration
+    #[command(after_help = "Example: netsuite-cli system governance-limits")]
+    GovernanceLimits,
+}
+</code></pre>
+<p>(d) Dispatch arm in <code>dispatch()</code> (after the <code>Command::Job</code> arm):</p>
+<pre><code>        Command::System { action } =&gt; {
+            let context = context_for(cli.account.as_deref())?;
+            match action {
+                SystemAction::ServerTime =&gt; system::server_time(&amp;context.client).await,
+                SystemAction::GovernanceLimits =&gt; {
+                    system::governance_limits(&amp;context.client).await
+                }
+            }
+        }
+</code></pre>
+<p>(e) Parse test in the <code>cli.rs</code> tests module:</p>
+<pre><code>    #[test]
+    fn system_subcommands_parse() {
+        Cli::try_parse_from(["netsuite-cli", "system", "server-time"])
+            .expect("server-time parses");
+        Cli::try_parse_from(["netsuite-cli", "system", "governance-limits"])
+            .expect("governance-limits parses");
+    }
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 6: Full gate</strong> — Run: <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — Expected: clean, all suites pass.</li>
+
+<li><input type="checkbox"> <strong>Step 7: Commit</strong>
+<pre><code>git add src/commands/system.rs src/commands/mod.rs src/cli.rs tests/system_commands.rs
+git commit -m "feat: add system command group (server-time, governance-limits)
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 2: <code>record attach</code> / <code>record detach</code></h2>
+<p><strong>Files:</strong> Create <code>tests/record_special_ops.rs</code> · Modify <code>src/commands/record.rs</code>, <code>src/cli.rs</code></p>
+<p><strong>Interfaces produced:</strong> <code>pub async fn attach(client, record_type: &amp;str, record_id: &amp;str, attach_type: &amp;str, attach_id: &amp;str, role: Option&lt;String&gt;) -&gt; Result&lt;Value, CliError&gt;</code> · <code>pub async fn detach(client, record_type: &amp;str, record_id: &amp;str, detach_type: &amp;str, detach_id: &amp;str) -&gt; Result&lt;Value, CliError&gt;</code>.</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Write the failing tests</strong> — create <code>tests/record_special_ops.rs</code>:
+<pre><code>mod common;
+
+use common::client_for;
+use netsuite_cli::commands::record;
+use wiremock::matchers::{body_json, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn attach_posts_role_body_and_reports_linkage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/customer/660/!attach/contact/106"))
+        .and(body_json(serde_json::json!({"role": {"id": "-5"}})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&amp;server)
+        .await;
+
+    let attached = record::attach(
+        &amp;client_for(&amp;server),
+        "customer",
+        "660",
+        "contact",
+        "106",
+        Some("-5".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attached,
+        serde_json::json!({
+            "attached": true, "type": "customer", "id": "660",
+            "attachedType": "contact", "attachedId": "106"
+        })
+    );
+}
+
+#[tokio::test]
+async fn attach_without_role_sends_empty_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/customer/660/!attach/contact/106"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&amp;server)
+        .await;
+
+    let attached = record::attach(&amp;client_for(&amp;server), "customer", "660", "contact", "106", None)
+        .await
+        .unwrap();
+    assert_eq!(attached["attached"], true);
+}
+
+#[tokio::test]
+async fn detach_posts_empty_body_and_reports_linkage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/opportunity/379/!detach/file/398"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&amp;server)
+        .await;
+
+    let detached = record::detach(&amp;client_for(&amp;server), "opportunity", "379", "file", "398")
+        .await
+        .unwrap();
+    assert_eq!(
+        detached,
+        serde_json::json!({
+            "detached": true, "type": "opportunity", "id": "379",
+            "detachedType": "file", "detachedId": "398"
+        })
+    );
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: Verify failure</strong> — Run: <code>cargo test --test record_special_ops</code><br>Expected: compile error — <code>cannot find function `attach` in module `record`</code>.</li>
+
+<li><input type="checkbox"> <strong>Step 3: Implement</strong> — append to <code>src/commands/record.rs</code>:
+<pre><code>pub async fn attach(
+    client: &amp;NsClient,
+    record_type: &amp;str,
+    record_id: &amp;str,
+    attach_type: &amp;str,
+    attach_id: &amp;str,
+    role: Option&lt;String&gt;,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let body = match &amp;role {
+        Some(role_id) =&gt; json!({"role": {"id": role_id}}),
+        None =&gt; json!({}),
+    };
+    client
+        .request(
+            reqwest::Method::POST,
+            &amp;format!(
+                "/services/rest/record/v1/{record_type}/{record_id}/!attach/{attach_type}/{attach_id}"
+            ),
+            &amp;[],
+            &amp;[],
+            Some(&amp;body),
+        )
+        .await?;
+    Ok(json!({
+        "attached": true, "type": record_type, "id": record_id,
+        "attachedType": attach_type, "attachedId": attach_id,
+    }))
+}
+
+pub async fn detach(
+    client: &amp;NsClient,
+    record_type: &amp;str,
+    record_id: &amp;str,
+    detach_type: &amp;str,
+    detach_id: &amp;str,
+) -&gt; Result&lt;Value, CliError&gt; {
+    client
+        .request(
+            reqwest::Method::POST,
+            &amp;format!(
+                "/services/rest/record/v1/{record_type}/{record_id}/!detach/{detach_type}/{detach_id}"
+            ),
+            &amp;[],
+            &amp;[],
+            Some(&amp;json!({})),
+        )
+        .await?;
+    Ok(json!({
+        "detached": true, "type": record_type, "id": record_id,
+        "detachedType": detach_type, "detachedId": detach_id,
+    }))
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 4: Verify pass</strong> — Run: <code>cargo test --test record_special_ops</code> — Expected: 3 passed.</li>
+
+<li><input type="checkbox"> <strong>Step 5: Wire the CLI.</strong> In <code>src/cli.rs</code>, add to <code>enum RecordAction</code> (after <code>Delete</code>). Note <code>allow_hyphen_values</code>: NetSuite contact role ids are often negative (e.g. <code>-5</code>) and clap would otherwise reject <code>--role -5</code> as an unknown flag:
+<pre><code>    /// Attach a record (e.g. a contact or file) to another record
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record attach customer 660 contact 106 --role -5\n  netsuite-cli record attach opportunity 379 file 398\n\nThe first pair is the record being attached TO; the second pair is what gets attached."
+    )]
+    Attach {
+        record_type: String,
+        id: String,
+        attach_type: String,
+        attach_id: String,
+        /// Contact role id for the attachment (accepts negative ids like -5)
+        #[arg(long, allow_hyphen_values = true)]
+        role: Option&lt;String&gt;,
+    },
+    /// Detach a previously attached record
+    #[command(after_help = "Example: netsuite-cli record detach opportunity 379 file 398")]
+    Detach {
+        record_type: String,
+        id: String,
+        detach_type: String,
+        detach_id: String,
+    },
+</code></pre>
+<p>Dispatch arms inside the <code>Command::Record</code> match:</p>
+<pre><code>                RecordAction::Attach {
+                    record_type,
+                    id,
+                    attach_type,
+                    attach_id,
+                    role,
+                } =&gt; {
+                    record::attach(
+                        &amp;context.client,
+                        record_type,
+                        id,
+                        attach_type,
+                        attach_id,
+                        role.clone(),
+                    )
+                    .await
+                }
+                RecordAction::Detach {
+                    record_type,
+                    id,
+                    detach_type,
+                    detach_id,
+                } =&gt; {
+                    record::detach(&amp;context.client, record_type, id, detach_type, detach_id).await
+                }
+</code></pre>
+<p>Parse test in the <code>cli.rs</code> tests module (guards the negative-role parse):</p>
+<pre><code>    #[test]
+    fn record_attach_parses_positional_pairs_and_negative_role() {
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "attach",
+            "customer",
+            "660",
+            "contact",
+            "106",
+            "--role",
+            "-5",
+        ])
+        .expect("attach with negative role id should parse");
+    }
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 6: Full gate</strong> — Run: <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — Expected: clean.</li>
+
+<li><input type="checkbox"> <strong>Step 7: Commit</strong>
+<pre><code>git add src/commands/record.rs src/cli.rs tests/record_special_ops.rs
+git commit -m "feat: add record attach/detach commands
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 3: <code>record transform</code> (execute + <code>--form</code> preview)</h2>
+<p><strong>Files:</strong> Modify <code>src/commands/record.rs</code>, <code>src/cli.rs</code>, <code>tests/record_special_ops.rs</code></p>
+<p><strong>Interfaces produced:</strong> <code>pub async fn transform(client, source_type: &amp;str, source_id: &amp;str, target_type: &amp;str, body: Option&lt;Value&gt;, form: bool, fields: Option&lt;String&gt;, expand_sub_resources: bool) -&gt; Result&lt;Value, CliError&gt;</code> · private helpers <code>view_query(fields: Option&lt;String&gt;, expand_sub_resources: bool) -&gt; Vec&lt;(&amp;'static str, String)&gt;</code> and <code>created_record_result(response: NsResponse, operation: &amp;str) -&gt; Result&lt;Value, CliError&gt;</code> (Tasks 4–5 reuse <code>view_query</code>; <code>create</code> is refactored onto <code>created_record_result</code>) · const <code>CREATE_FORM_ACCEPT</code> (Task 4 reuses it).</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Write the failing tests</strong> — append to <code>tests/record_special_ops.rs</code>, extending the imports at the top of the file to:
+<pre><code>use netsuite_cli::error::CliError;
+use wiremock::matchers::{body_json, header, method, path, query_param};
+</code></pre>
+<p>then add:</p>
+<pre><code>#[tokio::test]
+async fn transform_returns_id_from_location_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/salesOrder/7/!transform/invoice"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(
+            ResponseTemplate::new(204)
+                .insert_header("Location", "https://x/services/rest/record/v1/invoice/91"),
+        )
+        .mount(&amp;server)
+        .await;
+
+    let transformed = record::transform(
+        &amp;client_for(&amp;server),
+        "salesOrder",
+        "7",
+        "invoice",
+        None,
+        false,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        transformed,
+        serde_json::json!({
+            "id": "91", "location": "https://x/services/rest/record/v1/invoice/91"
+        })
+    );
+}
+
+#[tokio::test]
+async fn transform_errors_when_location_header_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/salesOrder/7/!transform/invoice"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&amp;server)
+        .await;
+
+    let transform_result = record::transform(
+        &amp;client_for(&amp;server),
+        "salesOrder",
+        "7",
+        "invoice",
+        None,
+        false,
+        None,
+        false,
+    )
+    .await;
+
+    match transform_result {
+        Err(CliError::Api {
+            status, message, ..
+        }) =&gt; {
+            assert_eq!(status, 204);
+            assert!(
+                message.contains("no Location header was returned"),
+                "unexpected message: {message}"
+            );
+        }
+        other =&gt; panic!("expected CliError::Api, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn transform_form_sends_create_form_accept_and_passes_body_through() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/services/rest/record/v1/salesOrder/7/!transform/itemFulfillment",
+        ))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=create-form",
+        ))
+        .and(query_param("fields", "item"))
+        .and(query_param("expandSubResources", "true"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "item": {"items": [{"quantity": 3}]}
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let preview = record::transform(
+        &amp;client_for(&amp;server),
+        "salesOrder",
+        "7",
+        "itemFulfillment",
+        None,
+        true,
+        Some("item".into()),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview["item"]["items"][0]["quantity"], 3);
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: Verify failure</strong> — Run: <code>cargo test --test record_special_ops</code><br>Expected: compile error — <code>cannot find function `transform` in module `record`</code>.</li>
+
+<li><input type="checkbox"> <strong>Step 3: Implement.</strong> In <code>src/commands/record.rs</code>:
+<p>(a) Change the client import at the top to also bring in <code>NsResponse</code>, and add the mediaType constant:</p>
+<pre><code>use crate::client::{NsClient, NsResponse};
+
+const CREATE_FORM_ACCEPT: &amp;str = "application/vnd.oracle.resource+json; type=create-form";
+</code></pre>
+<p>(b) Add the shared helpers (below the existing <code>delete</code> function):</p>
+<pre><code>/// Builds the fields/expandSubResources query pairs shared by `get` and the
+/// form-preview operations.
+fn view_query(
+    fields: Option&lt;String&gt;,
+    expand_sub_resources: bool,
+) -&gt; Vec&lt;(&amp;'static str, String)&gt; {
+    let mut query = Vec::new();
+    if let Some(field_list) = fields {
+        query.push(("fields", field_list));
+    }
+    if expand_sub_resources {
+        query.push(("expandSubResources", "true".into()));
+    }
+    query
+}
+
+/// Shapes the `{"id", "location"}` result for operations whose success is a 204
+/// with a Location header pointing at the record they created (create, transform).
+fn created_record_result(response: NsResponse, operation: &amp;str) -&gt; Result&lt;Value, CliError&gt; {
+    let Some(location) = response.location else {
+        return Err(CliError::Api {
+            status: response.status,
+            message: format!(
+                "{operation} succeeded but no Location header was returned; record id unknown"
+            ),
+            details: vec![],
+        });
+    };
+    let new_id = location.rsplit('/').next().unwrap_or_default().to_string();
+    Ok(json!({"id": new_id, "location": location}))
+}
+</code></pre>
+<p>(c) Refactor the bodies of <code>get</code> and <code>create</code> onto the helpers (signatures unchanged; existing tests must still pass):</p>
+<pre><code>pub async fn get(
+    client: &amp;NsClient,
+    record_type: &amp;str,
+    record_id: &amp;str,
+    fields: Option&lt;String&gt;,
+    expand_sub_resources: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let query = view_query(fields, expand_sub_resources);
+    let response = client
+        .request(
+            reqwest::Method::GET,
+            &amp;format!("/services/rest/record/v1/{record_type}/{record_id}"),
+            &amp;query,
+            &amp;[],
+            None,
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+
+pub async fn create(client: &amp;NsClient, record_type: &amp;str, body: Value) -&gt; Result&lt;Value, CliError&gt; {
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            &amp;format!("/services/rest/record/v1/{record_type}"),
+            &amp;[],
+            &amp;[],
+            Some(&amp;body),
+        )
+        .await?;
+    created_record_result(response, "create")
+}
+</code></pre>
+<p>(d) Add <code>transform</code>:</p>
+<pre><code>#[allow(clippy::too_many_arguments)]
+pub async fn transform(
+    client: &amp;NsClient,
+    source_type: &amp;str,
+    source_id: &amp;str,
+    target_type: &amp;str,
+    body: Option&lt;Value&gt;,
+    form: bool,
+    fields: Option&lt;String&gt;,
+    expand_sub_resources: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let path = format!(
+        "/services/rest/record/v1/{source_type}/{source_id}/!transform/{target_type}"
+    );
+    let request_body = body.unwrap_or_else(|| json!({}));
+    if form {
+        let query = view_query(fields, expand_sub_resources);
+        let response = client
+            .request(
+                reqwest::Method::POST,
+                &amp;path,
+                &amp;query,
+                &amp;[("Accept", CREATE_FORM_ACCEPT)],
+                Some(&amp;request_body),
+            )
+            .await?;
+        return Ok(response.body.unwrap_or(Value::Null));
+    }
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            &amp;path,
+            &amp;[],
+            &amp;[],
+            Some(&amp;request_body),
+        )
+        .await?;
+    created_record_result(response, "transform")
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 4: Verify pass</strong> — Run: <code>cargo test --test record_special_ops &amp;&amp; cargo test --test record_commands</code> — Expected: all pass (including the pre-existing create/get tests over the refactored helpers).</li>
+
+<li><input type="checkbox"> <strong>Step 5: Wire the CLI.</strong> In <code>src/cli.rs</code>, add to <code>enum RecordAction</code>. clap's <code>requires = "form"</code> makes <code>--fields</code>/<code>--expand-sub-resources</code> without <code>--form</code> a parse error (exit 2 via the existing usage envelope):
+<pre><code>    /// Turn one record into another (e.g. salesOrder -&gt; invoice); creates the target record
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record transform salesOrder 123 invoice\n  netsuite-cli record transform salesOrder 123 itemFulfillment --form --fields item --expand-sub-resources"
+    )]
+    Transform {
+        source_type: String,
+        source_id: String,
+        target_type: String,
+        /// Field overrides applied to the transformed record
+        #[arg(long)]
+        data: Option&lt;String&gt;,
+        /// Return the create-form preview instead of executing (creates nothing)
+        #[arg(long)]
+        form: bool,
+        /// Limit the --form preview to these fields
+        #[arg(long, requires = "form")]
+        fields: Option&lt;String&gt;,
+        /// Expand sublists/subrecords in the --form preview
+        #[arg(long, requires = "form")]
+        expand_sub_resources: bool,
+    },
+</code></pre>
+<p>Dispatch arm inside the <code>Command::Record</code> match:</p>
+<pre><code>                RecordAction::Transform {
+                    source_type,
+                    source_id,
+                    target_type,
+                    data,
+                    form,
+                    fields,
+                    expand_sub_resources,
+                } =&gt; {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::transform(
+                        &amp;context.client,
+                        source_type,
+                        source_id,
+                        target_type,
+                        body,
+                        *form,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+</code></pre>
+<p>Parse test in the <code>cli.rs</code> tests module:</p>
+<pre><code>    #[test]
+    fn record_transform_form_flags_require_form() {
+        expect_parse_error(&amp;[
+            "netsuite-cli",
+            "record",
+            "transform",
+            "salesOrder",
+            "1",
+            "invoice",
+            "--fields",
+            "item",
+        ]);
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "transform",
+            "salesOrder",
+            "1",
+            "invoice",
+            "--form",
+            "--fields",
+            "item",
+        ])
+        .expect("--fields with --form should parse");
+    }
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 6: Full gate</strong> — Run: <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — Expected: clean.</li>
+
+<li><input type="checkbox"> <strong>Step 7: Commit</strong>
+<pre><code>git add src/commands/record.rs src/cli.rs tests/record_special_ops.rs
+git commit -m "feat: add record transform with --form create-form preview
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 4: <code>record create-form</code> / <code>record edit-form</code></h2>
+<p><strong>Files:</strong> Modify <code>src/commands/record.rs</code>, <code>src/cli.rs</code>, <code>tests/record_special_ops.rs</code></p>
+<p><strong>Interfaces consumed:</strong> <code>view_query</code>, <code>CREATE_FORM_ACCEPT</code> (Task 3). <strong>Produced:</strong> <code>pub async fn create_form(client, record_type: &amp;str, body: Option&lt;Value&gt;, fields: Option&lt;String&gt;, expand_sub_resources: bool) -&gt; Result&lt;Value, CliError&gt;</code> · <code>pub async fn edit_form(client, record_type: &amp;str, record_id: &amp;str, body: Option&lt;Value&gt;, fields: Option&lt;String&gt;, expand_sub_resources: bool) -&gt; Result&lt;Value, CliError&gt;</code>.</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Write the failing tests</strong> — append to <code>tests/record_special_ops.rs</code>:
+<pre><code>#[tokio::test]
+async fn create_form_posts_accept_header_and_default_empty_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/salesOrder"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=create-form",
+        ))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "currency": {"id": "1", "refName": "USD"}
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let form = record::create_form(&amp;client_for(&amp;server), "salesOrder", None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(form["currency"]["refName"], "USD");
+}
+
+#[tokio::test]
+async fn edit_form_patches_with_accept_header_and_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/services/rest/record/v1/salesOrder/12"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=edit-form",
+        ))
+        .and(query_param("fields", "memo,total"))
+        .and(body_json(serde_json::json!({"memo": "rush"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "memo": "rush", "total": 99.5
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let form = record::edit_form(
+        &amp;client_for(&amp;server),
+        "salesOrder",
+        "12",
+        Some(serde_json::json!({"memo": "rush"})),
+        Some("memo,total".into()),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(form["total"], 99.5);
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: Verify failure</strong> — Run: <code>cargo test --test record_special_ops</code><br>Expected: compile error — <code>cannot find function `create_form` in module `record`</code>.</li>
+
+<li><input type="checkbox"> <strong>Step 3: Implement</strong> — in <code>src/commands/record.rs</code>, add the constant next to <code>CREATE_FORM_ACCEPT</code>:
+<pre><code>const EDIT_FORM_ACCEPT: &amp;str = "application/vnd.oracle.resource+json; type=edit-form";
+</code></pre>
+<p>and the functions:</p>
+<pre><code>pub async fn create_form(
+    client: &amp;NsClient,
+    record_type: &amp;str,
+    body: Option&lt;Value&gt;,
+    fields: Option&lt;String&gt;,
+    expand_sub_resources: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let query = view_query(fields, expand_sub_resources);
+    let request_body = body.unwrap_or_else(|| json!({}));
+    let response = client
+        .request(
+            reqwest::Method::POST,
+            &amp;format!("/services/rest/record/v1/{record_type}"),
+            &amp;query,
+            &amp;[("Accept", CREATE_FORM_ACCEPT)],
+            Some(&amp;request_body),
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+
+pub async fn edit_form(
+    client: &amp;NsClient,
+    record_type: &amp;str,
+    record_id: &amp;str,
+    body: Option&lt;Value&gt;,
+    fields: Option&lt;String&gt;,
+    expand_sub_resources: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let query = view_query(fields, expand_sub_resources);
+    let request_body = body.unwrap_or_else(|| json!({}));
+    let response = client
+        .request(
+            reqwest::Method::PATCH,
+            &amp;format!("/services/rest/record/v1/{record_type}/{record_id}"),
+            &amp;query,
+            &amp;[("Accept", EDIT_FORM_ACCEPT)],
+            Some(&amp;request_body),
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 4: Verify pass</strong> — Run: <code>cargo test --test record_special_ops</code> — Expected: all pass.</li>
+
+<li><input type="checkbox"> <strong>Step 5: Wire the CLI.</strong> In <code>src/cli.rs</code>, add to <code>enum RecordAction</code> (clap derives the names <code>create-form</code>/<code>edit-form</code>):
+<pre><code>    /// Preview a new record's defaulted fields without creating it
+    #[command(
+        after_help = "Example: netsuite-cli record create-form salesOrder --data '{\"entity\":{\"id\":107}}'"
+    )]
+    CreateForm {
+        record_type: String,
+        /// Field values the form defaults should take into account
+        #[arg(long)]
+        data: Option&lt;String&gt;,
+        /// Limit the preview to these fields
+        #[arg(long)]
+        fields: Option&lt;String&gt;,
+        /// Expand sublists/subrecords in the preview
+        #[arg(long)]
+        expand_sub_resources: bool,
+    },
+    /// Preview an update's effect on an existing record without saving it
+    #[command(
+        after_help = "Example: netsuite-cli record edit-form salesOrder 123 --data '{\"memo\":\"rush\"}'"
+    )]
+    EditForm {
+        record_type: String,
+        id: String,
+        /// Field values the previewed update would apply
+        #[arg(long)]
+        data: Option&lt;String&gt;,
+        /// Limit the preview to these fields
+        #[arg(long)]
+        fields: Option&lt;String&gt;,
+        /// Expand sublists/subrecords in the preview
+        #[arg(long)]
+        expand_sub_resources: bool,
+    },
+</code></pre>
+<p>Dispatch arms inside the <code>Command::Record</code> match:</p>
+<pre><code>                RecordAction::CreateForm {
+                    record_type,
+                    data,
+                    fields,
+                    expand_sub_resources,
+                } =&gt; {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::create_form(
+                        &amp;context.client,
+                        record_type,
+                        body,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::EditForm {
+                    record_type,
+                    id,
+                    data,
+                    fields,
+                    expand_sub_resources,
+                } =&gt; {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::edit_form(
+                        &amp;context.client,
+                        record_type,
+                        id,
+                        body,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+</code></pre>
+<p>Parse test in the <code>cli.rs</code> tests module:</p>
+<pre><code>    #[test]
+    fn record_form_subcommands_parse_with_kebab_case_names() {
+        Cli::try_parse_from(["netsuite-cli", "record", "create-form", "salesOrder"])
+            .expect("create-form parses");
+        Cli::try_parse_from(["netsuite-cli", "record", "edit-form", "salesOrder", "12"])
+            .expect("edit-form parses");
+    }
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 6: Full gate</strong> — Run: <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — Expected: clean.</li>
+
+<li><input type="checkbox"> <strong>Step 7: Commit</strong>
+<pre><code>git add src/commands/record.rs src/cli.rs tests/record_special_ops.rs
+git commit -m "feat: add record create-form and edit-form preview commands
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 5: <code>record select-options</code></h2>
+<p><strong>Files:</strong> Modify <code>src/commands/record.rs</code>, <code>src/cli.rs</code>, <code>tests/record_special_ops.rs</code></p>
+<p><strong>Interfaces produced:</strong> <code>pub async fn select_options(client, record_type: &amp;str, record_id: Option&lt;&amp;str&gt;, fields: &amp;str, q_filter: Option&lt;String&gt;, limit: Option&lt;u64&gt;, offset: Option&lt;u64&gt;, body: Option&lt;Value&gt;) -&gt; Result&lt;Value, CliError&gt;</code> (Task 6's live smoke calls it).</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Write the failing tests</strong> — append to <code>tests/record_special_ops.rs</code>:
+<pre><code>#[tokio::test]
+async fn select_options_without_id_posts_with_filters() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/customer"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=select-options",
+        ))
+        .and(query_param("fields", "entitystatus,location"))
+        .and(query_param("q", "entitystatus START_WITH LEAD-"))
+        .and(query_param("limit", "50"))
+        .and(query_param("offset", "0"))
+        .and(body_json(serde_json::json!({})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "entitystatus": {
+                "_selectOptions": {
+                    "items": [{"id": 13, "refName": "CUSTOMER-Closed Won"}],
+                    "count": 1, "offset": 0, "hasMore": false, "totalResults": 1
+                }
+            }
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let options = record::select_options(
+        &amp;client_for(&amp;server),
+        "customer",
+        None,
+        "entitystatus,location",
+        Some("entitystatus START_WITH LEAD-".into()),
+        Some(50),
+        Some(0),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        options["entitystatus"]["_selectOptions"]["items"][0]["id"],
+        13
+    );
+}
+
+#[tokio::test]
+async fn select_options_with_id_patches_with_dependency_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/services/rest/record/v1/salesOrder/12"))
+        .and(header(
+            "Accept",
+            "application/vnd.oracle.resource+json; type=select-options",
+        ))
+        .and(query_param("fields", "item"))
+        .and(body_json(serde_json::json!({"subsidiary": {"id": 1}})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "item": {"_selectOptions": {"items": []}}
+        })))
+        .mount(&amp;server)
+        .await;
+
+    let options = record::select_options(
+        &amp;client_for(&amp;server),
+        "salesOrder",
+        Some("12"),
+        "item",
+        None,
+        None,
+        None,
+        Some(serde_json::json!({"subsidiary": {"id": 1}})),
+    )
+    .await
+    .unwrap();
+    assert!(options["item"]["_selectOptions"]["items"].is_array());
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: Verify failure</strong> — Run: <code>cargo test --test record_special_ops</code><br>Expected: compile error — <code>cannot find function `select_options` in module `record`</code>.</li>
+
+<li><input type="checkbox"> <strong>Step 3: Implement</strong> — in <code>src/commands/record.rs</code>, add the constant:
+<pre><code>const SELECT_OPTIONS_ACCEPT: &amp;str = "application/vnd.oracle.resource+json; type=select-options";
+</code></pre>
+<p>and the function (POST for record-type context; PATCH against the record when an id is given, per the selectOptions doc):</p>
+<pre><code>#[allow(clippy::too_many_arguments)]
+pub async fn select_options(
+    client: &amp;NsClient,
+    record_type: &amp;str,
+    record_id: Option&lt;&amp;str&gt;,
+    fields: &amp;str,
+    q_filter: Option&lt;String&gt;,
+    limit: Option&lt;u64&gt;,
+    offset: Option&lt;u64&gt;,
+    body: Option&lt;Value&gt;,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let mut query: Vec&lt;(&amp;str, String)&gt; = vec![("fields", fields.to_string())];
+    if let Some(filter) = q_filter {
+        query.push(("q", filter));
+    }
+    if let Some(limit_value) = limit {
+        query.push(("limit", limit_value.to_string()));
+    }
+    if let Some(offset_value) = offset {
+        query.push(("offset", offset_value.to_string()));
+    }
+    let (http_method, path) = match record_id {
+        Some(id) =&gt; (
+            reqwest::Method::PATCH,
+            format!("/services/rest/record/v1/{record_type}/{id}"),
+        ),
+        None =&gt; (
+            reqwest::Method::POST,
+            format!("/services/rest/record/v1/{record_type}"),
+        ),
+    };
+    let request_body = body.unwrap_or_else(|| json!({}));
+    let response = client
+        .request(
+            http_method,
+            &amp;path,
+            &amp;query,
+            &amp;[("Accept", SELECT_OPTIONS_ACCEPT)],
+            Some(&amp;request_body),
+        )
+        .await?;
+    Ok(response.body.unwrap_or(Value::Null))
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 4: Verify pass</strong> — Run: <code>cargo test --test record_special_ops</code> — Expected: all pass.</li>
+
+<li><input type="checkbox"> <strong>Step 5: Wire the CLI.</strong> In <code>src/cli.rs</code>, add to <code>enum RecordAction</code> (<code>--fields</code> is required — the operation is meaningless without it):
+<pre><code>    /// Valid dropdown (select) values for record fields
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record select-options customer --fields entitystatus,location\n  netsuite-cli record select-options customer --fields entitystatus --q 'entitystatus START_WITH LEAD-'\n  netsuite-cli record select-options salesOrder 123 --fields item --data '{\"subsidiary\":{\"id\":1}}'"
+    )]
+    SelectOptions {
+        record_type: String,
+        /// Existing record id: evaluates options in that record's context (uses PATCH)
+        id: Option&lt;String&gt;,
+        /// Comma-separated field names to fetch options for (sublist fields as line.field)
+        #[arg(long)]
+        fields: String,
+        /// Filter, e.g. 'entitystatus START_WITH LEAD-' (operators: CONTAIN, IS, START_WITH)
+        #[arg(long)]
+        q: Option&lt;String&gt;,
+        #[arg(long)]
+        limit: Option&lt;u64&gt;,
+        #[arg(long)]
+        offset: Option&lt;u64&gt;,
+        /// Values for fields the requested options depend on
+        #[arg(long)]
+        data: Option&lt;String&gt;,
+    },
+</code></pre>
+<p>Dispatch arm inside the <code>Command::Record</code> match:</p>
+<pre><code>                RecordAction::SelectOptions {
+                    record_type,
+                    id,
+                    fields,
+                    q,
+                    limit,
+                    offset,
+                    data,
+                } =&gt; {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::select_options(
+                        &amp;context.client,
+                        record_type,
+                        id.as_deref(),
+                        fields,
+                        q.clone(),
+                        *limit,
+                        *offset,
+                        body,
+                    )
+                    .await
+                }
+</code></pre>
+<p>Parse test in the <code>cli.rs</code> tests module:</p>
+<pre><code>    #[test]
+    fn record_select_options_requires_fields_flag() {
+        expect_parse_error(&amp;["netsuite-cli", "record", "select-options", "customer"]);
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "select-options",
+            "customer",
+            "--fields",
+            "entitystatus",
+        ])
+        .expect("select-options with --fields parses");
+    }
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 6: Full gate</strong> — Run: <code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — Expected: clean.</li>
+
+<li><input type="checkbox"> <strong>Step 7: Commit</strong>
+<pre><code>git add src/commands/record.rs src/cli.rs tests/record_special_ops.rs
+git commit -m "feat: add record select-options command
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 6: Live smoke additions (read-only ops only)</h2>
+<p><strong>Files:</strong> Modify <code>tests/live_smoke.rs</code></p>
+<p><strong>Interfaces consumed:</strong> <code>system::server_time</code>, <code>system::governance_limits</code> (Task 1), <code>record::select_options</code> (Task 5).</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Add the tests</strong> — in <code>tests/live_smoke.rs</code>, extend the imports:
+<pre><code>use netsuite_cli::commands::record;
+use netsuite_cli::commands::system;
+</code></pre>
+<p>and append (same <code>#[ignore]</code> string as the existing tests):</p>
+<pre><code>/// Equivalent of `netsuite-cli system server-time`.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; run with NETSUITE_LIVE_ALIAS=&lt;alias&gt; cargo test --test live_smoke -- --ignored"]
+async fn server_time_returns_utc_timestamp() {
+    let alias = live_alias();
+    let context = context_for(Some(&amp;alias)).expect("account context resolves from local config");
+
+    let server_time = system::server_time(&amp;context.client)
+        .await
+        .expect("serverTime request succeeds");
+
+    let timestamp = server_time["serverTime"]
+        .as_str()
+        .expect("serverTime is a string");
+    assert!(timestamp.ends_with('Z'), "expected UTC timestamp: {timestamp}");
+}
+
+/// Equivalent of `netsuite-cli system governance-limits`.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; run with NETSUITE_LIVE_ALIAS=&lt;alias&gt; cargo test --test live_smoke -- --ignored"]
+async fn governance_limits_reports_concurrency() {
+    let alias = live_alias();
+    let context = context_for(Some(&amp;alias)).expect("account context resolves from local config");
+
+    let limits = system::governance_limits(&amp;context.client)
+        .await
+        .expect("governanceLimits request succeeds");
+
+    assert!(limits.is_object(), "expected a limits object: {limits}");
+}
+
+/// Equivalent of `netsuite-cli record select-options customer --fields entitystatus --limit 5`.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; run with NETSUITE_LIVE_ALIAS=&lt;alias&gt; cargo test --test live_smoke -- --ignored"]
+async fn select_options_lists_customer_entity_statuses() {
+    let alias = live_alias();
+    let context = context_for(Some(&amp;alias)).expect("account context resolves from local config");
+
+    let options = record::select_options(
+        &amp;context.client,
+        "customer",
+        None,
+        "entitystatus",
+        None,
+        Some(5),
+        None,
+        None,
+    )
+    .await
+    .expect("select-options request succeeds");
+
+    assert!(
+        options["entitystatus"]["_selectOptions"]["items"].is_array(),
+        "expected _selectOptions items for entitystatus: {options}"
+    );
+}
+</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: Verify compile + wiremock suites still green</strong> — Run: <code>cargo test</code> — Expected: all pass; live tests are compiled but skipped as ignored.</li>
+
+<li><input type="checkbox"> <strong>Step 3 (optional, if a sandbox alias is registered on this machine): run the new live tests</strong> — Run: <code>NETSUITE_LIVE_ALIAS=&lt;alias&gt; cargo test --test live_smoke -- --ignored server_time_returns_utc_timestamp governance_limits_reports_concurrency select_options_lists_customer_entity_statuses</code> — Expected: 3 passed (skip this step in CI or if no sandbox alias exists).</li>
+
+<li><input type="checkbox"> <strong>Step 4: Commit</strong>
+<pre><code>git add tests/live_smoke.rs
+git commit -m "test: live smoke coverage for server-time, governance-limits, select-options
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 7: Documentation (README + SKILL.md)</h2>
+<p><strong>Files:</strong> Modify <code>README.md</code>, <code>skills/netsuite-cli/SKILL.md</code></p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: README — intro sentence.</strong> In the first paragraph, change <code>It covers record CRUD, SuiteQL, RESTlets, metadata discovery, async jobs, and raw passthrough requests</code> to:
+<pre><code>It covers record CRUD and special operations (transform, form previews, select
+options, attach/detach), SuiteQL, RESTlets, metadata discovery, system endpoints,
+async jobs, and raw passthrough requests</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 2: README — record section.</strong> After the <code>record delete</code> example and the <code>--data</code>/<code>--all</code> paragraph in the <code>### record</code> section, append:
+<pre><code>Special operations in the same namespace:
+
+```bash
+$ netsuite-cli record transform salesOrder 123 invoice
+{"id":"9101","location":"https://1234567-sb1.suitetalk.api.netsuite.com/services/rest/record/v1/invoice/9101"}
+
+$ netsuite-cli record transform salesOrder 123 itemFulfillment --form   # preview; creates nothing
+$ netsuite-cli record create-form salesOrder --data '{"entity":{"id":107}}'
+$ netsuite-cli record edit-form salesOrder 123 --data '{"memo":"rush"}'
+
+$ netsuite-cli record select-options customer --fields entitystatus --q 'entitystatus START_WITH LEAD-'
+{"entitystatus":{"_selectOptions":{"items":[{"id":13,"refName":"CUSTOMER-Closed Won"}],"count":1,"offset":0,"hasMore":false,"totalResults":1}}}
+
+$ netsuite-cli record attach customer 660 contact 106 --role -5
+{"attached":true,"type":"customer","id":"660","attachedType":"contact","attachedId":"106"}
+
+$ netsuite-cli record detach opportunity 379 file 398
+{"detached":true,"type":"opportunity","id":"379","detachedType":"file","detachedId":"398"}
+```
+
+`transform` executes the conversion (sales order → invoice, etc.) and returns the
+new record like `record create`; add `--form` to preview the target record's
+defaulted fields without creating anything. `create-form`/`edit-form` are the
+same preview for plain creates and updates. `select-options` returns the valid
+dropdown values for a field — pass `--data` with the field values the options
+depend on, or an existing record id positional for that record's context. Every
+id positional also accepts NetSuite's `eid:&lt;externalId&gt;` form.</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 3: README — system section.</strong> After the <code>### restlet</code> section, add:
+<pre><code>### `system` — system/v1 endpoints
+
+```bash
+$ netsuite-cli system server-time
+{"serverTime":"2026-07-14T16:21:00.000Z"}
+
+$ netsuite-cli system governance-limits
+{"type":"accountLimit","accountConcurrencyLimit":25,"accountUnallocatedConcurrencyLimit":10}
+```</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 4: SKILL.md — chooser table.</strong> In <code>skills/netsuite-cli/SKILL.md</code>, add these rows to the "Pick the right command" table after the "Upsert keyed on your own id" row:
+<pre><code>| Turn one record into another (SO→invoice, order→fulfillment) | `record transform &lt;srcType&gt; &lt;srcId&gt; &lt;targetType&gt;` |
+| Preview defaulted fields, write nothing | `record create-form &lt;type&gt;` / `record edit-form &lt;type&gt; &lt;id&gt;` / `record transform ... --form` |
+| Valid dropdown values for a field | `record select-options &lt;type&gt; --fields &lt;f1,f2&gt;` |
+| Link/unlink a contact or file | `record attach` / `record detach` |
+| Server clock / concurrency limits | `system server-time` / `system governance-limits` |</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 5: SKILL.md — recipes.</strong> Append to the "Recipes" bullet list:
+<pre><code>- **Forms preview, never write:** `create-form` / `edit-form` / `transform --form`
+  return the record as NetSuite would default it, without saving — use before a
+  risky create or transform.
+- **select-options dependent fields:** pass current values via
+  `--data '{"subsidiary":{"id":1}}'`; add a record id positional
+  (`record select-options salesOrder 123 --fields item`) for an existing
+  record's context.
+- **External ids everywhere:** any id positional accepts `eid:&lt;yourId&gt;`.</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 6: Verify examples are copy-paste correct.</strong> Run each documented example against the real binary with a bogus account (avoids any live call while proving the flags parse):
+<pre><code>cargo build --release
+export NETSUITE_ACCOUNT=__plan_check__
+alias ns=./target/release/netsuite-cli
+ns record transform salesOrder 123 invoice
+ns record transform salesOrder 123 itemFulfillment --form --fields item --expand-sub-resources
+ns record create-form salesOrder --data '{"entity":{"id":107}}'
+ns record edit-form salesOrder 123 --data '{"memo":"rush"}'
+ns record select-options customer --fields entitystatus --q 'entitystatus START_WITH LEAD-'
+ns record select-options salesOrder 123 --fields item --data '{"subsidiary":{"id":1}}'
+ns record attach customer 660 contact 106 --role -5
+ns record detach opportunity 379 file 398
+ns system server-time
+ns system governance-limits
+unset NETSUITE_ACCOUNT</code></pre>
+Expected: every command exits 2 with a JSON usage error naming the unknown account <code>__plan_check__</code> — i.e. all flags and positionals parsed and the only complaint is the bogus alias. Any "unexpected argument" / "required" / "invalid value" error means a broken doc example; fix the doc.</li>
+
+<li><input type="checkbox"> <strong>Step 7: Commit</strong>
+<pre><code>git add README.md skills/netsuite-cli/SKILL.md
+git commit -m "docs: document special operations in README and agent skill
+
+Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;"
+</code></pre></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 8: Final gate, push, PR</h2>
+<p><strong>Files:</strong> none (verification + delivery)</p>
+
+<ul class="step">
+<li><input type="checkbox"> <strong>Step 1: Full gate from a clean tree</strong>
+<pre><code>cargo fmt --check &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code></pre>
+Expected: all clean; working tree has no uncommitted changes (<code>git status</code>).</li>
+
+<li><input type="checkbox"> <strong>Step 2: Push and open the PR</strong>
+<pre><code>git push -u origin feature/special-ops
+gh pr create \
+  --title "Add first-class special operations (transform, forms, select-options, attach/detach, system)" \
+  --body "Adds dedicated subcommands for NetSuite REST special operations so agents discover them via --help and the skill instead of hand-building raw requests:
+
+- record transform &lt;src&gt; &lt;id&gt; &lt;target&gt; (executes; --form previews via the create-form mediaType)
+- record create-form / edit-form (defaulted-field previews, nothing written)
+- record select-options (dropdown values; POST or record-context PATCH; q/limit/offset filters)
+- record attach / detach (incl. --role with negative-id support)
+- system server-time / governance-limits (system/v1)
+
+All are thin wrappers over the existing NsClient (auth/retries/error contract unchanged). Wiremock coverage for every verb incl. Accept mediaType headers, {} default bodies, Location-derived ids, and 204 shapes; read-only live-smoke additions; README + SKILL.md updated.
+
+Spec: docs/superpowers/specs/2026-07-14-special-ops-design.html
+Plan: docs/superpowers/plans/2026-07-14-special-ops.html
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)"</code></pre></li>
+
+<li><input type="checkbox"> <strong>Step 3: Take the PR to green</strong> — invoke the <code>pr-review-loop</code> skill (wait for CI, fix failures, triage Cursor Bugbot findings, repeat until green with no unresolved threads).</li>
+</ul>
+
+</body>
+</html>

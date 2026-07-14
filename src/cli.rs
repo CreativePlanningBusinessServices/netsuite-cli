@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use crate::commands::describe::MetadataFormat;
 use crate::commands::{
-    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, update,
+    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, system, update,
 };
 use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
@@ -98,6 +98,11 @@ pub enum Command {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// System-level endpoints (system/v1): server time, governance limits
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
+    },
     /// Check for or install the latest release from GitHub
     #[command(after_help = "Examples:\n  netsuite-cli update --check\n  netsuite-cli update")]
     Update {
@@ -124,6 +129,16 @@ pub enum ConfigAction {
         after_help = "Examples:\n  netsuite-cli config set default_account prod\n  netsuite-cli config set cache_ttl_hours 48"
     )]
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+pub enum SystemAction {
+    /// Current NetSuite server time in UTC (no permissions required)
+    #[command(after_help = "Example: netsuite-cli system server-time")]
+    ServerTime,
+    /// Concurrency limit allocation for this account and integration
+    #[command(after_help = "Example: netsuite-cli system governance-limits")]
+    GovernanceLimits,
 }
 
 /// Methods accepted by `raw` and `job submit` — NetSuite's REST endpoints (record/v1, async/v1,
@@ -285,6 +300,103 @@ pub enum RecordAction {
     },
     #[command(after_help = "Example: netsuite-cli record delete customer 1234")]
     Delete { record_type: String, id: String },
+    /// Attach a record (e.g. a contact or file) to another record
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record attach customer 660 contact 106 --role -5\n  netsuite-cli record attach opportunity 379 file 398\n\nThe first pair is the record being attached TO; the second pair is what gets attached."
+    )]
+    Attach {
+        record_type: String,
+        id: String,
+        attach_type: String,
+        attach_id: String,
+        /// Contact role id for the attachment (accepts negative ids like -5)
+        #[arg(long, allow_hyphen_values = true)]
+        role: Option<String>,
+    },
+    /// Detach a previously attached record
+    #[command(after_help = "Example: netsuite-cli record detach opportunity 379 file 398")]
+    Detach {
+        record_type: String,
+        id: String,
+        detach_type: String,
+        detach_id: String,
+    },
+    /// Turn one record into another (e.g. salesOrder -> invoice); creates the target record
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record transform salesOrder 123 invoice\n  netsuite-cli record transform salesOrder 123 itemFulfillment --form --fields item --expand-sub-resources"
+    )]
+    Transform {
+        source_type: String,
+        source_id: String,
+        target_type: String,
+        /// Field overrides applied to the transformed record
+        #[arg(long)]
+        data: Option<String>,
+        /// Return the create-form preview instead of executing (creates nothing)
+        #[arg(long)]
+        form: bool,
+        /// Limit the --form preview to these fields
+        #[arg(long, requires = "form")]
+        fields: Option<String>,
+        /// Expand sublists/subrecords in the --form preview
+        #[arg(long, requires = "form")]
+        expand_sub_resources: bool,
+    },
+    /// Preview a new record's defaulted fields without creating it
+    #[command(
+        after_help = "Example: netsuite-cli record create-form salesOrder --data '{\"entity\":{\"id\":107}}'"
+    )]
+    CreateForm {
+        record_type: String,
+        /// Field values the form defaults should take into account
+        #[arg(long)]
+        data: Option<String>,
+        /// Limit the preview to these fields
+        #[arg(long)]
+        fields: Option<String>,
+        /// Expand sublists/subrecords in the preview
+        #[arg(long)]
+        expand_sub_resources: bool,
+    },
+    /// Preview an update's effect on an existing record without saving it
+    #[command(
+        after_help = "Example: netsuite-cli record edit-form salesOrder 123 --data '{\"memo\":\"rush\"}'"
+    )]
+    EditForm {
+        record_type: String,
+        id: String,
+        /// Field values the previewed update would apply
+        #[arg(long)]
+        data: Option<String>,
+        /// Limit the preview to these fields
+        #[arg(long)]
+        fields: Option<String>,
+        /// Expand sublists/subrecords in the preview
+        #[arg(long)]
+        expand_sub_resources: bool,
+    },
+    /// Valid dropdown (select) values for record fields
+    #[command(
+        after_help = "Examples:\n  netsuite-cli record select-options customer --fields entitystatus,location\n  netsuite-cli record select-options customer --fields entitystatus --q 'entitystatus START_WITH LEAD-'\n  netsuite-cli record select-options salesOrder 123 --fields item --data '{\"subsidiary\":{\"id\":1}}'"
+    )]
+    SelectOptions {
+        record_type: String,
+        /// Existing record id: evaluates options in that record's context (uses PATCH)
+        id: Option<String>,
+        /// Comma-separated field names to fetch options for (sublist fields as line.field)
+        #[arg(long)]
+        fields: String,
+        /// Filter, e.g. 'entitystatus START_WITH LEAD-' (operators: CONTAIN, IS, START_WITH)
+        #[arg(long)]
+        q: Option<String>,
+        #[arg(long)]
+        limit: Option<u64>,
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Values for fields the requested options depend on
+        #[arg(long)]
+        data: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -451,6 +563,107 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 RecordAction::Delete { record_type, id } => {
                     record::delete(&context.client, record_type, id).await
                 }
+                RecordAction::Attach {
+                    record_type,
+                    id,
+                    attach_type,
+                    attach_id,
+                    role,
+                } => {
+                    record::attach(
+                        &context.client,
+                        record_type,
+                        id,
+                        attach_type,
+                        attach_id,
+                        role.clone(),
+                    )
+                    .await
+                }
+                RecordAction::Detach {
+                    record_type,
+                    id,
+                    detach_type,
+                    detach_id,
+                } => record::detach(&context.client, record_type, id, detach_type, detach_id).await,
+                RecordAction::Transform {
+                    source_type,
+                    source_id,
+                    target_type,
+                    data,
+                    form,
+                    fields,
+                    expand_sub_resources,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::transform(
+                        &context.client,
+                        source_type,
+                        source_id,
+                        target_type,
+                        body,
+                        *form,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::CreateForm {
+                    record_type,
+                    data,
+                    fields,
+                    expand_sub_resources,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::create_form(
+                        &context.client,
+                        record_type,
+                        body,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::EditForm {
+                    record_type,
+                    id,
+                    data,
+                    fields,
+                    expand_sub_resources,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::edit_form(
+                        &context.client,
+                        record_type,
+                        id,
+                        body,
+                        fields.clone(),
+                        *expand_sub_resources,
+                    )
+                    .await
+                }
+                RecordAction::SelectOptions {
+                    record_type,
+                    id,
+                    fields,
+                    q,
+                    limit,
+                    offset,
+                    data,
+                } => {
+                    let body = data.as_deref().map(commands::read_data_arg).transpose()?;
+                    record::select_options(
+                        &context.client,
+                        record_type,
+                        id.as_deref(),
+                        fields,
+                        q.clone(),
+                        *limit,
+                        *offset,
+                        body,
+                    )
+                    .await
+                }
             }
         }
         Command::Suiteql {
@@ -569,6 +782,13 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 JobAction::Result { job_id, task } => {
                     job::result(&context.client, job_id, task.clone()).await
                 }
+            }
+        }
+        Command::System { action } => {
+            let context = context_for(cli.account.as_deref())?;
+            match action {
+                SystemAction::ServerTime => system::server_time(&context.client).await,
+                SystemAction::GovernanceLimits => system::governance_limits(&context.client).await,
             }
         }
         Command::Update { check } => update::run(*check).await,
@@ -855,5 +1075,76 @@ mod tests {
             }
             other => panic!("expected Usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn system_subcommands_parse() {
+        Cli::try_parse_from(["netsuite-cli", "system", "server-time"]).expect("server-time parses");
+        Cli::try_parse_from(["netsuite-cli", "system", "governance-limits"])
+            .expect("governance-limits parses");
+    }
+
+    #[test]
+    fn record_attach_parses_positional_pairs_and_negative_role() {
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "attach",
+            "customer",
+            "660",
+            "contact",
+            "106",
+            "--role",
+            "-5",
+        ])
+        .expect("attach with negative role id should parse");
+    }
+
+    #[test]
+    fn record_transform_form_flags_require_form() {
+        expect_parse_error(&[
+            "netsuite-cli",
+            "record",
+            "transform",
+            "salesOrder",
+            "1",
+            "invoice",
+            "--fields",
+            "item",
+        ]);
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "transform",
+            "salesOrder",
+            "1",
+            "invoice",
+            "--form",
+            "--fields",
+            "item",
+        ])
+        .expect("--fields with --form should parse");
+    }
+
+    #[test]
+    fn record_form_subcommands_parse_with_kebab_case_names() {
+        Cli::try_parse_from(["netsuite-cli", "record", "create-form", "salesOrder"])
+            .expect("create-form parses");
+        Cli::try_parse_from(["netsuite-cli", "record", "edit-form", "salesOrder", "12"])
+            .expect("edit-form parses");
+    }
+
+    #[test]
+    fn record_select_options_requires_fields_flag() {
+        expect_parse_error(&["netsuite-cli", "record", "select-options", "customer"]);
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "record",
+            "select-options",
+            "customer",
+            "--fields",
+            "entitystatus",
+        ])
+        .expect("select-options with --fields parses");
     }
 }

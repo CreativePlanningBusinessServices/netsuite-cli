@@ -4,9 +4,10 @@ A NetSuite REST API command-line tool built for AI agents, not humans typing at 
 Every subcommand takes explicit, typed flags (no interactive prompts beyond the one-time OAuth
 login), emits a single JSON value on stdout on success, and reports failures as a single JSON
 object on stderr with a predictable exit code — so an agent can invoke it, parse the result, and
-branch on outcome without screen-scraping. It covers record CRUD, SuiteQL, RESTlets, metadata
-discovery, async jobs, and raw passthrough requests against any number of NetSuite accounts,
-switching between them with one flag.
+branch on outcome without screen-scraping. It covers record CRUD and special operations
+(transform, form previews, select options, attach/detach), SuiteQL, RESTlets, metadata
+discovery, system endpoints, async jobs, and raw passthrough requests against any number of
+NetSuite accounts, switching between them with one flag.
 
 ## Quick start for AI agents
 
@@ -219,6 +220,34 @@ $ netsuite-cli record delete customer 1234
 {"deleted":true,"id":"1234"}
 ```
 
+Special operations in the same namespace:
+
+```bash
+$ netsuite-cli record transform salesOrder 123 invoice
+{"id":"9101","location":"https://1234567-sb1.suitetalk.api.netsuite.com/services/rest/record/v1/invoice/9101"}
+
+$ netsuite-cli record transform salesOrder 123 itemFulfillment --form   # preview; creates nothing
+$ netsuite-cli record create-form salesOrder --data '{"entity":{"id":107}}'
+$ netsuite-cli record edit-form salesOrder 123 --data '{"memo":"rush"}'
+
+$ netsuite-cli record select-options customer --fields entitystatus --q 'entitystatus START_WITH LEAD-'
+{"entitystatus":{"_selectOptions":{"items":[{"id":13,"refName":"CUSTOMER-Closed Won"}],"count":1,"offset":0,"hasMore":false,"totalResults":1}}}
+
+$ netsuite-cli record attach customer 660 contact 106 --role -5
+{"attached":true,"type":"customer","id":"660","attachedType":"contact","attachedId":"106"}
+
+$ netsuite-cli record detach opportunity 379 file 398
+{"detached":true,"type":"opportunity","id":"379","detachedType":"file","detachedId":"398"}
+```
+
+`transform` executes the conversion (sales order → invoice, etc.) and returns the
+new record like `record create`; add `--form` to preview the target record's
+defaulted fields without creating anything. `create-form`/`edit-form` are the
+same preview for plain creates and updates. `select-options` returns the valid
+dropdown values for a field — pass `--data` with the field values the options
+depend on, or an existing record id positional for that record's context. Every
+id positional also accepts NetSuite's `eid:<externalId>` form.
+
 `--data` accepts inline JSON, `@path/to/file.json`, or `-` to read from stdin. `record list` and
 `suiteql` support `--all` to transparently follow `hasMore` pagination and merge every page's
 `items` into one response.
@@ -268,6 +297,16 @@ cache for one call.
 ```bash
 $ netsuite-cli restlet call --script 482 --deploy 1 --method GET --param customerId=1234
 {"customerId":"1234","balance":420.5}
+```
+
+### `system` — system/v1 endpoints
+
+```bash
+$ netsuite-cli system server-time
+{"serverTime":"2026-07-14T16:21:00.000Z"}
+
+$ netsuite-cli system governance-limits
+{"type":"accountLimit","accountConcurrencyLimit":25,"accountUnallocatedConcurrencyLimit":10}
 ```
 
 ### `raw` — arbitrary REST request
