@@ -895,6 +895,65 @@ async fn ensure_tba_secrets(
     })
 }
 
+/// After a successful `account add`, offer to mint the SOAP (TBA) token right away so new
+/// users learn saved searches need it while the integration record's one-time consumer
+/// secret is still at hand. Interactive terminals get a yes/no prompt; everything else gets
+/// a one-line tip. A chained failure never fails the add — the account is already stored.
+async fn offer_soap_setup(
+    alias: &str,
+    config_path: &Path,
+    store: Arc<dyn SecretStore>,
+    port: u16,
+    paste_mode: bool,
+    add_result: serde_json::Value,
+) -> serde_json::Value {
+    if let Ok(Some(secrets)) = store.get_tba(alias)
+        && secrets.token_id.is_some()
+    {
+        return add_result;
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{}", soap_auth_tip(alias));
+        return add_result;
+    }
+    eprint!("Saved searches use SOAP/TBA auth. Set it up for '{alias}' now? [y/N] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() || !wants_soap_setup(&answer) {
+        eprintln!("{}", soap_auth_tip(alias));
+        return add_result;
+    }
+    match account::soap_auth(config_path, store, alias, port, paste_mode).await {
+        Ok(_) => with_soap_token_flag(add_result, true),
+        Err(soap_error) => {
+            crate::output::print_error(&soap_error);
+            eprintln!(
+                "account '{alias}' was added; only SOAP setup failed — re-run \
+                 `netsuite-cli account soap-auth {alias}`"
+            );
+            with_soap_token_flag(add_result, false)
+        }
+    }
+}
+
+fn wants_soap_setup(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn soap_auth_tip(alias: &str) -> String {
+    format!(
+        "tip: saved searches authenticate separately (SOAP/TBA) — run \
+         `netsuite-cli account soap-auth {alias}` when ready (needs the consumer \
+         key/secret captured at integration-record creation)"
+    )
+}
+
+fn with_soap_token_flag(mut add_result: serde_json::Value, stored: bool) -> serde_json::Value {
+    if let Some(fields) = add_result.as_object_mut() {
+        fields.insert("soapTokenStored".into(), serde_json::Value::Bool(stored));
+    }
+    add_result
+}
+
 async fn dispatch_account(
     cli: &Cli,
     action: &AccountAction,
@@ -919,7 +978,7 @@ async fn dispatch_account(
                 let key = key.as_deref().ok_or_else(|| {
                     CliError::Usage("account add --flow m2m requires --key".into())
                 })?;
-                account::add_m2m(
+                let add_result = account::add_m2m(
                     &config_path,
                     store.as_ref(),
                     alias,
@@ -927,14 +986,23 @@ async fn dispatch_account(
                     client_id,
                     cert_id,
                     key,
+                )?;
+                Ok(offer_soap_setup(
+                    alias,
+                    &config_path,
+                    store.clone(),
+                    *port,
+                    *paste,
+                    add_result,
                 )
+                .await)
             }
             AccountFlowArg::AuthCode => {
                 let client_id = require_flag(
                     client_id.as_deref(),
                     "--flow auth-code requires --client-id",
                 )?;
-                account::add_auth_code(
+                let add_result = account::add_auth_code(
                     &config_path,
                     store.clone(),
                     alias,
@@ -943,7 +1011,16 @@ async fn dispatch_account(
                     *port,
                     *paste,
                 )
-                .await
+                .await?;
+                Ok(offer_soap_setup(
+                    alias,
+                    &config_path,
+                    store.clone(),
+                    *port,
+                    *paste,
+                    add_result,
+                )
+                .await)
             }
         },
         AccountAction::List => account::list(&config_path),
@@ -1279,5 +1356,33 @@ mod tests {
     #[test]
     fn saved_search_run_requires_type() {
         assert!(Cli::try_parse_from(["netsuite-cli", "saved-search", "run", "57"]).is_err());
+    }
+
+    #[test]
+    fn soap_setup_answer_parser_accepts_only_yes_variants() {
+        assert!(wants_soap_setup("y\n"));
+        assert!(wants_soap_setup("YES\n"));
+        assert!(wants_soap_setup(" Yes "));
+        assert!(!wants_soap_setup("\n"));
+        assert!(!wants_soap_setup(""));
+        assert!(!wants_soap_setup("n\n"));
+        assert!(!wants_soap_setup("yep\n"));
+    }
+
+    #[test]
+    fn soap_auth_tip_names_the_command_and_alias() {
+        let tip = soap_auth_tip("demo");
+        assert!(tip.contains("netsuite-cli account soap-auth demo"));
+        assert!(tip.contains("consumer key/secret"));
+    }
+
+    #[test]
+    fn soap_token_flag_merges_into_add_result_object() {
+        let merged =
+            with_soap_token_flag(serde_json::json!({"alias": "demo", "flow": "m2m"}), true);
+        assert_eq!(merged["soapTokenStored"], true);
+        assert_eq!(merged["alias"], "demo");
+        let failed = with_soap_token_flag(serde_json::json!({"alias": "demo"}), false);
+        assert_eq!(failed["soapTokenStored"], false);
     }
 }
