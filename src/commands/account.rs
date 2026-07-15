@@ -114,7 +114,8 @@ pub async fn soap_auth(
             "unknown account alias '{alias}'; run `netsuite-cli account list`"
         ))
     })?;
-    let (consumer_key, consumer_secret) = resolve_consumer_pair(store.as_ref(), alias)?;
+    let (consumer_key, consumer_secret) =
+        resolve_consumer_pair(store.as_ref(), alias, std::io::stdin().is_terminal())?;
     let http = reqwest::Client::new();
     let minted = tba::run_tba_flow(
         &http,
@@ -141,9 +142,13 @@ pub async fn soap_auth(
 /// Resolution order: env vars (for CI/non-interactive use) → previously stored TBA consumer
 /// pair for this alias → interactive prompt (hidden for the secret). The consumer secret must
 /// never be accepted as a CLI flag — that would leak it into shell history and `ps` output.
+/// `interactive` (whether stdin is a TTY) is a parameter rather than checked here so tests can
+/// exercise the non-interactive error branch deterministically instead of hanging on the prompt
+/// when run from a real terminal.
 pub fn resolve_consumer_pair(
     store: &dyn SecretStore,
     alias: &str,
+    interactive: bool,
 ) -> Result<(String, String), CliError> {
     if let (Ok(env_key), Ok(env_secret)) = (
         std::env::var("NETSUITE_CLI_TBA_CONSUMER_KEY"),
@@ -154,7 +159,7 @@ pub fn resolve_consumer_pair(
     if let Some(stored) = store.get_tba(alias)? {
         return Ok((stored.consumer_key, stored.consumer_secret));
     }
-    if !std::io::stdin().is_terminal() {
+    if !interactive {
         return Err(CliError::Auth(format!(
             "no TBA consumer credentials for '{alias}': set NETSUITE_CLI_TBA_CONSUMER_KEY and \
              NETSUITE_CLI_TBA_CONSUMER_SECRET, or run `netsuite-cli account soap-auth {alias}` \

@@ -323,16 +323,33 @@ async fn test_propagates_api_error_on_failure() {
     assert!(matches!(test_result, Err(CliError::Api { .. })));
 }
 
+/// Removes an env var on drop so a panicking assertion between set and remove cannot leak the
+/// var into the rest of the (shared) test process.
+struct EnvVarGuard {
+    name: &'static str,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        unsafe { std::env::set_var(name, value) };
+        EnvVarGuard { name }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var(self.name) };
+    }
+}
+
 /// NOTE: env-var cases must run in one test (or use a mutex) — process env is global, and
 /// `cargo test`'s parallel test threads would otherwise race each other's set_var/remove_var.
 #[test]
 fn consumer_pair_resolution_prefers_env_then_store() {
     let store = MemoryStore::default();
 
-    // no env, nothing stored → Auth error naming the env vars
-    // (this branch is only reached when stdin is not a TTY — under `cargo test` it isn't,
-    //  which conveniently exercises the non-interactive path)
-    let missing = account::resolve_consumer_pair(&store, "demo").unwrap_err();
+    // no env, nothing stored, not interactive → Auth error naming the env vars
+    let missing = account::resolve_consumer_pair(&store, "demo", false).unwrap_err();
     assert!(matches!(missing, CliError::Auth(_)));
     assert!(
         missing
@@ -353,23 +370,17 @@ fn consumer_pair_resolution_prefers_env_then_store() {
         )
         .unwrap();
     assert_eq!(
-        account::resolve_consumer_pair(&store, "demo").unwrap(),
+        account::resolve_consumer_pair(&store, "demo", false).unwrap(),
         ("storedkey".to_string(), "storedsecret".to_string())
     );
 
     // env overrides stored
-    unsafe {
-        std::env::set_var("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey");
-        std::env::set_var("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret");
-    }
+    let _key_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey");
+    let _secret_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret");
     assert_eq!(
-        account::resolve_consumer_pair(&store, "demo").unwrap(),
+        account::resolve_consumer_pair(&store, "demo", false).unwrap(),
         ("envkey".to_string(), "envsecret".to_string())
     );
-    unsafe {
-        std::env::remove_var("NETSUITE_CLI_TBA_CONSUMER_KEY");
-        std::env::remove_var("NETSUITE_CLI_TBA_CONSUMER_SECRET");
-    }
 }
 
 #[tokio::test]
