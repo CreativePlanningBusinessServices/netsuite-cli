@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli Saved-Search Execution via SOAP + TBA — Design Spec (2026-07-14)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e4; --warn-border:#e0a94e; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:860px; padding:2.5rem 1.5rem 4rem; font:16px/1.6 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h3 { font-size:1.05rem; margin:1.3rem 0 .4rem; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.5rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.86em; }
+  code { background:var(--code-bg); padding:.1em .35em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.9rem 1rem; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:.8rem 0; font-size:.93rem; }
+  th, td { border:1px solid var(--border); padding:.45rem .65rem; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul { padding-left:1.3rem; } li { margin:.25rem 0; }
+  .warn { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.8rem 1rem; margin:.8rem 0; }
+  details { margin:.6rem 0; } summary { cursor:pointer; font-weight:600; }
+  .buttons { display:flex; gap:.75rem; flex-wrap:wrap; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:1rem; margin:1.2rem 0; align-items:center; }
+  .buttons span { font-weight:600; }
+  .buttons a { display:inline-block; padding:.5rem 1.1rem; border-radius:8px; text-decoration:none; font-weight:600; border:1px solid var(--accent); }
+  .buttons a.primary { background:var(--accent); color:#fff; }
+  .buttons a.secondary { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>netsuite-cli Saved-Search Execution via SOAP + TBA — Design Spec</h1>
+<div class="meta">2026-07-14 · Adds <code>saved-search run</code> backed by SuiteTalk SOAP, with TBA enabled on the org's existing M2M integration record and browser-based token minting · Goal: agents execute NetSuite saved searches from the CLI, closing the main gap that keeps the MCP connector around.</div>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+<h2>1. Motivation &amp; decision history</h2>
+<p>NetSuite's REST APIs cannot execute saved searches; the legacy SOAP (SuiteTalk) API can. Today the CP NetSuite MCP connector is kept alive solely for <code>ns_runSavedSearch</code> and report execution. This feature gives the CLI native saved-search execution over SOAP.</p>
+<table>
+  <tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+  <tr><td>Transport</td><td>SOAP <code>search</code>/<code>searchMoreWithId</code> with <code>savedSearchId</code>, not a deployed RESTlet</td><td>Zero server-side footprint beyond the integration record the CLI already requires. RESTlet alternative rejected for now (needs a SuiteScript deployment per account). Accepted trade-off: SOAP endpoints are removed in NetSuite 2028.2 — this is a ~2-year bridge.</td></tr>
+  <tr><td>Auth</td><td>TBA (OAuth&nbsp;1.0a) via the three-step browser authorization flow</td><td>SOAP does not accept OAuth 2.0 in any flow. TBA tokens never expire, so it is one browser consent per account, then headless forever. Existing OAuth 2.0 M2M REST auth is untouched.</td></tr>
+  <tr><td>Integration record</td><td><strong>Reuse the org's existing M2M record</strong> — enable the TBA checkboxes on it; nothing CP-owned is distributed or embedded</td><td>The CLI already requires each org to set up an integration record for M2M OAuth 2.0, so TBA rides the same record and the same setup ritual. No consumer key or secret ships in binaries or the repo; no auto-installed CP record in strangers' accounts. Rejected alternatives: embedded key+secret (public secret enables completing signatures for any leaked token pair, and silent issuetoken minting while that endpoint lives), embedded key + pasted CP secret (still requires CP to distribute a secret; pointless once every org has its own record anyway).</td></tr>
+  <tr><td>Scope</td><td>Run only</td><td>No SOAP <code>getSavedSearch</code> listing, no ad-hoc criteria overlay. Discovery stays on existing paths. YAGNI.</td></tr>
+  <tr><td>SOAP client</td><td>Hand-rolled envelopes + <code>quick-xml</code> parsing</td><td>Only 2 of SOAP's 84 operations are used; WSDL codegen and Rust SOAP crates rejected (huge generated surface / unmaintained).</td></tr>
+</table>
+
+<h2>2. Deprecation timeline (accepted)</h2>
+<ul>
+  <li><strong>2027.1</strong> — no <em>new</em> integrations may be created using TBA or SOAP. Each org's integration record must have TBA enabled before then; existing records keep working. (Enable the checkboxes when this ships — don't defer.)</li>
+  <li><strong>2028.2</strong> — all SOAP endpoints disabled; this feature stops working. The README and skill must state this sunset.</li>
+  <li>Sources: <a href="https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/article_2104046421.html">SOAP Removal Plans FAQ</a>, <a href="https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_0525020842.html">Preparing for TBA End of Support</a>, <a href="https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_4429293934.html">Auto-Installation of Integration Records</a>.</li>
+</ul>
+
+<h2>3. Command surface</h2>
+<table>
+  <tr><th>Command</th><th>Behavior</th><th>Output</th></tr>
+  <tr><td><code>saved-search run &lt;id&gt; --type &lt;recordtype&gt; [--limit N] [--all]</code></td><td>SOAP <code>search</code> with <code>xsi:type</code> from the record-type table. Numeric <code>&lt;id&gt;</code> → <code>savedSearchId</code> attribute; <code>customsearch_*</code> → <code>savedSearchScriptId</code>. <code>--limit</code> = SOAP page size (5–1000, default 1000). <code>--all</code> follows <code>searchMoreWithId</code> to the last page, with the same runaway-page cap pattern as <code>suiteql --all</code>.</td><td><code>{"items":[…], "totalRecords":n, "totalPages":n, "pageIndex":n, "hasMore":bool}</code>; with <code>--all</code>, merged items and <code>"hasMore":false</code>.</td></tr>
+  <tr><td><code>account soap-auth &lt;alias&gt;</code></td><td>Explicitly runs the three-step TBA browser flow for an already-registered account alias and stores the token. Used for re-auth (e.g. after sandbox refresh) or pre-provisioning.</td><td>Confirmation JSON (account, entity, role, token stored).</td></tr>
+</table>
+<ul>
+  <li><strong>First-run auto-auth:</strong> <code>saved-search run</code> with no stored TBA token for the account triggers the browser flow automatically when stdin/stderr is a TTY; in non-interactive contexts it exits with the auth-error code and a message naming <code>account soap-auth</code>. If the alias has no consumer key/secret stored yet, the interactive flow first prompts for them (secret with hidden input) and stores them before opening the browser.</li>
+  <li><strong><code>--type</code> is required:</strong> NetSuite has no API to resolve a saved search's record type from its id. Values are lowercase names of the 95 <code>*SearchAdvanced</code> types (e.g. <code>transaction</code>, <code>customer</code>, <code>item</code>, <code>supportcase</code>, <code>employee</code>). Unknown value → usage error listing valid types.</li>
+  <li>The saved search executes with its own saved filters and columns (<code>returnSearchColumns=true</code>); the identity is the user+role that consented, so results honor that role's permissions.</li>
+</ul>
+
+<h2>4. Auth design</h2>
+<h3>4.1 Credential matrix</h3>
+<table>
+  <tr><th>Credential</th><th>Scope</th><th>Source</th><th>Storage</th></tr>
+  <tr><td>TBA consumer key</td><td>Per account alias (aliases of the same org share the same value — it is the record's client id)</td><td>Prompted on first SOAP use / <code>account soap-auth</code>; <code>NETSUITE_CLI_TBA_CONSUMER_KEY</code> env var overrides for CI</td><td>OS keyring, per alias (same place the existing flows keep <code>client_id</code> — config.toml holds only <code>account_id</code> + <code>flow</code>)</td></tr>
+  <tr><td>TBA consumer secret</td><td>Per account alias (same sharing note)</td><td>Prompted with hidden input alongside the key; <code>NETSUITE_CLI_TBA_CONSUMER_SECRET</code> env var overrides for CI. <strong>Never embedded, never committed.</strong></td><td>OS keyring, per alias</td></tr>
+  <tr><td>TBA token id + secret</td><td>Per account alias (bound to consenting user+role)</td><td>Three-step browser flow</td><td>OS keyring, per alias, alongside existing M2M secrets</td></tr>
+</table>
+<p><strong>Distribution model:</strong> identical to M2M — every org (CP included) uses its own integration record and never receives credentials from anyone else. Enabling TBA on the record is a one-time checkbox edit folded into the existing README setup instructions. Within an org, the consent flow still auto-installs the record into sibling accounts (e.g. sandboxes) that don't have it yet.</p>
+<p>OAuth 2.0 M2M for REST is untouched: same integration record may carry both auth methods; M2M certificate mappings remain a manual per-account admin step by NetSuite design (only cert <em>rotation</em> has an API). REST and SOAP may run as different identities.</p>
+
+<h3>4.2 Three-step TBA flow (all signatures HMAC-SHA256 per RFC 5849)</h3>
+<ol>
+  <li><strong>Request token:</strong> <code>POST https://&lt;acct&gt;.restlets.api.netsuite.com/rest/requesttoken</code> with OAuth 1.0a header (<code>oauth_consumer_key</code>, <code>oauth_callback=http://localhost:&lt;port&gt;</code>, nonce ≥6 chars — we use 20, timestamp, signature keyed by <code>urlencode(consumerSecret)&amp;</code>). Response: request token + secret + <code>oauth_callback_confirmed=true</code>.</li>
+  <li><strong>Browser consent:</strong> open <code>https://&lt;acct&gt;.app.netsuite.com/app/login/secure/authorizetoken.nl?oauth_token=…&amp;state=…</code>. User logs in / picks role / clicks Allow — <em>this consent auto-installs the integration record</em> into the account (State per SOAP Web Services Preferences "Require Approval"). NetSuite redirects to the local callback with <code>oauth_token</code>, <code>oauth_verifier</code>, <code>company</code>, <code>role</code>, <code>entity</code>, <code>state</code> (validate state).</li>
+  <li><strong>Access token:</strong> <code>POST https://&lt;acct&gt;.restlets.api.netsuite.com/rest/accesstoken</code> with <code>oauth_verifier</code>, signature keyed by <code>consumerSecret&amp;requestTokenSecret</code>. Response: permanent <code>oauth_token</code> + <code>oauth_token_secret</code> → keyring.</li>
+</ol>
+<ul>
+  <li>Reuses the local loopback HTTP listener pattern from the existing authcode flow (<code>src/auth/authcode.rs</code>).</li>
+  <li>The integration record's TBA callback URL must exactly match the <code>oauth_callback</code> the CLI sends — a fixed localhost port, registered on the record (setup checklist below).</li>
+  <li>Account-id forms: URLs use the lowercase hyphenated id (<code>1234567-sb1.restlets.api.netsuite.com</code>); the SOAP <code>tokenPassport&lt;account&gt;</code> and OAuth <code>realm</code> use the uppercase underscore form (<code>1234567_SB1</code>). Derived from the alias's configured account id.</li>
+</ul>
+
+<h3>4.3 One-time integration-record setup (manual, documented in README)</h3>
+<ul>
+  <li>On the org's existing M2M integration record: check <em>Token-Based Authentication</em> and <em>TBA: Authorization Flow</em>; set the TBA callback URL to the CLI's localhost callback; capture the consumer key/secret shown on save and keep them in the org's password manager. Consumer key = the record's client id already in CLI config.</li>
+  <li><strong>Reset Credentials trap:</strong> the consumer secret was displayed exactly once when the record was created. If it wasn't captured then, the only ways forward are (a) Reset Credentials — which rotates the client id, breaking every M2M certificate mapping and configured <code>client_id</code>, all of which must then be redone — or (b) a separate integration record just for TBA/SOAP. The README must call this out so orgs choose deliberately.</li>
+</ul>
+
+<h2>5. SOAP engine</h2>
+<ul>
+  <li><strong>Endpoint:</strong> <code>POST https://&lt;acct&gt;.suitetalk.api.netsuite.com/services/NetSuitePort_2025_2</code>, headers <code>Content-Type: text/xml; charset=utf-8</code> and <code>SOAPAction: "search"</code> / <code>"searchMoreWithId"</code>. WSDL version pinned to 2025_2 in namespace URNs.</li>
+  <li><strong>SOAP header — <code>tokenPassport</code></strong> (rebuilt per request): account, consumerKey, token, 20-char alphanumeric nonce, epoch-seconds timestamp, and <code>&lt;signature algorithm="HMAC-SHA256"&gt;</code> = Base64(HMAC-SHA256(key=<code>consumerSecret&amp;tokenSecret</code>, msg=<code>account&amp;consumerKey&amp;token&amp;nonce&amp;timestamp</code>)).</li>
+  <li><strong>SOAP header — <code>searchPreferences</code>:</strong> <code>pageSize</code> from <code>--limit</code>, <code>returnSearchColumns=true</code>.</li>
+  <li><strong>Body:</strong> <pre>&lt;search xmlns="urn:messages_2025_2.platform.webservices.netsuite.com"&gt;
+  &lt;searchRecord xmlns:q1="urn:sales_2025_2.transactions.webservices.netsuite.com"
+    xsi:type="q1:TransactionSearchAdvanced" savedSearchId="57"/&gt;
+&lt;/search&gt;</pre> (or <code>savedSearchScriptId="customsearch_x"</code>). <code>searchMoreWithId</code> takes the prior response's <code>searchId</code> + <code>pageIndex</code>.</li>
+  <li><strong>Record-type table:</strong> static Rust table mapping the 95 lowercase type names → (<code>xsi:type</code> name, namespace URN), generated from the 2025.2 XSDs (each <code>*SearchAdvanced</code> lives in the module XSD that defines it; the generation script/notes live next to the table for the next WSDL bump).</li>
+  <li><strong>Row flattening</strong> (generic, no per-type response types): each <code>searchRow</code> child is either <code>basic</code> or a join (<code>customerJoin</code>, …). For each field element: key = local element name (joins prefixed <code>customer.email</code> — join element name minus the <code>Join</code> suffix); value = <code>searchValue</code> text, else <code>internalId</code> attribute on <code>searchValue</code> (RecordRefs); repeated <code>searchValue</code> children → JSON array; <code>customFieldList/customField</code> keyed by its <code>scriptId</code>. Values stay strings (NetSuite returns typed text; no client-side coercion).</li>
+</ul>
+<details><summary>All 95 supported record types (from 2025.2 XSDs)</summary>
+<p><code>account, accountingperiod, accountingtransaction, billingaccount, billingschedule, bin, bom, bomrevision, budget, calendarevent, campaign, charge, classification, consolidatedexchangerate, contact, contactcategory, contactrole, costcategory, couponcode, currencyrate, customer, customercategory, customermessage, customerstatus, customersubsidiaryrelationship, customlist, customrecord, department, employee, entitygroup, expensecategory, fairvalueprice, file, folder, giftcertificate, globalaccountmapping, hcmjob, inboundshipment, inventorynumber, issue, item, itemaccountmapping, itemdemandplan, itemrevision, itemsupplyplan, job, jobstatus, jobtype, location, manufacturingcosttemplate, manufacturingoperationtask, manufacturingrouting, merchandisehierarchynode, message, nexus, note, notetype, opportunity, othernamecategory, partner, partnercategory, paycheck, paymentinstrument, paymentmethod, paymentoption, payrollitem, phonecall, pricelevel, pricinggroup, projecttask, promotioncode, resourceallocation, revrecschedule, revrectemplate, salesrole, salestaxitem, sitecategory, solution, subsidiary, supportcase, task, taxgroup, taxtype, term, timebill, timeentry, timesheet, topic, transaction, unitstype, usage, vendor, vendorcategory, vendorsubsidiaryrelationship, winlossreason</code></p>
+</details>
+
+<h2>6. Errors</h2>
+<ul>
+  <li>SOAP faults (<code>soapenv:Fault</code>, incl. <code>InvalidCredentialsFault</code>/<code>InsufficientPermissionFault</code>) and unsuccessful <code>&lt;status isSuccess="false"&gt;</code> responses are parsed into the existing error enum: auth-class failures use the same exit code as REST auth failures; NetSuite-reported errors (bad saved-search id, no permission on the search) map like REST API errors, with NetSuite's <code>statusDetail code</code>/<code>message</code> passed through; unknown type / bad flags are usage errors (exit 2). No new exit codes.</li>
+  <li>Missing consumer key/secret or TBA token in a non-interactive context → auth-error exit naming <code>account soap-auth</code> and the env-var overrides.</li>
+</ul>
+
+<h2>7. Code structure</h2>
+<table>
+  <tr><th>File</th><th>Contents</th></tr>
+  <tr><td><code>src/soap/mod.rs</code></td><td>SOAP client: endpoint construction, request dispatch, fault/status mapping.</td></tr>
+  <tr><td><code>src/soap/envelope.rs</code></td><td>Envelope templates (search, searchMoreWithId), tokenPassport + searchPreferences headers, HMAC signing, XML escaping of interpolated values.</td></tr>
+  <tr><td><code>src/soap/parse.rs</code></td><td>quick-xml response parsing: status, pagination metadata, generic row flattening.</td></tr>
+  <tr><td><code>src/soap/search_types.rs</code></td><td>Static 95-entry record-type table + lookup.</td></tr>
+  <tr><td><code>src/auth/tba.rs</code></td><td>Three-step flow (OAuth 1.0a header building/signing, loopback callback, state validation), keyring load/store of token pair and consumer secret, consumer key/secret resolution (env override → stored → interactive prompt).</td></tr>
+  <tr><td><code>src/commands/saved_search.rs</code></td><td><code>run</code>: resolve type, ensure token (auto-auth on TTY), page loop, output shaping.</td></tr>
+  <tr><td><code>src/cli.rs</code>, <code>src/commands/{mod,account}.rs</code></td><td><code>SavedSearch</code> command + <code>account soap-auth</code> wiring, <code>after_help</code> examples.</td></tr>
+  <tr><td><code>Cargo.toml</code></td><td>Add <code>quick-xml</code>, <code>hmac</code> (sha2/base64/rand already present).</td></tr>
+</table>
+
+<h2>8. Testing</h2>
+<ul>
+  <li><strong>Unit:</strong> tokenPassport signature against a fixed vector; OAuth 1.0a header signing (known key/nonce/timestamp → known signature); row flattening (basic fields, RecordRef internalId, multiselect arrays, joins, custom fields); record-type lookup.</li>
+  <li><strong>Integration (wiremock, canned XML):</strong> happy path single page; <code>--all</code> multi-page via searchMoreWithId; <code>isSuccess=false</code> with statusDetail; SOAP fault; script-id vs internal-id attribute selection; non-TTY missing-token error.</li>
+  <li><strong>Live smoke (gated like <code>live_smoke.rs</code>):</strong> run a known sandbox saved search end-to-end; include one custom-record saved search (<code>CustomRecordSearchAdvanced</code> with <code>savedSearchId</code> alone is confirmed working in the account).</li>
+</ul>
+
+<h2>9. Documentation</h2>
+<ul>
+  <li>README: saved-search section — extend the existing integration-record setup docs with the TBA checkboxes + callback URL, the Reset Credentials trap, consumer key/secret prompt + per-account browser consent, sandbox-refresh re-auth caveat, 2028.2 sunset warning.</li>
+  <li><code>skills/netsuite-cli/SKILL.md</code>: when to use <code>saved-search run</code> (vs SuiteQL), <code>--type</code> requirement, auth recovery recipe. Update the global CLAUDE.md guidance implication: the MCP connector remains only for reports.</li>
+</ul>
+
+<h2>10. Out of scope</h2>
+<ul>
+  <li>SOAP saved-search listing (<code>getSavedSearch</code>) and ad-hoc criteria overlay.</li>
+  <li>TBA as a REST auth fallback (deprecated path; M2M remains the REST auth).</li>
+  <li>Report execution (no SOAP/REST API exists; MCP connector keeps that job).</li>
+  <li>Any RESTlet-based fallback for the 2028.2 sunset — revisit nearer the date.</li>
+</ul>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+</body>
+</html>
