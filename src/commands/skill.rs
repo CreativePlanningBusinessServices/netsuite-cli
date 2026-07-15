@@ -106,7 +106,11 @@ mod tests {
 
     #[test]
     fn embedded_skill_carries_the_real_frontmatter() {
-        assert!(EMBEDDED_SKILL.starts_with("---\nname: netsuite-cli"));
+        // Tolerate CRLF: a Windows checkout without the .gitattributes eol=lf rule would
+        // embed the file with \r\n. The .gitattributes rule keeps it LF everywhere, but the
+        // assertion shouldn't itself be line-ending-fragile.
+        let head: String = EMBEDDED_SKILL.chars().filter(|ch| *ch != '\r').collect();
+        assert!(head.starts_with("---\nname: netsuite-cli"));
         assert!(EMBEDDED_SKILL.len() > 1000);
     }
 

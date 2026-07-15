@@ -1,0 +1,5 @@
+# The agent skill is compiled into the binary via include_str! and written back out
+# verbatim by `skill install`; force LF so the embedded/shipped bytes are identical on
+# every platform (Windows autocrlf would otherwise make it CRLF and diverge from
+# macOS/Linux builds).
+skills/netsuite-cli/SKILL.md text eol=lf
