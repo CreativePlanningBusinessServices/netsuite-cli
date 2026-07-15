@@ -1,4 +1,5 @@
 pub mod authcode;
+pub(crate) mod loopback;
 pub mod m2m;
 pub mod tba;
 
