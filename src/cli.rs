@@ -453,10 +453,12 @@ pub enum AccountAction {
         /// Required for --flow m2m
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Loopback listener port for --flow auth-code
+        /// Loopback listener port for --flow auth-code and the chained SOAP setup (must match
+        /// the integration record's TBA callback URL)
         #[arg(long, default_value_t = 8899)]
         port: u16,
-        /// For --flow auth-code: paste the redirect URL instead of running the loopback listener
+        /// Paste the redirect URL instead of running the loopback listener — applies to
+        /// --flow auth-code and the chained SOAP setup
         #[arg(long)]
         paste: bool,
     },
