@@ -261,6 +261,19 @@ mod tests {
         fn delete_token(&self, _alias: &str) -> Result<(), CliError> {
             Ok(())
         }
+        fn get_tba(&self, _alias: &str) -> Result<Option<crate::secrets::TbaSecrets>, CliError> {
+            Ok(None)
+        }
+        fn set_tba(
+            &self,
+            _alias: &str,
+            _secrets: &crate::secrets::TbaSecrets,
+        ) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn delete_tba(&self, _alias: &str) -> Result<(), CliError> {
+            Ok(())
+        }
     }
 
     #[test]
