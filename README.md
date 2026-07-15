@@ -415,8 +415,9 @@ netsuite-cli account soap-auth <alias> [--port 8899] [--paste]
 Or skip the explicit step: just run `saved-search run`. On first use, if no SOAP token is stored
 for the account and the CLI is attached to an interactive terminal, it prompts for the integration
 record's **consumer key** (visible) and **consumer secret** (hidden) — the Client ID/Client Secret
-you captured at record creation, under their TBA names — stores both in the OS keychain, then opens the browser for the TBA consent flow — same three-step authorization
-`soap-auth` runs explicitly. The resulting token never expires, so this normally happens once per
+you captured at record creation, under their TBA names. It stores both in the OS keychain, then
+opens the browser for the TBA consent flow: the same three-step authorization `soap-auth` runs
+explicitly. The resulting token never expires, so this normally happens once per
 account, ever. Set `NETSUITE_CLI_TBA_CONSUMER_KEY` / `NETSUITE_CLI_TBA_CONSUMER_SECRET` to supply
 the consumer pair without a prompt (CI, scripted first run). Running non-interactively with no
 stored token and no env vars fails with an `auth` error (exit `3`) naming
