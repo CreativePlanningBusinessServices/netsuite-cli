@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>First-Run TBA Onboarding — Implementation Plan (2026-07-15)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e3; --warn-border:#e6c98a; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:920px; padding:2.5rem 1.5rem 4rem; font:15px/1.55 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); }
+  h1 { font-size:1.55rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2.2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h2.task { background:var(--accent-soft); padding:.45rem .7rem; border-radius:8px; border-bottom:none; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.2rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em; }
+  code { background:var(--code-bg); padding:.1em .3em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.8rem 1rem; overflow-x:auto; line-height:1.45; }
+  .callout { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+  ul.step { list-style:none; padding-left:0; } ul.step li { margin:.6rem 0; }
+  ul { padding-left:1.3rem; }
+</style>
+</head>
+<body>
+
+<h1>First-Run TBA Onboarding — Implementation Plan</h1>
+<div class="meta">2026-07-15 · Executes <code>docs/superpowers/specs/2026-07-15-setup-ux-tba-onboarding-design.html</code> · Branch: <code>feature/setup-ux-onboarding</code> (create from <code>main</code>)</div>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: superpowers:subagent-driven-development (recommended) or superpowers:executing-plans, task-by-task with checkboxes.</div>
+
+<p><strong>Goal:</strong> New users configure ONE integration record for both M2M OAuth 2.0 and TBA at creation time, and <code>account add</code> teaches them (tip or interactive offer) that saved searches need a separate SOAP token — before the one-time consumer secret is lost.</p>
+<p><strong>Architecture:</strong> Three pure helpers + one async offer function in <code>src/cli.rs</code>, called from both <code>AccountAction::Add</code> dispatch arms after success, reusing the existing <code>commands::account::soap_auth</code>. README record-creation instructions unify into a single one-save checklist that all three auth mechanisms reference.</p>
+<p><strong>Tech stack:</strong> Rust, existing cli.rs dispatch patterns, no new dependencies.</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li>No Creative Planning identifiers in any repo artifact — placeholders only (<code>1234567_SB1</code>, <code>demo</code>).</li>
+  <li>Gate before every commit: <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code>.</li>
+  <li>Commits end with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>.</li>
+  <li>stdout stays exactly ONE JSON object per invocation; prompts/tips/errors go to stderr; exit codes unchanged; no new error kinds.</li>
+  <li><code>"soapTokenStored"</code> appears in the add JSON <em>only</em> when the chained setup actually ran; chained failure still exits 0.</li>
+  <li>Agents/scripts (non-TTY stdin) are never prompted.</li>
+  <li>The TTY prompt branch itself stays untested (established <code>ensure_tba_secrets</code> precedent); everything decidable is a tested pure helper.</li>
+</ul>
+
+<h2>File structure</h2>
+<ul>
+  <li><code>src/cli.rs</code> — MODIFY: helpers <code>offer_soap_setup</code>, <code>wants_soap_setup</code>, <code>soap_auth_tip</code>, <code>with_soap_token_flag</code> (place them directly below <code>ensure_tba_secrets</code>); wire both <code>AccountAction::Add</code> arms (<code>dispatch_account</code>, currently src/cli.rs:905-948); unit tests in the existing test mod.</li>
+  <li><code>README.md</code> — MODIFY: unified record checklist in "NetSuite setup"; M2M/auth-code/saved-search sections reference it.</li>
+  <li><code>skills/netsuite-cli/SKILL.md</code> — MODIFY: one agent-facing note.</li>
+</ul>
+
+<div class="callout"><strong>Setup before Task 1:</strong> <code>git checkout main &amp;&amp; git pull &amp;&amp; git checkout -b feature/setup-ux-onboarding</code></div>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 1: <code>account add</code> SOAP offer/tip + <code>soapTokenStored</code></h2>
+<p><strong>Files:</strong> Modify <code>src/cli.rs</code> (helpers + both Add dispatch arms + tests in its existing <code>#[cfg(test)]</code> mod)</p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>fn wants_soap_setup(answer: &amp;str) -&gt; bool
+fn soap_auth_tip(alias: &amp;str) -&gt; String
+fn with_soap_token_flag(add_result: serde_json::Value, stored: bool) -&gt; serde_json::Value
+async fn offer_soap_setup(alias: &amp;str, config_path: &amp;Path, store: Arc&lt;dyn SecretStore&gt;,
+    port: u16, paste_mode: bool, add_result: serde_json::Value) -&gt; serde_json::Value</pre>
+<p><strong>Consumes:</strong> <code>commands::account::soap_auth(config_path: &amp;Path, store: Arc&lt;dyn SecretStore&gt;, alias: &amp;str, port: u16, paste_mode: bool) -&gt; Result&lt;Value, CliError&gt;</code> · <code>SecretStore::get_tba(&amp;self, alias) -&gt; Result&lt;Option&lt;TbaSecrets&gt;, CliError&gt;</code> · <code>crate::output::print_error(&amp;CliError)</code> · <code>std::io::IsTerminal</code> (already imported in cli.rs).</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Write the failing tests</strong> — in cli.rs's existing <code>mod tests</code>:
+<pre>#[test]
+fn soap_setup_answer_parser_accepts_only_yes_variants() {
+    assert!(wants_soap_setup("y\n"));
+    assert!(wants_soap_setup("YES\n"));
+    assert!(wants_soap_setup(" Yes "));
+    assert!(!wants_soap_setup("\n"));
+    assert!(!wants_soap_setup(""));
+    assert!(!wants_soap_setup("n\n"));
+    assert!(!wants_soap_setup("yep\n"));
+}
+
+#[test]
+fn soap_auth_tip_names_the_command_and_alias() {
+    let tip = soap_auth_tip("demo");
+    assert!(tip.contains("netsuite-cli account soap-auth demo"));
+    assert!(tip.contains("consumer key/secret"));
+}
+
+#[test]
+fn soap_token_flag_merges_into_add_result_object() {
+    let merged =
+        with_soap_token_flag(serde_json::json!({"alias": "demo", "flow": "m2m"}), true);
+    assert_eq!(merged["soapTokenStored"], true);
+    assert_eq!(merged["alias"], "demo");
+    let failed = with_soap_token_flag(serde_json::json!({"alias": "demo"}), false);
+    assert_eq!(failed["soapTokenStored"], false);
+}</pre></li>
+<li>☐ <strong>Step 2: Run to verify failure</strong> — <code>cargo test --lib soap_setup_answer</code> → compile error (functions not defined).</li>
+<li>☐ <strong>Step 3: Implement the helpers</strong> — place directly below <code>ensure_tba_secrets</code> (src/cli.rs:873-896):
+<pre>/// After a successful `account add`, offer to mint the SOAP (TBA) token right away so new
+/// users learn saved searches need it while the integration record's one-time consumer
+/// secret is still at hand. Interactive terminals get a yes/no prompt; everything else gets
+/// a one-line tip. A chained failure never fails the add — the account is already stored.
+async fn offer_soap_setup(
+    alias: &amp;str,
+    config_path: &amp;Path,
+    store: Arc&lt;dyn SecretStore&gt;,
+    port: u16,
+    paste_mode: bool,
+    add_result: serde_json::Value,
+) -&gt; serde_json::Value {
+    if let Ok(Some(secrets)) = store.get_tba(alias)
+        &amp;&amp; secrets.token_id.is_some()
+    {
+        return add_result;
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("{}", soap_auth_tip(alias));
+        return add_result;
+    }
+    eprint!("Saved searches use SOAP/TBA auth. Set it up for '{alias}' now? [y/N] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&amp;mut answer).is_err() || !wants_soap_setup(&amp;answer) {
+        eprintln!("{}", soap_auth_tip(alias));
+        return add_result;
+    }
+    match account::soap_auth(config_path, store, alias, port, paste_mode).await {
+        Ok(_) =&gt; with_soap_token_flag(add_result, true),
+        Err(soap_error) =&gt; {
+            crate::output::print_error(&amp;soap_error);
+            eprintln!(
+                "account '{alias}' was added; only SOAP setup failed — re-run \
+                 `netsuite-cli account soap-auth {alias}`"
+            );
+            with_soap_token_flag(add_result, false)
+        }
+    }
+}
+
+fn wants_soap_setup(answer: &amp;str) -&gt; bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn soap_auth_tip(alias: &amp;str) -&gt; String {
+    format!(
+        "tip: saved searches authenticate separately (SOAP/TBA) — run \
+         `netsuite-cli account soap-auth {alias}` when ready (needs the consumer \
+         key/secret captured at integration-record creation)"
+    )
+}
+
+fn with_soap_token_flag(mut add_result: serde_json::Value, stored: bool) -&gt; serde_json::Value {
+    if let Some(fields) = add_result.as_object_mut() {
+        fields.insert("soapTokenStored".into(), serde_json::Value::Bool(stored));
+    }
+    add_result
+}</pre>
+(If <code>crate::output::print_error</code> is not already reachable from cli.rs, check how the error path at the top of the file prints errors and reuse that exact mechanism.)</li>
+<li>☐ <strong>Step 4: Wire both Add arms</strong> in <code>dispatch_account</code> (src/cli.rs:905-948) — the add result flows through the offer before being returned:
+<pre>AccountFlowArg::M2m =&gt; {
+    let client_id =
+        require_flag(client_id.as_deref(), "--flow m2m requires --client-id")?;
+    let cert_id = require_flag(cert_id.as_deref(), "--flow m2m requires --cert-id")?;
+    let key = key.as_deref().ok_or_else(|| {
+        CliError::Usage("account add --flow m2m requires --key".into())
+    })?;
+    let add_result = account::add_m2m(
+        &amp;config_path,
+        store.as_ref(),
+        alias,
+        account_id,
+        client_id,
+        cert_id,
+        key,
+    )?;
+    Ok(offer_soap_setup(alias, &amp;config_path, store.clone(), *port, *paste, add_result).await)
+}
+AccountFlowArg::AuthCode =&gt; {
+    let client_id = require_flag(
+        client_id.as_deref(),
+        "--flow auth-code requires --client-id",
+    )?;
+    let add_result = account::add_auth_code(
+        &amp;config_path,
+        store.clone(),
+        alias,
+        account_id,
+        client_id,
+        *port,
+        *paste,
+    )
+    .await?;
+    Ok(offer_soap_setup(alias, &amp;config_path, store.clone(), *port, *paste, add_result).await)
+}</pre></li>
+<li>☐ <strong>Step 5: Run the new tests</strong> — <code>cargo test --lib soap</code> → the 3 new tests PASS; then the full gate: <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> → green (existing account_commands integration tests must be unaffected — they call <code>commands::account</code> functions directly, not the dispatch, so no TTY hazard).</li>
+<li>☐ <strong>Step 6: Manual non-TTY sanity check</strong> — <code>echo | cargo run -q -- account add demo --account-id 1234567_SB1 --flow m2m --client-id x --cert-id y --key /nonexistent 2&gt;&amp;1 | head -3</code>: fails on the bad key as before (usage error), proving the wiring compiles and errors still short-circuit before the offer. No keychain write occurs.</li>
+<li>☐ <strong>Step 7: Commit</strong> — <code>git add src/cli.rs &amp;&amp; git commit -m "feat: account add offers SOAP/TBA setup on interactive terminals"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 2: README unified checklist + SKILL.md agent note</h2>
+<p><strong>Files:</strong> Modify <code>README.md</code>, <code>skills/netsuite-cli/SKILL.md</code></p>
+<p><strong>Consumes:</strong> Task 1's exact stderr strings (the tip text and prompt text) — quote them accurately where the docs mention them.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Read both files fully</strong>, then replace README's record-creation paragraph (the "Both require a NetSuite <strong>Integration record</strong> first…" paragraph in "## NetSuite setup", currently around line 62) with this unified checklist (adjust surrounding prose so it flows; keep the existing intro bullets about the two flows):
+<pre>Both flows — and saved-search execution — share a single NetSuite **Integration record**.
+Create it once with everything enabled in the same save: **Setup &gt; Integration &gt; Manage
+Integrations &gt; New**, then:
+
+1. Give it a name.
+2. Under **Authentication**, check **Token-Based Authentication** and
+   **TBA: Authorization Flow**, and set the TBA **Callback URL** to
+   `https://localhost:8899/callback` (used by saved-search auth; see
+   [Saved searches (SOAP)](#saved-searches-soap)).
+3. Under **OAuth 2.0**, enable the grant(s) you need — **Client Credentials
+   (Machine to Machine) Grant** for `--flow m2m` and/or **Authorization Code
+   Grant** for `--flow auth-code` — plus the **REST Web Services** and
+   **RESTlets** scopes.
+4. Save, then copy **both** values NetSuite shows you: the **Client ID** (every
+   `account add` call needs it via `--client-id`) and the **Client Secret**.
+   **The secret is displayed only this once** — it is exactly what saved-search
+   (TBA) auth asks for later, so store both in your password manager now.
+   Recovering a lost secret means Reset Credentials, which rotates the Client ID
+   and breaks every M2M certificate mapping.</pre></li>
+<li>☐ <strong>Step 2: De-duplicate the flow sections</strong> — in "### M2M (client credentials)" step 1 and the auth-code section's record step, remove the per-section "enable the grant" record instructions and reference the checklist instead (e.g. "On the integration record from the setup checklist above (Client Credentials grant + scopes already enabled), …"). Keep each section's flow-specific steps (certificate generation + mapping; Public Client + redirect URI) untouched.</li>
+<li>☐ <strong>Step 3: Reframe the saved-search setup</strong> — in "## Saved searches (SOAP)", replace the one-time integration-record setup steps with: "Already done if you followed the [NetSuite setup](#netsuite-setup) checklist — the record has TBA enabled and you captured the consumer key/secret at creation." Keep the sunset warning and keep the Reset Credentials trap, reframed as the recovery path for records created <em>without</em> TBA. Mention that <code>account add</code> offers to run SOAP setup immediately on interactive terminals.</li>
+<li>☐ <strong>Step 4: SKILL.md agent note</strong> — in the section covering account/auth commands (near the <code>account soap-auth</code> row added by the saved-search feature), add one line: <code>account add</code> never prompts when non-interactive — it prints a one-line stderr tip pointing at <code>account soap-auth &lt;alias&gt;</code>; on a TTY it offers to chain SOAP setup (answer <code>N</code> to skip). Output gains <code>"soapTokenStored"</code> only when the chained setup ran.</li>
+<li>☐ <strong>Step 5: Verify + gate</strong> — every command in the edited sections must parse: eyeball against <code>cargo run -q -- account add --help</code> and <code>cargo run -q -- account soap-auth --help</code>. Identifier sweep: <code>git diff main | grep -icE "&lt;real-account-id&gt;|&lt;org-name&gt;|&lt;username&gt;"</code> → 0. Full gate.</li>
+<li>☐ <strong>Step 6: Commit</strong> — <code>git add README.md skills/netsuite-cli/SKILL.md &amp;&amp; git commit -m "docs: unified one-save integration-record checklist and onboarding notes"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2>Final verification (before PR)</h2>
+<ul>
+  <li>☐ <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — green.</li>
+  <li>☐ Identifier sweep over the whole diff incl. docs: <code>git diff main | grep -icE "&lt;real-account-id&gt;|&lt;org-name&gt;|&lt;username&gt;"</code> → 0.</li>
+  <li>☐ Interactive spot-check (controller/user, real TTY): <code>cargo run -q -- account add demo2 --account-id 1234567_SB1 --flow m2m --client-id x --cert-id y --key &lt;valid-key&gt;</code> → prompt appears on stderr; answering <code>N</code> prints the tip and stdout carries a single unchanged JSON object. Remove the demo alias afterwards (<code>account remove demo2</code>).</li>
+  <li>☐ Open PR (non-draft) → run pr-review-loop to green.</li>
+</ul>
+
+</body>
+</html>
