@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
 use crate::error::CliError;
 use crate::output;
-use crate::secrets::{AccountSecrets, KeyringStore, SecretStore};
+use crate::secrets::{AccountSecrets, KeyringStore, SecretStore, TbaSecrets};
 
 #[derive(Parser)]
 #[command(
@@ -114,6 +115,32 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Execute a saved search over SuiteTalk SOAP (requires a TBA token; see account soap-auth)
+    #[command(
+        after_help = "Examples:\n  netsuite-cli saved-search run 57 --type transaction\n  netsuite-cli saved-search run customsearch_example --type customrecord --all\n\nNOTE: NetSuite removes SOAP web services in release 2028.2; this command stops working then."
+    )]
+    SavedSearch {
+        #[command(subcommand)]
+        action: SavedSearchAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SavedSearchAction {
+    /// Run a saved search and return its rows as JSON
+    Run {
+        /// Saved search id (numeric internal id or script id, e.g. customsearch_example)
+        id: String,
+        /// Record type the saved search is defined against (e.g. transaction, customer)
+        #[arg(long = "type")]
+        record_type: String,
+        /// Page size (SOAP searchPreferences bounds apply); defaults to the max page size
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Fetch every page instead of just the first
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -814,7 +841,57 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 ConfigAction::Set { key, value } => config_cmd::set(&config_path, key, value),
             }
         }
+        Command::SavedSearch { action } => match action {
+            SavedSearchAction::Run {
+                id,
+                record_type,
+                limit,
+                all,
+            } => {
+                let config_path = crate::config::default_config_path();
+                let config = Config::load(&config_path)?;
+                let env_alias = std::env::var("NETSUITE_ACCOUNT").ok();
+                let alias = config.resolve_alias(cli.account.as_deref(), env_alias.as_deref())?;
+                let account_id = config.accounts[&alias].account_id.clone();
+                let store: Arc<dyn SecretStore> = Arc::new(KeyringStore);
+                let secrets = ensure_tba_secrets(&alias, store, &config_path, 8899).await?;
+                let soap = crate::soap::SoapClient::new(
+                    reqwest::Client::new(),
+                    &crate::account::rest_base(&account_id),
+                    &account_id,
+                    secrets,
+                )?;
+                commands::saved_search::run(&soap, id, record_type, *limit, *all).await
+            }
+        },
     }
+}
+
+/// First-run auto-auth for `saved-search run`: reuse a previously minted SOAP token if one is
+/// stored, otherwise (only when attached to an interactive terminal) walk the user through
+/// `account soap-auth` once and store the resulting token for next time.
+async fn ensure_tba_secrets(
+    alias: &str,
+    store: Arc<dyn SecretStore>,
+    config_path: &Path,
+    port: u16,
+) -> Result<TbaSecrets, CliError> {
+    if let Some(secrets) = store.get_tba(alias)?
+        && secrets.token_id.is_some()
+    {
+        return Ok(secrets);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::Auth(format!(
+            "no SOAP token for '{alias}'; run `netsuite-cli account soap-auth {alias}` \
+             in an interactive terminal first"
+        )));
+    }
+    eprintln!("No SOAP token for '{alias}' yet — starting one-time browser authorization…");
+    account::soap_auth(config_path, store.clone(), alias, port, false).await?;
+    store.get_tba(alias)?.ok_or_else(|| {
+        CliError::Auth("SOAP authorization completed but no token was stored".into())
+    })
 }
 
 async fn dispatch_account(
@@ -1164,5 +1241,42 @@ mod tests {
             "entitystatus",
         ])
         .expect("select-options with --fields parses");
+    }
+
+    #[test]
+    fn saved_search_run_parses_type_limit_and_all() {
+        let cli = Cli::try_parse_from([
+            "netsuite-cli",
+            "saved-search",
+            "run",
+            "customsearch_example",
+            "--type",
+            "transaction",
+            "--limit",
+            "100",
+            "--all",
+        ])
+        .unwrap();
+        let Command::SavedSearch {
+            action:
+                SavedSearchAction::Run {
+                    id,
+                    record_type,
+                    limit,
+                    all,
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(id, "customsearch_example");
+        assert_eq!(record_type, "transaction");
+        assert_eq!(limit, Some(100));
+        assert!(all);
+    }
+
+    #[test]
+    fn saved_search_run_requires_type() {
+        assert!(Cli::try_parse_from(["netsuite-cli", "saved-search", "run", "57"]).is_err());
     }
 }
