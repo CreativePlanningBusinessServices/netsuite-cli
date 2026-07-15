@@ -7,12 +7,12 @@ pub const REPO_NAME: &str = "netsuite-cli";
 
 /// self_update's backend is blocking (synchronous HTTP + file I/O), so it runs on the
 /// blocking thread pool rather than tying up the async runtime.
-pub async fn run(check_only: bool) -> Result<Value, CliError> {
+pub async fn run(check_only: bool, skip_skill: bool) -> Result<Value, CliError> {
     tokio::task::spawn_blocking(move || {
         if check_only {
             check_for_update()
         } else {
-            install_update()
+            install_update(skip_skill)
         }
     })
     .await
@@ -45,15 +45,53 @@ fn update_available(current: &str, latest: &str) -> Result<bool, CliError> {
     })
 }
 
-fn install_update() -> Result<Value, CliError> {
+fn install_update(skip_skill: bool) -> Result<Value, CliError> {
     let updater = build_updater()?;
     let status = updater
         .update()
         .map_err(|update_error| CliError::Network(update_error.to_string()))?;
-    Ok(json!({
-        "updated": status.updated(),
-        "version": status.version(),
-    }))
+    let mut result = json!({ "updated": status.updated(), "version": status.version() });
+    if !skip_skill && status.updated() {
+        result["skill"] = refresh_skill_via_new_binary();
+    }
+    Ok(result)
+}
+
+/// The running process is the OLD binary and still holds the OLD embedded skill, so it cannot
+/// write the new one directly. self_update has already replaced the file at current_exe(); run
+/// THAT (now-new) binary's `skill install` so the fresh embedded skill lands. Never fatal — a
+/// failure here leaves the binary updated and only the skill stale.
+fn refresh_skill_via_new_binary() -> Value {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            return skill_refresh_error(&format!("cannot locate updated binary: {error}"));
+        }
+    };
+    let output = std::process::Command::new(exe)
+        .args(["skill", "install"])
+        .output();
+    match output {
+        Ok(done) if done.status.success() => {
+            // Surface the child's stderr notes (symlink/no-config-dir tips) to the user.
+            if !done.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&done.stderr));
+            }
+            serde_json::from_slice(&done.stdout)
+                .unwrap_or_else(|_| skill_refresh_error("skill install produced no JSON"))
+        }
+        Ok(done) => skill_refresh_error(&format!(
+            "skill install exited {}: {}",
+            done.status,
+            String::from_utf8_lossy(&done.stderr).trim()
+        )),
+        Err(error) => skill_refresh_error(&format!("could not run skill install: {error}")),
+    }
+}
+
+fn skill_refresh_error(message: &str) -> Value {
+    eprintln!("binary updated; skill refresh skipped — {message}");
+    json!({"skill": "netsuite-cli", "installed": false, "reason": message})
 }
 
 fn build_updater() -> Result<Box<dyn self_update::update::ReleaseUpdate>, CliError> {

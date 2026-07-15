@@ -110,6 +110,16 @@ pub enum Command {
         /// Only report whether a newer release is available; do not install it
         #[arg(long)]
         check: bool,
+        /// Do not refresh the bundled agent skill after updating the binary
+        #[arg(long)]
+        no_skill: bool,
+    },
+    /// Install or refresh the bundled agent skill (SKILL.md) into your Claude skills dir
+    #[command(after_help = "Examples:\n  netsuite-cli skill install\n  \
+netsuite-cli skill install --dir ~/.config/claude/skills/netsuite-cli")]
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
     },
     /// Get or set persisted CLI configuration
     Config {
@@ -166,6 +176,16 @@ pub enum SystemAction {
     /// Concurrency limit allocation for this account and integration
     #[command(after_help = "Example: netsuite-cli system governance-limits")]
     GovernanceLimits,
+}
+
+#[derive(Subcommand)]
+pub enum SkillAction {
+    /// Write the embedded SKILL.md to your Claude skills dir (skips a symlinked/repo-tracked copy)
+    Install {
+        /// Target dir (default: $CLAUDE_CONFIG_DIR or ~/.claude, under skills/netsuite-cli)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// Methods accepted by `raw` and `job submit` — NetSuite's REST endpoints (record/v1, async/v1,
@@ -835,7 +855,10 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                 SystemAction::GovernanceLimits => system::governance_limits(&context.client).await,
             }
         }
-        Command::Update { check } => update::run(*check).await,
+        Command::Update { check, no_skill } => update::run(*check, *no_skill).await,
+        Command::Skill { action } => match action {
+            SkillAction::Install { dir } => commands::skill::install(dir.as_deref()),
+        },
         Command::Config { action } => {
             let config_path = crate::config::default_config_path();
             match action {
@@ -1386,5 +1409,28 @@ mod tests {
         assert_eq!(merged["alias"], "demo");
         let failed = with_soap_token_flag(serde_json::json!({"alias": "demo"}), false);
         assert_eq!(failed["soapTokenStored"], false);
+    }
+
+    #[test]
+    fn skill_install_parses_dir_override() {
+        let cli =
+            Cli::try_parse_from(["netsuite-cli", "skill", "install", "--dir", "/tmp/x"]).unwrap();
+        let Command::Skill {
+            action: SkillAction::Install { dir },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(dir, Some(PathBuf::from("/tmp/x")));
+    }
+
+    #[test]
+    fn update_parses_no_skill_flag() {
+        let cli = Cli::try_parse_from(["netsuite-cli", "update", "--no-skill"]).unwrap();
+        let Command::Update { check, no_skill } = cli.command else {
+            panic!("wrong variant")
+        };
+        assert!(!check);
+        assert!(no_skill);
     }
 }
