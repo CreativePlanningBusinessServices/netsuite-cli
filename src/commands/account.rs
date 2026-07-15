@@ -116,6 +116,18 @@ pub async fn soap_auth(
     })?;
     let (consumer_key, consumer_secret) =
         resolve_consumer_pair(store.as_ref(), alias, std::io::stdin().is_terminal())?;
+    // Persist the consumer pair before opening the browser: if the user abandons or fails the
+    // consent flow, a retry finds the pair already stored instead of losing a prompted secret
+    // and being forced to re-enter it.
+    store.set_tba(
+        alias,
+        &TbaSecrets {
+            consumer_key: consumer_key.clone(),
+            consumer_secret: consumer_secret.clone(),
+            token_id: None,
+            token_secret: None,
+        },
+    )?;
     let http = reqwest::Client::new();
     let minted = tba::run_tba_flow(
         &http,

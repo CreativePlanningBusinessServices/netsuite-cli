@@ -344,8 +344,8 @@ impl Drop for EnvVarGuard {
 
 /// NOTE: env-var cases must run in one test (or use a mutex) — process env is global, and
 /// `cargo test`'s parallel test threads would otherwise race each other's set_var/remove_var.
-#[test]
-fn consumer_pair_resolution_prefers_env_then_store() {
+#[tokio::test]
+async fn consumer_pair_resolution_prefers_env_then_store() {
     let store = MemoryStore::default();
 
     // no env, nothing stored, not interactive → Auth error naming the env vars
@@ -381,6 +381,47 @@ fn consumer_pair_resolution_prefers_env_then_store() {
         account::resolve_consumer_pair(&store, "demo", false).unwrap(),
         ("envkey".to_string(), "envsecret".to_string())
     );
+
+    // While the env guards are still in scope, prove that `soap_auth` persists the
+    // env-sourced consumer pair *before* it opens the browser consent flow — not only after
+    // the flow succeeds. Account id "0000000" resolves to a restlets.api.netsuite.com
+    // subdomain that does not exist, so the request-token POST fails fast on DNS resolution
+    // without needing a live NetSuite account or a browser.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.accounts.insert(
+        "demo".to_string(),
+        netsuite_cli::config::AccountEntry {
+            account_id: "0000000".to_string(),
+            flow: AuthFlow::M2m,
+        },
+    );
+    config.save(&config_path).unwrap();
+    let store: Arc<dyn SecretStore> = Arc::new(store);
+
+    let soap_auth_result = account::soap_auth(&config_path, store.clone(), "demo", 8899, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            soap_auth_result,
+            CliError::Network(_) | CliError::Auth(_) | CliError::Api { .. }
+        ),
+        "expected the unroutable request-token POST to fail, got {soap_auth_result:?}"
+    );
+
+    let persisted = store
+        .get_tba("demo")
+        .unwrap()
+        .expect("consumer pair must be persisted even though the browser consent flow failed");
+    assert_eq!(persisted.consumer_key, "envkey");
+    assert_eq!(persisted.consumer_secret, "envsecret");
+    assert_eq!(
+        persisted.token_id, None,
+        "no token has been minted yet, so token_id must stay unset"
+    );
+    assert_eq!(persisted.token_secret, None);
 }
 
 #[tokio::test]
