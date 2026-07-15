@@ -491,7 +491,7 @@ The result gains a nested `"skill"` object reporting that outcome:
 
 ```bash
 $ netsuite-cli update
-{"updated":true,"version":"0.3.0","skill":{"skill":"netsuite-cli","path":"/home/you/.claude/skills/netsuite-cli/SKILL.md","installed":true}}
+{"updated":true,"version":"0.4.1","skill":{"installed":true,"path":"/home/you/.claude/skills/netsuite-cli/SKILL.md"}}
 ```
 
 The refresh is skipped, harmlessly, in three cases — each reported as
