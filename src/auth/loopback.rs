@@ -40,7 +40,7 @@ pub(crate) async fn listen_for_redirect<CallbackValue>(
     {
         Ok(result) => result,
         Err(_) => Err(CliError::Auth(
-            "login timed out after 5 minutes; re-run account add (or use --paste)".into(),
+            "login timed out after 5 minutes; re-run the command (or use --paste)".into(),
         )),
     }
 }

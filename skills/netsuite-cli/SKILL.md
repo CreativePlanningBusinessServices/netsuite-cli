@@ -122,7 +122,7 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
 | 1 | API | Parse stderr JSON: `details[].["o:errorCode"]` (`NONEXISTENT_ID`, `INVALID_CONTENT`, …) says what to fix |
 | 2 | usage | Re-run with `--help`; the examples are exact |
 | 3 | auth | M2M: credentials wrong/revoked → re-run `account add`. Auth-code: refresh token expired → re-run `account add <alias> --flow auth-code ...`. `saved-search run`: message mentions "SOAP token" → run `account soap-auth <alias>` (interactive; needs the integration record's TBA consumer key/secret — see README "Saved searches (SOAP)") |
-| 4 | network | Retries with backoff (429/5xx) already happened — the failure is real |
+| 4 | network | Retries with backoff (429/5xx) already happened — the failure is real. Exception: `saved-search run`'s SOAP client has no retry loop, so a transient network/5xx there is unretried — safe to retry the command yourself |
 
 ## Gotchas
 

@@ -117,6 +117,17 @@ fn tba_callback_parser_validates_token_state_and_extracts_verifier() {
     assert!(
         tba::parse_tba_callback("denied=true&state=STATE123", "reqtoken111", "STATE123").is_err()
     );
+    // Correct token and state but no oauth_verifier — exercises the missing-verifier branch
+    // specifically, distinct from the token-mismatch case above (that query has no oauth_token
+    // at all, so it fails the token check rather than the verifier check).
+    assert!(
+        tba::parse_tba_callback(
+            "oauth_token=reqtoken111&state=STATE123",
+            "reqtoken111",
+            "STATE123"
+        )
+        .is_err()
+    );
 }
 
 #[test]

@@ -114,17 +114,38 @@ impl SoapClient {
                 ))
             })?;
         let http_status = response.status().as_u16();
+        let is_success_status = (200..300).contains(&http_status);
         let body = response.text().await.map_err(|read_error| {
             CliError::Network(format!("reading SOAP response failed: {read_error}"))
         })?;
         // Faults arrive with HTTP 500 but the body is authoritative either way.
         if body.contains("<") {
-            return parse_search_response(&body);
+            return parse_search_response(&body)
+                .map_err(|error| fill_in_real_status(error, http_status, is_success_status));
         }
         Err(CliError::Api {
             status: http_status,
             message: body,
             details: vec![],
         })
+    }
+}
+
+/// `parse_search_response` has no notion of the HTTP transport, so a status-less SOAP body
+/// (e.g. an intermediary's HTML error page) always comes back as `status: 0`. When the HTTP
+/// status itself signals failure, that's the real status worth surfacing — a 502 gateway page
+/// shouldn't be reported to the caller as a bare, unattributed status-0 API error.
+fn fill_in_real_status(error: CliError, http_status: u16, is_success_status: bool) -> CliError {
+    match error {
+        CliError::Api {
+            status: 0,
+            message,
+            details,
+        } if !is_success_status => CliError::Api {
+            status: http_status,
+            message,
+            details,
+        },
+        other => other,
     }
 }

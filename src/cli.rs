@@ -884,7 +884,8 @@ async fn ensure_tba_secrets(
     if !std::io::stdin().is_terminal() {
         return Err(CliError::Auth(format!(
             "no SOAP token for '{alias}'; run `netsuite-cli account soap-auth {alias}` \
-             in an interactive terminal first"
+             in an interactive terminal first (set NETSUITE_CLI_TBA_CONSUMER_KEY and \
+             NETSUITE_CLI_TBA_CONSUMER_SECRET to supply the consumer pair without prompting)"
         )));
     }
     eprintln!("No SOAP token for '{alias}' yet — starting one-time browser authorization…");

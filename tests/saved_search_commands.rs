@@ -131,6 +131,25 @@ async fn http_500_fault_body_is_parsed_not_swallowed() {
     assert!(matches!(error, netsuite_cli::error::CliError::Auth(_)));
 }
 
+#[tokio::test]
+async fn http_502_html_error_page_surfaces_real_status() {
+    let server = MockServer::start().await;
+    let html_error_page = "<html><body><h1>502 Bad Gateway</h1></body></html>";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(502).set_body_string(html_error_page))
+        .mount(&server)
+        .await;
+    let search_type = search_types::lookup("customer").unwrap();
+    let error = soap_client_for(&server)
+        .search(&search_type, "savedSearchId", "1", 5)
+        .await
+        .unwrap_err();
+    match error {
+        CliError::Api { status, .. } => assert_eq!(status, 502),
+        other => panic!("expected Api error with the real HTTP status, got {other:?}"),
+    }
+}
+
 const PAGE_ONE_OF_TWO_RESPONSE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
  <soapenv:Body>
