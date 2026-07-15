@@ -33,8 +33,12 @@ pub fn parse_search_response(xml: &str) -> Result<SoapSearchResult, CliError> {
                 state.path.push(name);
             }
             Ok(Event::Empty(element)) => {
+                // A self-closing element is Start immediately followed by End: run both
+                // handlers back-to-back, but skip the path push/pop since no descendant
+                // events will observe it on the stack.
                 let name = local_name(&element);
                 state.handle_open(&name, &element);
+                state.handle_close(&name);
             }
             Ok(Event::Text(text)) => match text.unescape() {
                 Ok(value) => state.handle_text(&value),
@@ -369,6 +373,35 @@ mod tests {
         assert_eq!(row["otherRefNum"], serde_json::json!(["PO-1", "PO-2"]));
         assert_eq!(row["custbody_example"], "hello"); // custom field by scriptId
         assert_eq!(row["customer.email"], "a@example.com"); // join prefix, "Join" stripped
+    }
+
+    #[test]
+    fn self_closing_field_wrapper_does_not_desync_row_parser() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+ <soapenv:Body>
+  <searchResponse xmlns="urn:messages_2025_2.platform.webservices.netsuite.com">
+   <platformCore:searchResult xmlns:platformCore="urn:core_2025_2.platform.webservices.netsuite.com">
+    <platformCore:status isSuccess="true"/>
+    <platformCore:searchRowList>
+     <platformCore:searchRow xmlns:tranSales="urn:sales_2025_2.transactions.webservices.netsuite.com" xsi:type="tranSales:TransactionSearchRow" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <tranSales:basic xmlns:platformCommon="urn:common_2025_2.platform.webservices.netsuite.com">
+       <platformCommon:tranId><platformCore:searchValue>INV-2002</platformCore:searchValue></platformCommon:tranId>
+       <platformCommon:memo/>
+       <platformCommon:entity><platformCore:searchValue internalId="77"/></platformCommon:entity>
+      </tranSales:basic>
+     </platformCore:searchRow>
+    </platformCore:searchRowList>
+   </platformCore:searchResult>
+  </searchResponse>
+ </soapenv:Body>
+</soapenv:Envelope>"#;
+        let result = parse_search_response(xml).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row["tranId"], "INV-2002");
+        assert_eq!(row["memo"], Value::Null);
+        assert_eq!(row["entity"], "77");
     }
 
     #[test]
