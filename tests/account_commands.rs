@@ -422,6 +422,92 @@ async fn consumer_pair_resolution_prefers_env_then_store() {
         "no token has been minted yet, so token_id must stay unset"
     );
     assert_eq!(persisted.token_secret, None);
+
+    // Register two more aliases against the same unroutable account id, still under the
+    // "envkey"/"envsecret" env guards, to prove the pre-flow persist preserves a previously
+    // minted token when the consumer pair is unchanged, and correctly drops it when the pair
+    // changed (a token minted under a different consumerSecret is unusable anyway — TBA
+    // request signatures are keyed by consumerSecret&tokenSecret).
+    config.accounts.insert(
+        "demo-same-pair".to_string(),
+        netsuite_cli::config::AccountEntry {
+            account_id: "0000000".to_string(),
+            flow: AuthFlow::M2m,
+        },
+    );
+    config.accounts.insert(
+        "demo-diff-pair".to_string(),
+        netsuite_cli::config::AccountEntry {
+            account_id: "0000000".to_string(),
+            flow: AuthFlow::M2m,
+        },
+    );
+    config.save(&config_path).unwrap();
+
+    // Scenario 1: stored pair already matches the resolved (env) pair, and a token was already
+    // minted under it. A failed re-auth attempt must not clobber that working token.
+    store
+        .set_tba(
+            "demo-same-pair",
+            &TbaSecrets {
+                consumer_key: "envkey".into(),
+                consumer_secret: "envsecret".into(),
+                token_id: Some("existing-token-id".into()),
+                token_secret: Some("existing-token-secret".into()),
+            },
+        )
+        .unwrap();
+
+    account::soap_auth(&config_path, store.clone(), "demo-same-pair", 8899, false)
+        .await
+        .unwrap_err();
+
+    let same_pair_persisted = store
+        .get_tba("demo-same-pair")
+        .unwrap()
+        .expect("consumer pair must remain persisted");
+    assert_eq!(same_pair_persisted.consumer_key, "envkey");
+    assert_eq!(same_pair_persisted.consumer_secret, "envsecret");
+    assert_eq!(
+        same_pair_persisted.token_id,
+        Some("existing-token-id".to_string()),
+        "an unchanged consumer pair must preserve the previously minted token when the retry fails"
+    );
+    assert_eq!(
+        same_pair_persisted.token_secret,
+        Some("existing-token-secret".to_string())
+    );
+
+    // Scenario 2: stored pair differs from the resolved (env) pair, and a token was minted
+    // under that old pair. The env pair wins resolution, and since the pair changed, the old
+    // token must be dropped (it cannot be used to sign requests under the new consumer secret).
+    store
+        .set_tba(
+            "demo-diff-pair",
+            &TbaSecrets {
+                consumer_key: "oldkey".into(),
+                consumer_secret: "oldsecret".into(),
+                token_id: Some("stale-token-id".into()),
+                token_secret: Some("stale-token-secret".into()),
+            },
+        )
+        .unwrap();
+
+    account::soap_auth(&config_path, store.clone(), "demo-diff-pair", 8899, false)
+        .await
+        .unwrap_err();
+
+    let diff_pair_persisted = store
+        .get_tba("demo-diff-pair")
+        .unwrap()
+        .expect("consumer pair must be persisted");
+    assert_eq!(diff_pair_persisted.consumer_key, "envkey");
+    assert_eq!(diff_pair_persisted.consumer_secret, "envsecret");
+    assert_eq!(
+        diff_pair_persisted.token_id, None,
+        "a changed consumer pair must drop the stale token minted under the old pair"
+    );
+    assert_eq!(diff_pair_persisted.token_secret, None);
 }
 
 #[tokio::test]

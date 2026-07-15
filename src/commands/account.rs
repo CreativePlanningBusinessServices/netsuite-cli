@@ -118,14 +118,24 @@ pub async fn soap_auth(
         resolve_consumer_pair(store.as_ref(), alias, std::io::stdin().is_terminal())?;
     // Persist the consumer pair before opening the browser: if the user abandons or fails the
     // consent flow, a retry finds the pair already stored instead of losing a prompted secret
-    // and being forced to re-enter it.
+    // and being forced to re-enter it. If a token was already minted under this exact same
+    // consumer pair, keep it — a failed re-auth attempt must not destroy a working SOAP token.
+    // A token minted under a *different* pair is unusable regardless (TBA request signatures
+    // are keyed by consumerSecret&tokenSecret), so it is correctly dropped in that case.
+    let existing_tba = store.get_tba(alias)?;
+    let (preserved_token_id, preserved_token_secret) = match &existing_tba {
+        Some(tba) if tba.consumer_key == consumer_key && tba.consumer_secret == consumer_secret => {
+            (tba.token_id.clone(), tba.token_secret.clone())
+        }
+        _ => (None, None),
+    };
     store.set_tba(
         alias,
         &TbaSecrets {
             consumer_key: consumer_key.clone(),
             consumer_secret: consumer_secret.clone(),
-            token_id: None,
-            token_secret: None,
+            token_id: preserved_token_id,
+            token_secret: preserved_token_secret,
         },
     )?;
     let http = reqwest::Client::new();
