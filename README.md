@@ -1,8 +1,8 @@
 # netsuite-cli
 
 A NetSuite REST API command-line tool built for AI agents, not humans typing at a terminal.
-Every subcommand takes explicit, typed flags (no interactive prompts beyond the one-time OAuth
-login), emits a single JSON value on stdout on success, and reports failures as a single JSON
+Every subcommand takes explicit, typed flags (no interactive prompts beyond one-time auth
+setup), emits a single JSON value on stdout on success, and reports failures as a single JSON
 object on stderr with a predictable exit code — so an agent can invoke it, parse the result, and
 branch on outcome without screen-scraping. It covers record CRUD and special operations
 (transform, form previews, select options, attach/detach), SuiteQL, RESTlets, metadata
@@ -67,7 +67,9 @@ Integrations > New**, then:
 2. Under **Authentication**, check **Token-Based Authentication** and
    **TBA: Authorization Flow**, and set the TBA **Callback URL** to
    `https://localhost:8899/callback` (used by saved-search auth; see
-   [Saved searches (SOAP)](#saved-searches-soap)).
+   [Saved searches (SOAP)](#saved-searches-soap)). The port must match any
+   custom `--port` you pass to `account add`/`account soap-auth` (8899 is the
+   default).
 3. Under **OAuth 2.0**, enable the grant(s) you need — **Client Credentials
    (Machine to Machine) Grant** for `--flow m2m` and/or **Authorization Code
    Grant** for `--flow auth-code` — plus the **REST Web Services** and
