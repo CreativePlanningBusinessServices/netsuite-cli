@@ -59,20 +59,34 @@ in place — see [Updating](#updating).
   `netsuite-cli` persists automatically. Use this when the integration needs to act as a specific
   user rather than a dedicated integration record.
 
-Both require a NetSuite **Integration record** first: **Setup > Integration > Manage
-Integrations > New**. Give it a name, and under the applicable authentication section enable the
-grant type you're setting up (see below). Saving gives you a **Client ID** — every `account add`
-call needs it via `--client-id`.
+Both flows — and saved-search execution — share a single NetSuite **Integration record**.
+Create it once with everything enabled in the same save: **Setup > Integration > Manage
+Integrations > New**, then:
+
+1. Give it a name.
+2. Under **Authentication**, check **Token-Based Authentication** and
+   **TBA: Authorization Flow**, and set the TBA **Callback URL** to
+   `https://localhost:8899/callback` (used by saved-search auth; see
+   [Saved searches (SOAP)](#saved-searches-soap)).
+3. Under **OAuth 2.0**, enable the grant(s) you need — **Client Credentials
+   (Machine to Machine) Grant** for `--flow m2m` and/or **Authorization Code
+   Grant** for `--flow auth-code` — plus the **REST Web Services** and
+   **RESTlets** scopes.
+4. Save, then copy **both** values NetSuite shows you: the **Client ID** (every
+   `account add` call needs it via `--client-id`) and the **Client Secret**.
+   **The secret is displayed only this once** — it is exactly what saved-search
+   (TBA) auth asks for later, so store both in your password manager now.
+   Recovering a lost secret means Reset Credentials, which rotates the Client ID
+   and breaks every M2M certificate mapping.
 
 `saved-search run` uses a third, separate authentication mechanism — Token-Based Authentication
-(TBA) for SuiteTalk SOAP, not one of the two OAuth 2.0 grants above — set up on the same
-integration record; see [Saved searches (SOAP)](#saved-searches-soap).
+(TBA) for SuiteTalk SOAP, not one of the two OAuth 2.0 grants above — enabled on the same
+integration record by the checklist above; see [Saved searches (SOAP)](#saved-searches-soap).
 
 ### M2M (client credentials)
 
-1. On the integration record, enable **OAuth 2.0 Client Credentials Grant (Client Credentials /
-   Machine to Machine)** plus the **REST Web Services** and **RESTlets** scopes, and save. Note
-   the **Client ID**.
+1. On the integration record from the setup checklist above (Client Credentials grant + scopes
+   already enabled), note the **Client ID**.
 2. Generate a certificate/key pair. NetSuite accepts RSA (3072/4096-bit, signed with RSA-PSS) or
    EC (P-256/384/521) keys, with a maximum validity of 2 years (`-days 730`):
 
@@ -117,12 +131,12 @@ integration record; see [Saved searches (SOAP)](#saved-searches-soap).
 
 ### Auth-code (authorization code + PKCE)
 
-1. On the integration record, enable **Authorization Code Grant**, check **Public Client** (no
-   client secret — the CLI authenticates with PKCE instead), and set the **Redirect URI** to
+1. On the integration record from the setup checklist above (Authorization Code Grant + REST Web
+   Services/RESTlets scopes already enabled), check **Public Client** (no client secret — the CLI
+   authenticates with PKCE instead), add the **SuiteAnalytics Workbook** scope (not part of the
+   checklist's baseline, but needed for this flow), and set the **Redirect URI** to
    `https://localhost:8899/callback` (or `https://localhost:<port>/callback` if you'll pass a
-   custom `--port` to `account add`/`account test --reauth`). Enable the scopes you need — REST
-   Web Services, RESTlets, and SuiteAnalytics Workbook cover everything this CLI calls. Save and
-   note the **Client ID**.
+   custom `--port` to `account add`/`account test --reauth`). Save and note the **Client ID**.
 2. Register the account — this opens your default browser for a one-time login:
 
    ```bash
@@ -369,21 +383,19 @@ SOAP web services (there is no REST equivalent for running a saved search) and r
 JSON. It needs its own one-time setup, separate from the M2M/auth-code flows above, because SOAP
 authenticates with Token-Based Authentication (TBA), not OAuth 2.0.
 
-### One-time integration-record setup
+### Integration-record setup
 
-Do this once per NetSuite account, on the **same integration record** you already use for M2M
-(**Setup > Integration > Manage Integrations**):
+Already done if you followed the [NetSuite setup](#netsuite-setup) checklist — the record has TBA
+enabled and you captured the consumer key/secret at creation. On an interactive terminal,
+`account add` also offers to chain straight into SOAP setup right after adding an account, so you
+mint the token while that secret is still fresh; answer the prompt (or just run `account soap-auth
+<alias>` later) whenever you're ready.
 
-1. Check **Token-Based Authentication (TBA)** and **TBA: Authorization Flow**.
-2. Set the **TBA callback URL** to `https://localhost:8899/callback` (match the port to whatever
-   `--port` you'll pass `account soap-auth`, if not the default `8899`).
-3. Save. NetSuite shows a **Consumer Key** and **Consumer Secret** — capture both into the org's
-   password manager immediately.
+### The Reset Credentials trap (recovery path)
 
-### The Reset Credentials trap
-
-The consumer secret is shown **exactly once**, at the moment the record is saved. If it wasn't
-captured then:
+Relevant if your integration record predates the checklist above and either doesn't have TBA
+enabled yet, or its consumer secret was never captured. The secret is shown **exactly once**, at
+the moment TBA is enabled and the record is saved. If it wasn't captured then:
 
 - **Do not click Reset Credentials** to get a fresh one. Reset Credentials rotates the
   integration's client ID, which breaks every M2M certificate mapping and every configured
