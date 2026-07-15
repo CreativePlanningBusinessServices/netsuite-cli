@@ -159,7 +159,9 @@ async fn signed_form_post(
             "TBA endpoint {url} returned {status}: {body}"
         )));
     }
-    Ok(url::form_urlencoded::parse(body.as_bytes())
+    // NetSuite terminates the form-encoded body with a newline; without trimming,
+    // the final parameter's value would carry it (e.g. oauth_callback_confirmed="true\n").
+    Ok(url::form_urlencoded::parse(body.trim().as_bytes())
         .map(|(name, value)| (name.into_owned(), value.into_owned()))
         .collect())
 }

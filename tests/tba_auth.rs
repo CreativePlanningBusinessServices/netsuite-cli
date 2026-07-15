@@ -10,7 +10,9 @@ async fn request_token_step_sends_signed_oauth_header_and_parses_form_response()
         .and(path("/rest/requesttoken"))
         .and(header_exists("Authorization"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
-            "oauth_token=reqtoken111&oauth_token_secret=reqtokensecret333&oauth_callback_confirmed=true"))
+            // NetSuite terminates the body with a newline; the parser must trim it or the
+            // final parameter's value would be "true\n" (seen live against a real account).
+            "oauth_token=reqtoken111&oauth_token_secret=reqtokensecret333&oauth_callback_confirmed=true\n"))
         .expect(1)
         .mount(&server)
         .await;
@@ -78,7 +80,7 @@ async fn access_token_step_includes_verifier_and_parses_minted_token() {
         .and(path("/rest/accesstoken"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_string("oauth_token=tokenid456&oauth_token_secret=tokensecret012"),
+                .set_body_string("oauth_token=tokenid456&oauth_token_secret=tokensecret012\n"),
         )
         .mount(&server)
         .await;
