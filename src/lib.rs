@@ -8,3 +8,4 @@ pub mod context;
 pub mod error;
 pub mod output;
 pub mod secrets;
+pub mod soap;

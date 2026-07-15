@@ -170,3 +170,80 @@ async fn select_options_lists_customer_entity_statuses() {
         "expected _selectOptions items for entitystatus: {options}"
     );
 }
+
+/// Equivalent of `netsuite-cli saved-search <id> --type <record_type>`; exercises SOAP
+/// saved-search execution end to end with stored TBA secrets.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; needs account soap-auth + NETSUITE_LIVE_SAVED_SEARCH(_TYPE)"]
+async fn saved_search_runs_over_soap_with_stored_tba_token() {
+    let alias = live_alias();
+    let saved_search_id = std::env::var("NETSUITE_LIVE_SAVED_SEARCH")
+        .expect("NETSUITE_LIVE_SAVED_SEARCH must name a saved search id");
+    let record_type = std::env::var("NETSUITE_LIVE_SAVED_SEARCH_TYPE")
+        .expect("NETSUITE_LIVE_SAVED_SEARCH_TYPE must name the record type");
+
+    let config = netsuite_cli::config::Config::load(&netsuite_cli::config::default_config_path())
+        .expect("config loads");
+    let account_id = config.accounts[&alias].account_id.clone();
+    let store = netsuite_cli::secrets::KeyringStore;
+    let secrets = netsuite_cli::secrets::SecretStore::get_tba(&store, &alias)
+        .expect("keychain readable")
+        .expect("run `netsuite-cli account soap-auth` first");
+    let soap = netsuite_cli::soap::SoapClient::new(
+        reqwest::Client::new(),
+        &netsuite_cli::account::rest_base(&account_id),
+        &account_id,
+        secrets,
+    )
+    .expect("token present");
+
+    let result = netsuite_cli::commands::saved_search::run(
+        &soap,
+        &saved_search_id,
+        &record_type,
+        Some(5),
+        false,
+    )
+    .await
+    .expect("saved search executes");
+    assert!(result["totalRecords"].as_u64().is_some());
+    assert!(result["items"].is_array());
+}
+
+/// Equivalent of `netsuite-cli saved-search <id> --type customrecord`; verifies SOAP
+/// saved-search execution works with custom record types.
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; needs NETSUITE_LIVE_CUSTOM_SAVED_SEARCH"]
+async fn custom_record_saved_search_works_with_saved_search_id_alone() {
+    let alias = live_alias();
+    let saved_search_id = std::env::var("NETSUITE_LIVE_CUSTOM_SAVED_SEARCH")
+        .expect("NETSUITE_LIVE_CUSTOM_SAVED_SEARCH must name a saved search id");
+    let record_type = "customrecord";
+
+    let config = netsuite_cli::config::Config::load(&netsuite_cli::config::default_config_path())
+        .expect("config loads");
+    let account_id = config.accounts[&alias].account_id.clone();
+    let store = netsuite_cli::secrets::KeyringStore;
+    let secrets = netsuite_cli::secrets::SecretStore::get_tba(&store, &alias)
+        .expect("keychain readable")
+        .expect("run `netsuite-cli account soap-auth` first");
+    let soap = netsuite_cli::soap::SoapClient::new(
+        reqwest::Client::new(),
+        &netsuite_cli::account::rest_base(&account_id),
+        &account_id,
+        secrets,
+    )
+    .expect("token present");
+
+    let result = netsuite_cli::commands::saved_search::run(
+        &soap,
+        &saved_search_id,
+        record_type,
+        Some(5),
+        false,
+    )
+    .await
+    .expect("saved search executes");
+    assert!(result["totalRecords"].as_u64().is_some());
+    assert!(result["items"].is_array());
+}

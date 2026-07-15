@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,10 +9,11 @@ use crate::account as domain;
 use crate::auth::TokenResponse;
 use crate::auth::authcode;
 use crate::auth::m2m::{M2mConfig, build_assertion};
+use crate::auth::tba;
 use crate::client::NsClient;
 use crate::config::{AccountEntry, AuthFlow, Config};
 use crate::error::CliError;
-use crate::secrets::{AccountSecrets, CachedToken, SecretStore};
+use crate::secrets::{AccountSecrets, CachedToken, SecretStore, TbaSecrets};
 
 pub fn add_m2m(
     config_path: &Path,
@@ -94,6 +96,116 @@ pub async fn add_auth_code(
         client_id,
         &token,
     )
+}
+
+/// Mints a never-expiring SOAP (TBA) token via browser consent and stores it alongside the
+/// consumer pair used to obtain it, so a later `soap_auth` re-run (or the SOAP client itself)
+/// can find both without prompting again.
+pub async fn soap_auth(
+    config_path: &Path,
+    store: Arc<dyn SecretStore>,
+    alias: &str,
+    port: u16,
+    paste_mode: bool,
+) -> Result<Value, CliError> {
+    let config = Config::load(config_path)?;
+    let entry = config.accounts.get(alias).ok_or_else(|| {
+        CliError::Usage(format!(
+            "unknown account alias '{alias}'; run `netsuite-cli account list`"
+        ))
+    })?;
+    let (consumer_key, consumer_secret) =
+        resolve_consumer_pair(store.as_ref(), alias, std::io::stdin().is_terminal())?;
+    // Persist the consumer pair before opening the browser: if the user abandons or fails the
+    // consent flow, a retry finds the pair already stored instead of losing a prompted secret
+    // and being forced to re-enter it. If a token was already minted under this exact same
+    // consumer pair, keep it — a failed re-auth attempt must not destroy a working SOAP token.
+    // A token minted under a *different* pair is unusable regardless (TBA request signatures
+    // are keyed by consumerSecret&tokenSecret), so it is correctly dropped in that case.
+    let existing_tba = store.get_tba(alias)?;
+    let (preserved_token_id, preserved_token_secret) = match &existing_tba {
+        Some(tba) if tba.consumer_key == consumer_key && tba.consumer_secret == consumer_secret => {
+            (tba.token_id.clone(), tba.token_secret.clone())
+        }
+        _ => (None, None),
+    };
+    store.set_tba(
+        alias,
+        &TbaSecrets {
+            consumer_key: consumer_key.clone(),
+            consumer_secret: consumer_secret.clone(),
+            token_id: preserved_token_id,
+            token_secret: preserved_token_secret,
+        },
+    )?;
+    let http = reqwest::Client::new();
+    let minted = tba::run_tba_flow(
+        &http,
+        &domain::restlet_base(&entry.account_id),
+        &domain::app_base(&entry.account_id),
+        &consumer_key,
+        &consumer_secret,
+        port,
+        paste_mode,
+    )
+    .await?;
+    store.set_tba(
+        alias,
+        &TbaSecrets {
+            consumer_key,
+            consumer_secret,
+            token_id: Some(minted.token_id),
+            token_secret: Some(minted.token_secret),
+        },
+    )?;
+    Ok(json!({"alias": alias, "accountId": entry.account_id, "soapTokenStored": true}))
+}
+
+/// Resolution order: env vars (for CI/non-interactive use) → previously stored TBA consumer
+/// pair for this alias → interactive prompt (hidden for the secret). The consumer secret must
+/// never be accepted as a CLI flag — that would leak it into shell history and `ps` output.
+/// `interactive` (whether stdin is a TTY) is a parameter rather than checked here so tests can
+/// exercise the non-interactive error branch deterministically instead of hanging on the prompt
+/// when run from a real terminal.
+pub fn resolve_consumer_pair(
+    store: &dyn SecretStore,
+    alias: &str,
+    interactive: bool,
+) -> Result<(String, String), CliError> {
+    if let (Ok(env_key), Ok(env_secret)) = (
+        std::env::var("NETSUITE_CLI_TBA_CONSUMER_KEY"),
+        std::env::var("NETSUITE_CLI_TBA_CONSUMER_SECRET"),
+    ) {
+        // File-sourced env vars (e.g. `export FOO=$(cat secret.txt)`) often carry a trailing
+        // newline; trim just like the prompt path below does, or it would be persisted into
+        // the keyring and silently break HMAC signing on every SOAP call.
+        return Ok((env_key.trim().to_string(), env_secret.trim().to_string()));
+    }
+    if let Some(stored) = store.get_tba(alias)? {
+        return Ok((stored.consumer_key, stored.consumer_secret));
+    }
+    if !interactive {
+        return Err(CliError::Auth(format!(
+            "no TBA consumer credentials for '{alias}': set NETSUITE_CLI_TBA_CONSUMER_KEY and \
+             NETSUITE_CLI_TBA_CONSUMER_SECRET, or run `netsuite-cli account soap-auth {alias}` \
+             in an interactive terminal"
+        )));
+    }
+    eprint!("Integration record consumer key (client id): ");
+    let mut consumer_key = String::new();
+    std::io::stdin()
+        .read_line(&mut consumer_key)
+        .map_err(|read_error| {
+            CliError::Auth(format!("failed to read consumer key: {read_error}"))
+        })?;
+    let consumer_secret =
+        rpassword::prompt_password("Integration record consumer secret (hidden): ").map_err(
+            |read_error| CliError::Auth(format!("failed to read consumer secret: {read_error}")),
+        )?;
+    Ok((
+        consumer_key.trim().to_string(),
+        consumer_secret.trim().to_string(),
+    ))
 }
 
 pub fn list(config_path: &Path) -> Result<Value, CliError> {
@@ -259,6 +371,19 @@ mod tests {
             Ok(())
         }
         fn delete_token(&self, _alias: &str) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn get_tba(&self, _alias: &str) -> Result<Option<crate::secrets::TbaSecrets>, CliError> {
+            Ok(None)
+        }
+        fn set_tba(
+            &self,
+            _alias: &str,
+            _secrets: &crate::secrets::TbaSecrets,
+        ) -> Result<(), CliError> {
+            Ok(())
+        }
+        fn delete_tba(&self, _alias: &str) -> Result<(), CliError> {
             Ok(())
         }
     }

@@ -4,7 +4,8 @@ use common::client_for;
 use netsuite_cli::commands::account;
 use netsuite_cli::config::{AuthFlow, Config};
 use netsuite_cli::error::CliError;
-use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
+use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore, TbaSecrets};
+use std::sync::Arc;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -320,4 +321,210 @@ async fn test_propagates_api_error_on_failure() {
 
     let test_result = account::test(&client_for(&server), "prod").await;
     assert!(matches!(test_result, Err(CliError::Api { .. })));
+}
+
+/// Removes an env var on drop so a panicking assertion between set and remove cannot leak the
+/// var into the rest of the (shared) test process.
+struct EnvVarGuard {
+    name: &'static str,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        unsafe { std::env::set_var(name, value) };
+        EnvVarGuard { name }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var(self.name) };
+    }
+}
+
+/// NOTE: env-var cases must run in one test (or use a mutex) — process env is global, and
+/// `cargo test`'s parallel test threads would otherwise race each other's set_var/remove_var.
+#[tokio::test]
+async fn consumer_pair_resolution_prefers_env_then_store() {
+    let store = MemoryStore::default();
+
+    // no env, nothing stored, not interactive → Auth error naming the env vars
+    let missing = account::resolve_consumer_pair(&store, "demo", false).unwrap_err();
+    assert!(matches!(missing, CliError::Auth(_)));
+    assert!(
+        missing
+            .to_string()
+            .contains("NETSUITE_CLI_TBA_CONSUMER_KEY")
+    );
+
+    // stored pair wins when no env
+    store
+        .set_tba(
+            "demo",
+            &TbaSecrets {
+                consumer_key: "storedkey".into(),
+                consumer_secret: "storedsecret".into(),
+                token_id: None,
+                token_secret: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        account::resolve_consumer_pair(&store, "demo", false).unwrap(),
+        ("storedkey".to_string(), "storedsecret".to_string())
+    );
+
+    // env overrides stored — and file-sourced env vars often carry a trailing newline (e.g.
+    // from `export FOO=$(cat secret.txt)`), which must be trimmed just like the prompt path
+    // trims, or it would be persisted into the keyring and silently break HMAC signing.
+    let _key_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey\n");
+    let _secret_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret\n");
+    assert_eq!(
+        account::resolve_consumer_pair(&store, "demo", false).unwrap(),
+        ("envkey".to_string(), "envsecret".to_string())
+    );
+
+    // While the env guards are still in scope, prove that `soap_auth` persists the
+    // env-sourced consumer pair *before* it opens the browser consent flow — not only after
+    // the flow succeeds. Account id "0000000" resolves to a restlets.api.netsuite.com
+    // subdomain that does not exist, so the request-token POST fails fast on DNS resolution
+    // without needing a live NetSuite account or a browser.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.accounts.insert(
+        "demo".to_string(),
+        netsuite_cli::config::AccountEntry {
+            account_id: "0000000".to_string(),
+            flow: AuthFlow::M2m,
+        },
+    );
+    config.save(&config_path).unwrap();
+    let store: Arc<dyn SecretStore> = Arc::new(store);
+
+    let soap_auth_result = account::soap_auth(&config_path, store.clone(), "demo", 8899, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            soap_auth_result,
+            CliError::Network(_) | CliError::Auth(_) | CliError::Api { .. }
+        ),
+        "expected the unroutable request-token POST to fail, got {soap_auth_result:?}"
+    );
+
+    let persisted = store
+        .get_tba("demo")
+        .unwrap()
+        .expect("consumer pair must be persisted even though the browser consent flow failed");
+    assert_eq!(persisted.consumer_key, "envkey");
+    assert_eq!(persisted.consumer_secret, "envsecret");
+    assert_eq!(
+        persisted.token_id, None,
+        "no token has been minted yet, so token_id must stay unset"
+    );
+    assert_eq!(persisted.token_secret, None);
+
+    // Register two more aliases against the same unroutable account id, still under the
+    // "envkey"/"envsecret" env guards, to prove the pre-flow persist preserves a previously
+    // minted token when the consumer pair is unchanged, and correctly drops it when the pair
+    // changed (a token minted under a different consumerSecret is unusable anyway — TBA
+    // request signatures are keyed by consumerSecret&tokenSecret).
+    config.accounts.insert(
+        "demo-same-pair".to_string(),
+        netsuite_cli::config::AccountEntry {
+            account_id: "0000000".to_string(),
+            flow: AuthFlow::M2m,
+        },
+    );
+    config.accounts.insert(
+        "demo-diff-pair".to_string(),
+        netsuite_cli::config::AccountEntry {
+            account_id: "0000000".to_string(),
+            flow: AuthFlow::M2m,
+        },
+    );
+    config.save(&config_path).unwrap();
+
+    // Scenario 1: stored pair already matches the resolved (env) pair, and a token was already
+    // minted under it. A failed re-auth attempt must not clobber that working token.
+    store
+        .set_tba(
+            "demo-same-pair",
+            &TbaSecrets {
+                consumer_key: "envkey".into(),
+                consumer_secret: "envsecret".into(),
+                token_id: Some("existing-token-id".into()),
+                token_secret: Some("existing-token-secret".into()),
+            },
+        )
+        .unwrap();
+
+    account::soap_auth(&config_path, store.clone(), "demo-same-pair", 8899, false)
+        .await
+        .unwrap_err();
+
+    let same_pair_persisted = store
+        .get_tba("demo-same-pair")
+        .unwrap()
+        .expect("consumer pair must remain persisted");
+    assert_eq!(same_pair_persisted.consumer_key, "envkey");
+    assert_eq!(same_pair_persisted.consumer_secret, "envsecret");
+    assert_eq!(
+        same_pair_persisted.token_id,
+        Some("existing-token-id".to_string()),
+        "an unchanged consumer pair must preserve the previously minted token when the retry fails"
+    );
+    assert_eq!(
+        same_pair_persisted.token_secret,
+        Some("existing-token-secret".to_string())
+    );
+
+    // Scenario 2: stored pair differs from the resolved (env) pair, and a token was minted
+    // under that old pair. The env pair wins resolution, and since the pair changed, the old
+    // token must be dropped (it cannot be used to sign requests under the new consumer secret).
+    store
+        .set_tba(
+            "demo-diff-pair",
+            &TbaSecrets {
+                consumer_key: "oldkey".into(),
+                consumer_secret: "oldsecret".into(),
+                token_id: Some("stale-token-id".into()),
+                token_secret: Some("stale-token-secret".into()),
+            },
+        )
+        .unwrap();
+
+    account::soap_auth(&config_path, store.clone(), "demo-diff-pair", 8899, false)
+        .await
+        .unwrap_err();
+
+    let diff_pair_persisted = store
+        .get_tba("demo-diff-pair")
+        .unwrap()
+        .expect("consumer pair must be persisted");
+    assert_eq!(diff_pair_persisted.consumer_key, "envkey");
+    assert_eq!(diff_pair_persisted.consumer_secret, "envsecret");
+    assert_eq!(
+        diff_pair_persisted.token_id, None,
+        "a changed consumer pair must drop the stale token minted under the old pair"
+    );
+    assert_eq!(diff_pair_persisted.token_secret, None);
+}
+
+#[tokio::test]
+async fn soap_auth_rejects_unknown_alias() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+    Config::default().save(&config_path).unwrap();
+    let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+
+    let error = account::soap_auth(&config_path, store, "ghost", 8899, false)
+        .await
+        .unwrap_err();
+
+    match error {
+        CliError::Usage(message) => assert!(message.contains("ghost")),
+        other => panic!("expected Usage error, got {other:?}"),
+    }
 }

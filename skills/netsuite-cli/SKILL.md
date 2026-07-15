@@ -1,6 +1,6 @@
 ---
 name: netsuite-cli
-description: Use when a task needs NetSuite data or metadata from the command line — reading or writing records, running SuiteQL queries, discovering record schemas, calling RESTlets, or driving async REST jobs. Covers picking the right subcommand, bootstrapping an account, workflow recipes, and triaging errors by exit code.
+description: Use when a task needs NetSuite data or metadata from the command line — reading or writing records, running SuiteQL queries, running a saved search, discovering record schemas, calling RESTlets, or driving async REST jobs. Covers picking the right subcommand, bootstrapping an account, workflow recipes, and triaging errors by exit code.
 ---
 
 # netsuite-cli
@@ -16,6 +16,7 @@ and the repo README.
 |---|---|
 | Record type + internal id | `record get <type> <id>` |
 | Query, aggregate, filter, join | `suiteql "SELECT ..."` |
+| Run an existing saved search as-is, or reach data only exposed via one | `saved-search run <id> --type <recordtype>` |
 | Unknown record type or field names | `describe --list`, then `describe <type>` |
 | Create / update / delete a record | `record create` / `record update` / `record delete` |
 | Upsert keyed on your own id | `record upsert <type> <externalId>` |
@@ -71,6 +72,14 @@ netsuite-cli account test --account <alias>   # proves auth end to end
   (`record select-options salesOrder 123 --fields item`) for an existing
   record's context.
 - **External ids everywhere:** any id positional accepts `eid:<yourId>`.
+- **`saved-search run` vs `suiteql`:** reach for `saved-search run <id> --type <recordtype>`
+  instead of `suiteql` when you want the saved search's own filters/formulas/columns exactly as
+  the search owner built them, or when the data you need is only exposed via a saved search (no
+  equivalent SuiteQL table/view). Otherwise prefer `suiteql` — it's REST, needs no separate SOAP
+  auth, and is easier to iterate on. `--type` is required and must match the record type the
+  search is defined against; resolve it first by asking the search's owner or checking **Lists >
+  Search > Saved Searches** in the NetSuite UI (the search's record type is right there) rather
+  than guessing.
 
 ## Batch / bulk (record collections)
 
@@ -112,8 +121,8 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
 |---|---|---|
 | 1 | API | Parse stderr JSON: `details[].["o:errorCode"]` (`NONEXISTENT_ID`, `INVALID_CONTENT`, …) says what to fix |
 | 2 | usage | Re-run with `--help`; the examples are exact |
-| 3 | auth | M2M: credentials wrong/revoked → re-run `account add`. Auth-code: refresh token expired → re-run `account add <alias> --flow auth-code ...` |
-| 4 | network | Retries with backoff (429/5xx) already happened — the failure is real |
+| 3 | auth | M2M: credentials wrong/revoked → re-run `account add`. Auth-code: refresh token expired → re-run `account add <alias> --flow auth-code ...`. `saved-search run`: message mentions "SOAP token" → run `account soap-auth <alias>` (interactive; needs the integration record's TBA consumer key/secret — see README "Saved searches (SOAP)") |
+| 4 | network | Retries with backoff (429/5xx) already happened — the failure is real. Exception: `saved-search run`'s SOAP client has no retry loop, so a transient network/5xx there is unretried — safe to retry the command yourself |
 
 ## Gotchas
 
@@ -128,3 +137,7 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
   internalid FROM customrecord_...` errors with `Unknown identifier
   'internalid'` (standard records accept both). Use `id` and it silently
   returns nothing on some shapes, so prefer `id` everywhere for custom records.
+- **`saved-search run` is on borrowed time:** it calls NetSuite's legacy SuiteTalk SOAP web
+  services, which NetSuite is sunsetting — no new TBA/SOAP integrations after release 2027.1, and
+  the SOAP endpoints are removed entirely in release 2028.2. Don't build new workflows around it
+  without a `suiteql`/REST fallback plan.

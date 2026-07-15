@@ -34,6 +34,19 @@ impl SecretStore for FailingOnSetStore {
     fn delete_token(&self, alias: &str) -> Result<(), CliError> {
         self.inner.delete_token(alias)
     }
+    fn get_tba(&self, alias: &str) -> Result<Option<netsuite_cli::secrets::TbaSecrets>, CliError> {
+        self.inner.get_tba(alias)
+    }
+    fn set_tba(
+        &self,
+        alias: &str,
+        secrets: &netsuite_cli::secrets::TbaSecrets,
+    ) -> Result<(), CliError> {
+        self.inner.set_tba(alias, secrets)
+    }
+    fn delete_tba(&self, alias: &str) -> Result<(), CliError> {
+        self.inner.delete_tba(alias)
+    }
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ pub mod job;
 pub mod raw;
 pub mod record;
 pub mod restlet;
+pub mod saved_search;
 pub mod suiteql;
 pub mod system;
 pub mod update;

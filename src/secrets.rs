@@ -25,6 +25,14 @@ pub struct CachedToken {
     pub expires_at_epoch: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TbaSecrets {
+    pub consumer_key: String,
+    pub consumer_secret: String,
+    pub token_id: Option<String>,
+    pub token_secret: Option<String>,
+}
+
 impl CachedToken {
     const LEEWAY_SECONDS: u64 = 60;
 
@@ -40,6 +48,9 @@ pub trait SecretStore: Send + Sync {
     fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError>;
     fn set_token(&self, alias: &str, token: &CachedToken) -> Result<(), CliError>;
     fn delete_token(&self, alias: &str) -> Result<(), CliError>;
+    fn get_tba(&self, alias: &str) -> Result<Option<TbaSecrets>, CliError>;
+    fn set_tba(&self, alias: &str, secrets: &TbaSecrets) -> Result<(), CliError>;
+    fn delete_tba(&self, alias: &str) -> Result<(), CliError>;
 }
 
 pub struct KeyringStore;
@@ -92,7 +103,8 @@ impl SecretStore for KeyringStore {
     }
     fn delete(&self, alias: &str) -> Result<(), CliError> {
         KeyringStore::remove(alias)?;
-        KeyringStore::remove(&format!("{alias}#token"))
+        KeyringStore::remove(&format!("{alias}#token"))?;
+        KeyringStore::remove(&format!("{alias}#tba"))
     }
     fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError> {
         KeyringStore::read(&format!("{alias}#token"))
@@ -102,6 +114,15 @@ impl SecretStore for KeyringStore {
     }
     fn delete_token(&self, alias: &str) -> Result<(), CliError> {
         KeyringStore::remove(&format!("{alias}#token"))
+    }
+    fn get_tba(&self, alias: &str) -> Result<Option<TbaSecrets>, CliError> {
+        KeyringStore::read(&format!("{alias}#tba"))
+    }
+    fn set_tba(&self, alias: &str, secrets: &TbaSecrets) -> Result<(), CliError> {
+        KeyringStore::write(&format!("{alias}#tba"), secrets)
+    }
+    fn delete_tba(&self, alias: &str) -> Result<(), CliError> {
+        KeyringStore::remove(&format!("{alias}#tba"))
     }
 }
 
@@ -140,6 +161,7 @@ impl SecretStore for MemoryStore {
         let mut entries = self.entries.lock().unwrap();
         entries.remove(alias);
         entries.remove(&format!("{alias}#token"));
+        entries.remove(&format!("{alias}#tba"));
         Ok(())
     }
     fn get_token(&self, alias: &str) -> Result<Option<CachedToken>, CliError> {
@@ -153,6 +175,16 @@ impl SecretStore for MemoryStore {
             .lock()
             .unwrap()
             .remove(&format!("{alias}#token"));
+        Ok(())
+    }
+    fn get_tba(&self, alias: &str) -> Result<Option<TbaSecrets>, CliError> {
+        self.read(&format!("{alias}#tba"))
+    }
+    fn set_tba(&self, alias: &str, secrets: &TbaSecrets) -> Result<(), CliError> {
+        self.write(&format!("{alias}#tba"), secrets)
+    }
+    fn delete_tba(&self, alias: &str) -> Result<(), CliError> {
+        self.entries.lock().unwrap().remove(&format!("{alias}#tba"));
         Ok(())
     }
 }
@@ -202,5 +234,51 @@ mod tests {
         };
         assert!(live.is_valid_at(now));
         assert!(!stale.is_valid_at(now)); // 60s leeway
+    }
+
+    #[test]
+    fn tba_secrets_round_trip_and_are_removed_with_the_account() {
+        let store = MemoryStore::default();
+        assert!(store.get_tba("demo").unwrap().is_none());
+
+        let tba = TbaSecrets {
+            consumer_key: "consumerkey123".into(),
+            consumer_secret: "consumersecret789".into(),
+            token_id: None,
+            token_secret: None,
+        };
+        store.set_tba("demo", &tba).unwrap();
+        let stored = store.get_tba("demo").unwrap().expect("stored");
+        assert_eq!(stored.consumer_key, "consumerkey123");
+        assert!(stored.token_id.is_none());
+
+        let minted = TbaSecrets {
+            token_id: Some("tokenid456".into()),
+            token_secret: Some("tokensecret012".into()),
+            ..tba
+        };
+        store.set_tba("demo", &minted).unwrap();
+        assert_eq!(
+            store.get_tba("demo").unwrap().unwrap().token_id.as_deref(),
+            Some("tokenid456")
+        );
+
+        // account removal must sweep the TBA entry too
+        store.delete("demo").unwrap();
+        assert!(store.get_tba("demo").unwrap().is_none());
+
+        store
+            .set_tba(
+                "demo",
+                &TbaSecrets {
+                    consumer_key: "k".into(),
+                    consumer_secret: "s".into(),
+                    token_id: None,
+                    token_secret: None,
+                },
+            )
+            .unwrap();
+        store.delete_tba("demo").unwrap();
+        assert!(store.get_tba("demo").unwrap().is_none());
     }
 }

@@ -1,0 +1,1662 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saved-Search via SOAP + TBA — Implementation Plan (2026-07-14)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e3; --warn-border:#e6c98a; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:920px; padding:2.5rem 1.5rem 4rem; font:15px/1.55 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); }
+  h1 { font-size:1.55rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2.2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h2.task { background:var(--accent-soft); padding:.45rem .7rem; border-radius:8px; border-bottom:none; }
+  h3 { font-size:1.02rem; margin:1.2rem 0 .4rem; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.2rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em; }
+  code { background:var(--code-bg); padding:.1em .3em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.8rem 1rem; overflow-x:auto; line-height:1.45; }
+  .callout { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+  ul.step { list-style:none; padding-left:0; } ul.step li { margin:.6rem 0; }
+  ul { padding-left:1.3rem; }
+  details { margin:.6rem 0; } summary { cursor:pointer; font-weight:600; }
+</style>
+</head>
+<body>
+
+<h1>Saved-Search Execution via SOAP + TBA — Implementation Plan</h1>
+<div class="meta">2026-07-14 · Executes <code>docs/superpowers/specs/2026-07-14-soap-saved-search-design.html</code> · Branch: <code>feature/saved-search-soap</code> (create from <code>main</code>)</div>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: superpowers:subagent-driven-development (recommended) or superpowers:executing-plans, task-by-task with checkboxes.</div>
+
+<div class="callout" style="background:var(--accent-soft); border-color:var(--accent);">
+  <strong>Execution choice:</strong>&nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-Driven" target="_blank"><strong>Subagent-Driven (recommended)</strong></a> — fresh subagent per task, review between tasks &nbsp;·&nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline%20Execution" target="_blank"><strong>Inline Execution</strong></a> — this session, batch with checkpoints &nbsp;·&nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=review&amp;l=Review%20plan%20first" target="_blank"><strong>I'll review the plan first</strong></a>
+</div>
+
+<p><strong>Goal:</strong> <code>netsuite-cli saved-search run &lt;id&gt; --type &lt;recordtype&gt;</code> executes a NetSuite saved search over SuiteTalk SOAP (<code>search</code>/<code>searchMoreWithId</code>), authenticated by TBA tokens minted through a browser flow (<code>account soap-auth</code>), with rows flattened to JSON.</p>
+<p><strong>Architecture:</strong> A self-contained <code>src/soap/</code> module (hand-rolled envelopes, quick-xml parsing, static record-type table) plus <code>src/auth/tba.rs</code> (OAuth 1.0a signing + three-step browser flow reusing a generalized loopback listener extracted from <code>authcode.rs</code>). TBA credentials live in a new keyring entry per alias (<code>{alias}#tba</code>); nothing touches the existing REST client, providers, or exit-code contract. The consumer key/secret come from env vars, the keyring, or an interactive prompt — never from the binary.</p>
+<p><strong>Tech stack:</strong> Rust, clap v4 (derive), reqwest, quick-xml (new), hmac (new), rpassword (new), wiremock tests.</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li>No Creative Planning identifiers (account IDs, aliases, URLs, saved-search ids) in any repo artifact — placeholder/demo values only (<code>1234567_SB1</code>, <code>demo</code>, <code>customsearch_example</code>).</li>
+  <li>Gate before every commit: <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code>. All must pass.</li>
+  <li>Commits end with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>.</li>
+  <li>Output contract untouched: JSON-only stdout, JSON errors on stderr, exit codes Api=1, Usage=2, Auth=3, Network=4 (see <code>src/error.rs</code>). No new error kinds.</li>
+  <li>WSDL version pinned to <code>2025_2</code> in every namespace URN and the endpoint path.</li>
+  <li>House style: descriptive names (never single letters), top-down function ordering, comments only where genuinely non-obvious, no <code>as unknown as</code>-style escape hatches (Rust equivalent: no <code>unsafe</code>, no <code>unwrap()</code> outside tests unless provably infallible with an <code>expect</code> message saying why).</li>
+  <li>Every <code>after_help</code> example must be copy-paste correct (SKILL.md promises this).</li>
+  <li>The consumer secret must never appear in argv (no <code>--consumer-secret</code> flag — it would leak into shell history and <code>ps</code>); env var or hidden prompt only.</li>
+</ul>
+
+<h2>File structure</h2>
+<ul>
+  <li><code>src/soap/mod.rs</code> — NEW: <code>SoapClient</code> (endpoint build, POST + SOAPAction, fault/status → <code>CliError</code>).</li>
+  <li><code>src/soap/search_types.rs</code> — NEW: static 95-entry record-type table + <code>lookup</code>.</li>
+  <li><code>src/soap/envelope.rs</code> — NEW: XML escaping, <code>tokenPassport</code>/<code>searchPreferences</code> headers, <code>search</code>/<code>searchMoreWithId</code> envelopes.</li>
+  <li><code>src/soap/parse.rs</code> — NEW: quick-xml response parsing (fault, status, pagination metadata, generic row flattening).</li>
+  <li><code>src/auth/tba.rs</code> — NEW: percent-encoding, OAuth 1.0a + tokenPassport HMAC signing, three-step flow, callback parsing.</li>
+  <li><code>src/auth/loopback.rs</code> — NEW: HTTPS loopback listener extracted from <code>authcode.rs</code>, generic over the query parser.</li>
+  <li><code>src/auth/authcode.rs</code> — MODIFY: delegate to <code>loopback.rs</code>; public API and behavior unchanged.</li>
+  <li><code>src/secrets.rs</code> — MODIFY: <code>TbaSecrets</code> struct + <code>get_tba/set_tba/delete_tba</code> on <code>SecretStore</code>; <code>delete</code> also removes <code>{alias}#tba</code>.</li>
+  <li><code>src/commands/saved_search.rs</code> — NEW: <code>run</code> (type lookup, id-attribute selection, page loop, output shaping).</li>
+  <li><code>src/commands/account.rs</code> — MODIFY: <code>soap_auth</code> + consumer-pair resolution.</li>
+  <li><code>src/cli.rs</code> — MODIFY: <code>Command::SavedSearch</code>, <code>AccountAction::SoapAuth</code>, dispatch, <code>ensure_tba_token</code> auto-auth helper.</li>
+  <li><code>src/lib.rs</code>, <code>src/commands/mod.rs</code>, <code>src/auth/mod.rs</code> — MODIFY: module registrations.</li>
+  <li><code>tests/saved_search_commands.rs</code> — NEW wiremock suite (SOAP dispatch, paging, faults).</li>
+  <li><code>tests/tba_auth.rs</code> — NEW wiremock suite (request/access token steps).</li>
+  <li><code>tests/live_smoke.rs</code> — add 2 gated live tests.</li>
+  <li><code>Cargo.toml</code> — add <code>quick-xml = "0.37"</code>, <code>hmac = "0.12"</code>, <code>rpassword = "7"</code>.</li>
+  <li><code>README.md</code>, <code>skills/netsuite-cli/SKILL.md</code> — documentation.</li>
+</ul>
+
+<div class="callout"><strong>Setup step before Task 1:</strong> <code>git checkout -b feature/saved-search-soap</code> (the spec commits are already on <code>main</code>).</div>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 1: <code>TbaSecrets</code> storage in <code>src/secrets.rs</code></h2>
+<p><strong>Files:</strong> Modify <code>src/secrets.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub struct TbaSecrets {
+    pub consumer_key: String,
+    pub consumer_secret: String,
+    pub token_id: Option&lt;String&gt;,
+    pub token_secret: Option&lt;String&gt;,
+}
+// on trait SecretStore (implemented by KeyringStore and MemoryStore):
+fn get_tba(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;TbaSecrets&gt;, CliError&gt;;
+fn set_tba(&amp;self, alias: &amp;str, secrets: &amp;TbaSecrets) -&gt; Result&lt;(), CliError&gt;;
+fn delete_tba(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt;;</pre>
+<p>The token pair is <code>Option</code> because the consumer pair can be stored (prompted) before the browser flow has minted a token. Keyring key: <code>{alias}#tba</code> (mirrors the <code>{alias}#token</code> convention).</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Write the failing test</strong> — in the existing <code>mod tests</code> of <code>src/secrets.rs</code>:
+<pre>#[test]
+fn tba_secrets_round_trip_and_are_removed_with_the_account() {
+    let store = MemoryStore::default();
+    assert!(store.get_tba("demo").unwrap().is_none());
+
+    let tba = TbaSecrets {
+        consumer_key: "consumerkey123".into(),
+        consumer_secret: "consumersecret789".into(),
+        token_id: None,
+        token_secret: None,
+    };
+    store.set_tba("demo", &amp;tba).unwrap();
+    let stored = store.get_tba("demo").unwrap().expect("stored");
+    assert_eq!(stored.consumer_key, "consumerkey123");
+    assert!(stored.token_id.is_none());
+
+    let minted = TbaSecrets {
+        token_id: Some("tokenid456".into()),
+        token_secret: Some("tokensecret012".into()),
+        ..tba
+    };
+    store.set_tba("demo", &amp;minted).unwrap();
+    assert_eq!(
+        store.get_tba("demo").unwrap().unwrap().token_id.as_deref(),
+        Some("tokenid456")
+    );
+
+    // account removal must sweep the TBA entry too
+    store.delete("demo").unwrap();
+    assert!(store.get_tba("demo").unwrap().is_none());
+
+    store.set_tba("demo", &amp;TbaSecrets {
+        consumer_key: "k".into(), consumer_secret: "s".into(),
+        token_id: None, token_secret: None,
+    }).unwrap();
+    store.delete_tba("demo").unwrap();
+    assert!(store.get_tba("demo").unwrap().is_none());
+}</pre></li>
+<li>☐ <strong>Step 2: Run it, verify it fails</strong> — <code>cargo test tba_secrets_round_trip</code> → compile error: no <code>TbaSecrets</code>, no <code>get_tba</code>.</li>
+<li>☐ <strong>Step 3: Implement</strong> — add to <code>src/secrets.rs</code>: the derive block matches <code>AccountSecrets</code> (<code>#[derive(Debug, Clone, Serialize, Deserialize)]</code>, no serde tag needed — it is a plain struct). Add the three methods to the <code>SecretStore</code> trait and both impls:
+<pre>// KeyringStore
+fn get_tba(&amp;self, alias: &amp;str) -&gt; Result&lt;Option&lt;TbaSecrets&gt;, CliError&gt; {
+    KeyringStore::read(&amp;format!("{alias}#tba"))
+}
+fn set_tba(&amp;self, alias: &amp;str, secrets: &amp;TbaSecrets) -&gt; Result&lt;(), CliError&gt; {
+    KeyringStore::write(&amp;format!("{alias}#tba"), secrets)
+}
+fn delete_tba(&amp;self, alias: &amp;str) -&gt; Result&lt;(), CliError&gt; {
+    KeyringStore::remove(&amp;format!("{alias}#tba"))
+}
+// and extend KeyringStore::delete to also remove "{alias}#tba"
+// MemoryStore: same via its read/write helpers; extend its delete likewise</pre></li>
+<li>☐ <strong>Step 4: Gate</strong> — <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> → all green.</li>
+<li>☐ <strong>Step 5: Commit</strong> — <code>git add src/secrets.rs &amp;&amp; git commit -m "feat: TBA secret storage per account alias"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 2: record-type table — <code>src/soap/search_types.rs</code></h2>
+<p><strong>Files:</strong> Create <code>src/soap/search_types.rs</code>, <code>src/soap/mod.rs</code> (module shell) · Modify <code>src/lib.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub struct SearchType {
+    pub xsi_type: &amp;'static str,   // e.g. "TransactionSearchAdvanced"
+    pub namespace: &amp;'static str,  // e.g. "urn:sales_2025_2.transactions.webservices.netsuite.com"
+}
+pub fn lookup(record_type: &amp;str) -&gt; Option&lt;SearchType&gt;   // case-insensitive
+pub fn known_type_names() -&gt; String                        // comma-joined, for usage errors</pre>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> (in <code>search_types.rs</code>'s own <code>mod tests</code>):
+<pre>#[test]
+fn lookup_maps_cli_names_to_xsi_types_and_namespaces() {
+    let transaction = lookup("transaction").expect("known type");
+    assert_eq!(transaction.xsi_type, "TransactionSearchAdvanced");
+    assert_eq!(transaction.namespace, "urn:sales_2025_2.transactions.webservices.netsuite.com");
+
+    let custom = lookup("CustomRecord").expect("case-insensitive");
+    assert_eq!(custom.xsi_type, "CustomRecordSearchAdvanced");
+    assert_eq!(custom.namespace, "urn:customization_2025_2.setup.webservices.netsuite.com");
+
+    assert!(lookup("nonsense").is_none());
+    assert_eq!(SEARCH_TYPES.len(), 95);
+}
+
+#[test]
+fn known_type_names_lists_all_alphabetically() {
+    let names = known_type_names();
+    assert!(names.starts_with("account, accountingperiod"));
+    assert!(names.ends_with("winlossreason"));
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure</strong> — <code>cargo test --lib search_types</code> → module does not exist.</li>
+<li>☐ <strong>Step 3: Implement</strong> — <code>src/soap/mod.rs</code> starts as just <code>pub mod search_types;</code>; register <code>pub mod soap;</code> in <code>src/lib.rs</code>. Table is generated from the 2025.2 XSDs (generation note goes in a doc comment: <em>grep <code>complexType name="*SearchAdvanced"</code> across the XSDs at <code>https://webservices.netsuite.com/xsd/&lt;module&gt;/v2025_2_0/*.xsd</code>, cli name = lowercased type minus the suffix, namespace = the XSD's <code>targetNamespace</code></em>). Full table — copy verbatim:
+<details><summary>Complete <code>SEARCH_TYPES</code> table (95 entries)</summary>
+<pre>const SEARCH_TYPES: &amp;[(&amp;str, &amp;str, &amp;str)] = &amp;[
+    ("account", "AccountSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("accountingperiod", "AccountingPeriodSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("accountingtransaction", "AccountingTransactionSearchAdvanced", "urn:sales_2025_2.transactions.webservices.netsuite.com"),
+    ("billingaccount", "BillingAccountSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("billingschedule", "BillingScheduleSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("bin", "BinSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("bom", "BomSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("bomrevision", "BomRevisionSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("budget", "BudgetSearchAdvanced", "urn:financial_2025_2.transactions.webservices.netsuite.com"),
+    ("calendarevent", "CalendarEventSearchAdvanced", "urn:scheduling_2025_2.activities.webservices.netsuite.com"),
+    ("campaign", "CampaignSearchAdvanced", "urn:marketing_2025_2.lists.webservices.netsuite.com"),
+    ("charge", "ChargeSearchAdvanced", "urn:customers_2025_2.transactions.webservices.netsuite.com"),
+    ("classification", "ClassificationSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("consolidatedexchangerate", "ConsolidatedExchangeRateSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("contact", "ContactSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("contactcategory", "ContactCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("contactrole", "ContactRoleSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("costcategory", "CostCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("couponcode", "CouponCodeSearchAdvanced", "urn:marketing_2025_2.lists.webservices.netsuite.com"),
+    ("currencyrate", "CurrencyRateSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("customer", "CustomerSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("customercategory", "CustomerCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("customermessage", "CustomerMessageSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("customerstatus", "CustomerStatusSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("customersubsidiaryrelationship", "CustomerSubsidiaryRelationshipSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("customlist", "CustomListSearchAdvanced", "urn:customization_2025_2.setup.webservices.netsuite.com"),
+    ("customrecord", "CustomRecordSearchAdvanced", "urn:customization_2025_2.setup.webservices.netsuite.com"),
+    ("department", "DepartmentSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("employee", "EmployeeSearchAdvanced", "urn:employees_2025_2.lists.webservices.netsuite.com"),
+    ("entitygroup", "EntityGroupSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("expensecategory", "ExpenseCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("fairvalueprice", "FairValuePriceSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("file", "FileSearchAdvanced", "urn:filecabinet_2025_2.documents.webservices.netsuite.com"),
+    ("folder", "FolderSearchAdvanced", "urn:filecabinet_2025_2.documents.webservices.netsuite.com"),
+    ("giftcertificate", "GiftCertificateSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("globalaccountmapping", "GlobalAccountMappingSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("hcmjob", "HcmJobSearchAdvanced", "urn:employees_2025_2.lists.webservices.netsuite.com"),
+    ("inboundshipment", "InboundShipmentSearchAdvanced", "urn:purchases_2025_2.transactions.webservices.netsuite.com"),
+    ("inventorynumber", "InventoryNumberSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("issue", "IssueSearchAdvanced", "urn:support_2025_2.lists.webservices.netsuite.com"),
+    ("item", "ItemSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("itemaccountmapping", "ItemAccountMappingSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("itemdemandplan", "ItemDemandPlanSearchAdvanced", "urn:demandplanning_2025_2.transactions.webservices.netsuite.com"),
+    ("itemrevision", "ItemRevisionSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("itemsupplyplan", "ItemSupplyPlanSearchAdvanced", "urn:demandplanning_2025_2.transactions.webservices.netsuite.com"),
+    ("job", "JobSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("jobstatus", "JobStatusSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("jobtype", "JobTypeSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("location", "LocationSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("manufacturingcosttemplate", "ManufacturingCostTemplateSearchAdvanced", "urn:supplychain_2025_2.lists.webservices.netsuite.com"),
+    ("manufacturingoperationtask", "ManufacturingOperationTaskSearchAdvanced", "urn:supplychain_2025_2.lists.webservices.netsuite.com"),
+    ("manufacturingrouting", "ManufacturingRoutingSearchAdvanced", "urn:supplychain_2025_2.lists.webservices.netsuite.com"),
+    ("merchandisehierarchynode", "MerchandiseHierarchyNodeSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("message", "MessageSearchAdvanced", "urn:communication_2025_2.general.webservices.netsuite.com"),
+    ("nexus", "NexusSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("note", "NoteSearchAdvanced", "urn:communication_2025_2.general.webservices.netsuite.com"),
+    ("notetype", "NoteTypeSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("opportunity", "OpportunitySearchAdvanced", "urn:sales_2025_2.transactions.webservices.netsuite.com"),
+    ("othernamecategory", "OtherNameCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("partner", "PartnerSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("partnercategory", "PartnerCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("paycheck", "PaycheckSearchAdvanced", "urn:employees_2025_2.transactions.webservices.netsuite.com"),
+    ("paymentinstrument", "PaymentInstrumentSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("paymentmethod", "PaymentMethodSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("paymentoption", "PaymentOptionSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("payrollitem", "PayrollItemSearchAdvanced", "urn:employees_2025_2.lists.webservices.netsuite.com"),
+    ("phonecall", "PhoneCallSearchAdvanced", "urn:scheduling_2025_2.activities.webservices.netsuite.com"),
+    ("pricelevel", "PriceLevelSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("pricinggroup", "PricingGroupSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("projecttask", "ProjectTaskSearchAdvanced", "urn:scheduling_2025_2.activities.webservices.netsuite.com"),
+    ("promotioncode", "PromotionCodeSearchAdvanced", "urn:marketing_2025_2.lists.webservices.netsuite.com"),
+    ("resourceallocation", "ResourceAllocationSearchAdvanced", "urn:scheduling_2025_2.activities.webservices.netsuite.com"),
+    ("revrecschedule", "RevRecScheduleSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("revrectemplate", "RevRecTemplateSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("salesrole", "SalesRoleSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("salestaxitem", "SalesTaxItemSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("sitecategory", "SiteCategorySearchAdvanced", "urn:website_2025_2.lists.webservices.netsuite.com"),
+    ("solution", "SolutionSearchAdvanced", "urn:support_2025_2.lists.webservices.netsuite.com"),
+    ("subsidiary", "SubsidiarySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("supportcase", "SupportCaseSearchAdvanced", "urn:support_2025_2.lists.webservices.netsuite.com"),
+    ("task", "TaskSearchAdvanced", "urn:scheduling_2025_2.activities.webservices.netsuite.com"),
+    ("taxgroup", "TaxGroupSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("taxtype", "TaxTypeSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("term", "TermSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("timebill", "TimeBillSearchAdvanced", "urn:employees_2025_2.transactions.webservices.netsuite.com"),
+    ("timeentry", "TimeEntrySearchAdvanced", "urn:employees_2025_2.transactions.webservices.netsuite.com"),
+    ("timesheet", "TimeSheetSearchAdvanced", "urn:employees_2025_2.transactions.webservices.netsuite.com"),
+    ("topic", "TopicSearchAdvanced", "urn:support_2025_2.lists.webservices.netsuite.com"),
+    ("transaction", "TransactionSearchAdvanced", "urn:sales_2025_2.transactions.webservices.netsuite.com"),
+    ("unitstype", "UnitsTypeSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("usage", "UsageSearchAdvanced", "urn:sales_2025_2.transactions.webservices.netsuite.com"),
+    ("vendor", "VendorSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("vendorcategory", "VendorCategorySearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+    ("vendorsubsidiaryrelationship", "VendorSubsidiaryRelationshipSearchAdvanced", "urn:relationships_2025_2.lists.webservices.netsuite.com"),
+    ("winlossreason", "WinLossReasonSearchAdvanced", "urn:accounting_2025_2.lists.webservices.netsuite.com"),
+];</pre>
+</details>
+Accessors:
+<pre>pub struct SearchType {
+    pub xsi_type: &amp;'static str,
+    pub namespace: &amp;'static str,
+}
+
+pub fn lookup(record_type: &amp;str) -&gt; Option&lt;SearchType&gt; {
+    let wanted = record_type.to_ascii_lowercase();
+    SEARCH_TYPES
+        .iter()
+        .find(|(cli_name, _, _)| *cli_name == wanted)
+        .map(|(_, xsi_type, namespace)| SearchType { xsi_type, namespace })
+}
+
+pub fn known_type_names() -&gt; String {
+    SEARCH_TYPES
+        .iter()
+        .map(|(cli_name, _, _)| *cli_name)
+        .collect::&lt;Vec&lt;_&gt;&gt;()
+        .join(", ")
+}</pre></li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: SOAP search record-type table (95 types from 2025.2 XSDs)"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 3: signing primitives — <code>src/auth/tba.rs</code> (part 1)</h2>
+<p><strong>Files:</strong> Create <code>src/auth/tba.rs</code> · Modify <code>src/auth/mod.rs</code> (add <code>pub mod tba;</code>), <code>Cargo.toml</code> (add <code>hmac = "0.12"</code>)</p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub fn percent_encode(raw: &amp;str) -&gt; String                      // RFC 3986 unreserved set
+pub fn generate_nonce() -&gt; String                                // 20 ASCII alphanumeric chars
+pub fn epoch_seconds() -&gt; u64
+pub fn hmac_sha256_base64(key: &amp;str, message: &amp;str) -&gt; String
+pub fn token_passport_signature(account_id, consumer_key, token_id, nonce,
+    timestamp: u64, consumer_secret, token_secret) -&gt; String     // all &amp;str except timestamp
+pub fn oauth_signature(http_method: &amp;str, url: &amp;str, params: &amp;[(&amp;str, String)],
+    consumer_secret: &amp;str, token_secret: &amp;str) -&gt; String         // token_secret "" for step 1
+pub fn oauth_authorization_header(params: &amp;[(&amp;str, String)], signature: &amp;str) -&gt; String</pre>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> — the expected signatures below are precomputed with Python's <code>hmac</code>/<code>hashlib</code> against the exact base-string/key rules in the spec; they pin the implementation:
+<pre>#[test]
+fn token_passport_signature_matches_reference_vector() {
+    // base string: account&amp;consumerKey&amp;token&amp;nonce&amp;timestamp
+    // key:         consumerSecret&amp;tokenSecret
+    let signature = token_passport_signature(
+        "1234567_SB1", "consumerkey123", "tokenid456",
+        "ABCDEFGHIJKLMNOPQRST", 1_700_000_000,
+        "consumersecret789", "tokensecret012",
+    );
+    assert_eq!(signature, "8VL7CiUwRAgjw1e1P/e6GkZsWf1Bmc6T3J+DXl7WLc0=");
+}
+
+#[test]
+fn oauth_signature_matches_reference_vector_for_request_token() {
+    let params = [
+        ("oauth_callback", "https://localhost:8899/callback".to_string()),
+        ("oauth_consumer_key", "consumerkey123".to_string()),
+        ("oauth_nonce", "ABCDEFGHIJKLMNOPQRST".to_string()),
+        ("oauth_signature_method", "HMAC-SHA256".to_string()),
+        ("oauth_timestamp", "1700000000".to_string()),
+        ("oauth_version", "1.0".to_string()),
+    ];
+    let signature = oauth_signature(
+        "POST",
+        "https://1234567-sb1.restlets.api.netsuite.com/rest/requesttoken",
+        &amp;params, "consumersecret789", "",
+    );
+    assert_eq!(signature, "5sgbCQr3mRLrl1Jgmkg/UnNLwzGofJ5jkktNvRVQlYE=");
+}
+
+#[test]
+fn oauth_signature_matches_reference_vector_for_access_token() {
+    let params = [
+        ("oauth_consumer_key", "consumerkey123".to_string()),
+        ("oauth_nonce", "ABCDEFGHIJKLMNOPQRST".to_string()),
+        ("oauth_signature_method", "HMAC-SHA256".to_string()),
+        ("oauth_timestamp", "1700000000".to_string()),
+        ("oauth_token", "reqtoken111".to_string()),
+        ("oauth_verifier", "verifier222".to_string()),
+        ("oauth_version", "1.0".to_string()),
+    ];
+    let signature = oauth_signature(
+        "POST",
+        "https://1234567-sb1.restlets.api.netsuite.com/rest/accesstoken",
+        &amp;params, "consumersecret789", "reqtokensecret333",
+    );
+    assert_eq!(signature, "lH8IsRMocNRdk2TflE43sLDNU0MYzbberQZJgokyLKI=");
+}
+
+#[test]
+fn percent_encoding_covers_rfc3986_reserved_characters() {
+    assert_eq!(percent_encode("https://x/y?a=b&amp;c"), "https%3A%2F%2Fx%2Fy%3Fa%3Db%26c");
+    assert_eq!(percent_encode("safe-._~AZaz09"), "safe-._~AZaz09");
+    assert_eq!(percent_encode("sp ace+plus"), "sp%20ace%2Bplus");
+}
+
+#[test]
+fn nonce_is_twenty_alphanumeric_characters() {
+    let nonce = generate_nonce();
+    assert_eq!(nonce.len(), 20);
+    assert!(nonce.chars().all(|ch| ch.is_ascii_alphanumeric()));
+    assert_ne!(generate_nonce(), nonce);
+}
+
+#[test]
+fn authorization_header_percent_encodes_values_and_appends_signature() {
+    let header = oauth_authorization_header(
+        &amp;[("oauth_consumer_key", "key/with/slash".to_string())],
+        "sig+base64=",
+    );
+    assert!(header.starts_with("OAuth "));
+    assert!(header.contains(r#"oauth_consumer_key="key%2Fwith%2Fslash""#));
+    assert!(header.ends_with(r#"oauth_signature="sig%2Bbase64%3D""#));
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong> — add <code>hmac = "0.12"</code> to Cargo.toml. Top-down in <code>tba.rs</code>:
+<pre>use base64::Engine;
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use sha2::Sha256;
+
+pub fn token_passport_signature(
+    account_id: &amp;str, consumer_key: &amp;str, token_id: &amp;str,
+    nonce: &amp;str, timestamp: u64,
+    consumer_secret: &amp;str, token_secret: &amp;str,
+) -&gt; String {
+    let base_string = format!("{account_id}&amp;{consumer_key}&amp;{token_id}&amp;{nonce}&amp;{timestamp}");
+    let signing_key = format!("{consumer_secret}&amp;{token_secret}");
+    hmac_sha256_base64(&amp;signing_key, &amp;base_string)
+}
+
+pub fn oauth_signature(
+    http_method: &amp;str, url: &amp;str, params: &amp;[(&amp;str, String)],
+    consumer_secret: &amp;str, token_secret: &amp;str,
+) -&gt; String {
+    let mut sorted_params: Vec&lt;(&amp;str, &amp;str)&gt; = params
+        .iter().map(|(name, value)| (*name, value.as_str())).collect();
+    sorted_params.sort();
+    let parameter_string = sorted_params
+        .iter()
+        .map(|(name, value)| format!("{}={}", percent_encode(name), percent_encode(value)))
+        .collect::&lt;Vec&lt;_&gt;&gt;()
+        .join("&amp;");
+    let base_string = format!(
+        "{http_method}&amp;{}&amp;{}",
+        percent_encode(url), percent_encode(&amp;parameter_string)
+    );
+    let signing_key = format!(
+        "{}&amp;{}",
+        percent_encode(consumer_secret), percent_encode(token_secret)
+    );
+    hmac_sha256_base64(&amp;signing_key, &amp;base_string)
+}
+
+pub fn oauth_authorization_header(params: &amp;[(&amp;str, String)], signature: &amp;str) -&gt; String {
+    let mut header_params: Vec&lt;String&gt; = params
+        .iter()
+        .map(|(name, value)| format!(r#"{}="{}""#, name, percent_encode(value)))
+        .collect();
+    header_params.push(format!(r#"oauth_signature="{}""#, percent_encode(signature)));
+    format!("OAuth {}", header_params.join(", "))
+}
+
+pub fn hmac_sha256_base64(key: &amp;str, message: &amp;str) -&gt; String {
+    let mut mac = Hmac::&lt;Sha256&gt;::new_from_slice(key.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(message.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+pub fn percent_encode(raw: &amp;str) -&gt; String {
+    raw.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' =&gt; {
+                (byte as char).to_string()
+            }
+            _ =&gt; format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+pub fn generate_nonce() -&gt; String {
+    const CHARSET: &amp;[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    (0..20).map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char).collect()
+}
+
+pub fn epoch_seconds() -&gt; u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after 1970")
+        .as_secs()
+}</pre></li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: OAuth 1.0a and tokenPassport HMAC-SHA256 signing"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 4: envelopes — <code>src/soap/envelope.rs</code></h2>
+<p><strong>Files:</strong> Create <code>src/soap/envelope.rs</code> · Modify <code>src/soap/mod.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub struct TokenPassport {          // pre-signed field bundle; signing stays in auth::tba
+    pub account_id: String,
+    pub consumer_key: String,
+    pub token_id: String,
+    pub nonce: String,
+    pub timestamp: u64,
+    pub signature: String,
+}
+pub fn xml_escape(raw: &amp;str) -&gt; String
+pub fn search_envelope(passport: &amp;TokenPassport, page_size: u64,
+    search_type: &amp;SearchType, id_attribute: &amp;str, saved_search_id: &amp;str) -&gt; String
+pub fn search_more_envelope(passport: &amp;TokenPassport, search_id: &amp;str, page_index: u64) -&gt; String</pre>
+<p><code>id_attribute</code> is either <code>"savedSearchId"</code> or <code>"savedSearchScriptId"</code> (selection happens in the command layer, Task 7). Element facts from the 2025.2 WSDL/XSDs: header elements <code>tokenPassport</code>/<code>searchPreferences</code> live in the <em>messages</em> namespace, TokenPassport children in the <em>core</em> namespace; <code>SearchPreferences</code> child order is <code>bodyFieldsOnly, returnSearchColumns, pageSize</code>; <code>signature</code> carries a required <code>algorithm</code> attribute (<code>HMAC-SHA256</code>).</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong>:
+<pre>fn demo_passport() -&gt; TokenPassport {
+    TokenPassport {
+        account_id: "1234567_SB1".into(), consumer_key: "consumerkey123".into(),
+        token_id: "tokenid456".into(), nonce: "ABCDEFGHIJKLMNOPQRST".into(),
+        timestamp: 1_700_000_000, signature: "SIG=".into(),
+    }
+}
+
+#[test]
+fn search_envelope_contains_passport_preferences_and_typed_search_record() {
+    let search_type = crate::soap::search_types::lookup("transaction").unwrap();
+    let envelope = search_envelope(&amp;demo_passport(), 1000, &amp;search_type, "savedSearchId", "57");
+    for expected in [
+        r#"&lt;tokenPassport xmlns="urn:messages_2025_2.platform.webservices.netsuite.com""#,
+        r#"xmlns:core="urn:core_2025_2.platform.webservices.netsuite.com""#,
+        "&lt;core:account&gt;1234567_SB1&lt;/core:account&gt;",
+        "&lt;core:consumerKey&gt;consumerkey123&lt;/core:consumerKey&gt;",
+        "&lt;core:token&gt;tokenid456&lt;/core:token&gt;",
+        "&lt;core:nonce&gt;ABCDEFGHIJKLMNOPQRST&lt;/core:nonce&gt;",
+        "&lt;core:timestamp&gt;1700000000&lt;/core:timestamp&gt;",
+        r#"&lt;core:signature algorithm="HMAC-SHA256"&gt;SIG=&lt;/core:signature&gt;"#,
+        "&lt;bodyFieldsOnly&gt;true&lt;/bodyFieldsOnly&gt;",
+        "&lt;returnSearchColumns&gt;true&lt;/returnSearchColumns&gt;",
+        "&lt;pageSize&gt;1000&lt;/pageSize&gt;",
+        r#"&lt;search xmlns="urn:messages_2025_2.platform.webservices.netsuite.com"&gt;"#,
+        r#"xmlns:q1="urn:sales_2025_2.transactions.webservices.netsuite.com""#,
+        r#"xsi:type="q1:TransactionSearchAdvanced""#,
+        r#"savedSearchId="57""#,
+    ] {
+        assert!(envelope.contains(expected), "missing {expected} in:\n{envelope}");
+    }
+}
+
+#[test]
+fn search_envelope_escapes_attribute_and_text_values() {
+    let search_type = crate::soap::search_types::lookup("customer").unwrap();
+    let mut passport = demo_passport();
+    passport.account_id = r#"A&amp;B&lt;"quote""#.into();
+    let envelope = search_envelope(&amp;passport, 5, &amp;search_type, "savedSearchScriptId", r#"custom"search&amp;"#);
+    assert!(envelope.contains("&lt;core:account&gt;A&amp;amp;B&amp;lt;&amp;quot;quote&amp;quot;&lt;/core:account&gt;"));
+    assert!(envelope.contains(r#"savedSearchScriptId="custom&amp;quot;search&amp;amp;""#));
+}
+
+#[test]
+fn search_more_envelope_carries_search_id_and_page_index() {
+    let envelope = search_more_envelope(&amp;demo_passport(), "WEBSERVICES_1234567", 3);
+    assert!(envelope.contains("&lt;searchId&gt;WEBSERVICES_1234567&lt;/searchId&gt;"));
+    assert!(envelope.contains("&lt;pageIndex&gt;3&lt;/pageIndex&gt;"));
+    assert!(envelope.contains(r#"&lt;searchMoreWithId xmlns="urn:messages_2025_2.platform.webservices.netsuite.com"&gt;"#));
+    assert!(envelope.contains("&lt;core:signature"));
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong> (top-down; body builders share <code>envelope_with_body</code>):
+<pre>use crate::soap::search_types::SearchType;
+
+const MESSAGES_NS: &amp;str = "urn:messages_2025_2.platform.webservices.netsuite.com";
+const CORE_NS: &amp;str = "urn:core_2025_2.platform.webservices.netsuite.com";
+
+pub fn search_envelope(
+    passport: &amp;TokenPassport, page_size: u64,
+    search_type: &amp;SearchType, id_attribute: &amp;str, saved_search_id: &amp;str,
+) -&gt; String {
+    let body = format!(
+        r#"&lt;search xmlns="{MESSAGES_NS}"&gt;&lt;searchRecord xmlns:q1="{}" xsi:type="q1:{}" {}="{}"/&gt;&lt;/search&gt;"#,
+        search_type.namespace, search_type.xsi_type,
+        id_attribute, xml_escape(saved_search_id),
+    );
+    envelope_with_body(passport, page_size, &amp;body)
+}
+
+pub fn search_more_envelope(passport: &amp;TokenPassport, search_id: &amp;str, page_index: u64) -&gt; String {
+    let body = format!(
+        "&lt;searchMoreWithId xmlns=\"{MESSAGES_NS}\"&gt;&lt;searchId&gt;{}&lt;/searchId&gt;&lt;pageIndex&gt;{page_index}&lt;/pageIndex&gt;&lt;/searchMoreWithId&gt;",
+        xml_escape(search_id),
+    );
+    // searchMoreWithId reuses the pageSize fixed by the original search; the
+    // preferences header is still sent because NetSuite requires the header block.
+    envelope_with_body(passport, 0, &amp;body)
+}
+
+fn envelope_with_body(passport: &amp;TokenPassport, page_size: u64, body: &amp;str) -&gt; String {
+    let page_size_element = if page_size &gt; 0 {
+        format!("&lt;pageSize&gt;{page_size}&lt;/pageSize&gt;")
+    } else {
+        String::new()
+    };
+    format!(
+        concat!(
+            r#"&lt;?xml version="1.0" encoding="UTF-8"?&gt;"#,
+            r#"&lt;soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"&gt;"#,
+            "&lt;soap:Header&gt;",
+            r#"&lt;tokenPassport xmlns="{messages}" xmlns:core="{core}"&gt;"#,
+            "&lt;core:account&gt;{account}&lt;/core:account&gt;",
+            "&lt;core:consumerKey&gt;{consumer_key}&lt;/core:consumerKey&gt;",
+            "&lt;core:token&gt;{token}&lt;/core:token&gt;",
+            "&lt;core:nonce&gt;{nonce}&lt;/core:nonce&gt;",
+            "&lt;core:timestamp&gt;{timestamp}&lt;/core:timestamp&gt;",
+            r#"&lt;core:signature algorithm="HMAC-SHA256"&gt;{signature}&lt;/core:signature&gt;"#,
+            "&lt;/tokenPassport&gt;",
+            r#"&lt;searchPreferences xmlns="{messages}"&gt;"#,
+            "&lt;bodyFieldsOnly&gt;true&lt;/bodyFieldsOnly&gt;",
+            "&lt;returnSearchColumns&gt;true&lt;/returnSearchColumns&gt;",
+            "{page_size_element}",
+            "&lt;/searchPreferences&gt;",
+            "&lt;/soap:Header&gt;",
+            "&lt;soap:Body&gt;{body}&lt;/soap:Body&gt;",
+            "&lt;/soap:Envelope&gt;",
+        ),
+        messages = MESSAGES_NS, core = CORE_NS,
+        account = xml_escape(&amp;passport.account_id),
+        consumer_key = xml_escape(&amp;passport.consumer_key),
+        token = xml_escape(&amp;passport.token_id),
+        nonce = xml_escape(&amp;passport.nonce),
+        timestamp = passport.timestamp,
+        signature = xml_escape(&amp;passport.signature),
+        page_size_element = page_size_element,
+        body = body,
+    )
+}
+
+pub fn xml_escape(raw: &amp;str) -&gt; String {
+    raw.chars()
+        .map(|ch| match ch {
+            '&amp;' =&gt; "&amp;amp;".to_string(),
+            '&lt;' =&gt; "&amp;lt;".to_string(),
+            '&gt;' =&gt; "&amp;gt;".to_string(),
+            '"' =&gt; "&amp;quot;".to_string(),
+            '\'' =&gt; "&amp;apos;".to_string(),
+            other =&gt; other.to_string(),
+        })
+        .collect()
+}</pre>
+Note <code>concat!</code> with <code>format!</code> named args keeps the template readable; if the duplicate-brace escaping gets awkward, plain <code>format!</code> with one long literal is fine too — the tests pin the output either way.</li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: SOAP search envelopes with tokenPassport header"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 5: response parsing — <code>src/soap/parse.rs</code></h2>
+<p><strong>Files:</strong> Create <code>src/soap/parse.rs</code> · Modify <code>src/soap/mod.rs</code>, <code>Cargo.toml</code> (add <code>quick-xml = "0.37"</code>)</p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub struct SoapSearchResult {
+    pub total_records: u64,
+    pub page_size: u64,
+    pub total_pages: u64,
+    pub page_index: u64,
+    pub search_id: String,
+    pub rows: Vec&lt;serde_json::Value&gt;,
+}
+pub fn parse_search_response(xml: &amp;str) -&gt; Result&lt;SoapSearchResult, CliError&gt;</pre>
+<p>Behavior: SOAP <code>Fault</code> → <code>CliError</code> (Auth if the fault message/code mentions credentials/login, else Api status 500). <code>&lt;status isSuccess="false"&gt;</code> → <code>CliError</code> (Auth if any <code>statusDetail code</code> starts with <code>INVALID_LOGIN</code> or equals <code>INSUFFICIENT_PERMISSION</code>, else Api status 200 with code+message). Row flattening rules exactly per spec §5: key = field's local element name; joins prefixed with the join element name minus the <code>Join</code> suffix + <code>.</code>; value = <code>internalId</code> attribute if present on <code>searchValue</code>, else its text; repeated <code>searchValue</code> → JSON array; <code>customField</code> keyed by its <code>scriptId</code> attribute. All values stay JSON strings.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> — canned XML mirrors real NetSuite responses (namespace prefixes intentionally varied to prove parsing is local-name-based):
+<pre>const HAPPY_RESPONSE: &amp;str = r#"&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"&gt;
+ &lt;soapenv:Body&gt;
+  &lt;searchResponse xmlns="urn:messages_2025_2.platform.webservices.netsuite.com"&gt;
+   &lt;platformCore:searchResult xmlns:platformCore="urn:core_2025_2.platform.webservices.netsuite.com"&gt;
+    &lt;platformCore:status isSuccess="true"/&gt;
+    &lt;platformCore:totalRecords&gt;3&lt;/platformCore:totalRecords&gt;
+    &lt;platformCore:pageSize&gt;2&lt;/platformCore:pageSize&gt;
+    &lt;platformCore:totalPages&gt;2&lt;/platformCore:totalPages&gt;
+    &lt;platformCore:pageIndex&gt;1&lt;/platformCore:pageIndex&gt;
+    &lt;platformCore:searchId&gt;WEBSERVICES_1234567_ABC&lt;/platformCore:searchId&gt;
+    &lt;platformCore:searchRowList&gt;
+     &lt;platformCore:searchRow xmlns:tranSales="urn:sales_2025_2.transactions.webservices.netsuite.com" xsi:type="tranSales:TransactionSearchRow" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"&gt;
+      &lt;tranSales:basic xmlns:platformCommon="urn:common_2025_2.platform.webservices.netsuite.com"&gt;
+       &lt;platformCommon:tranId&gt;&lt;platformCore:searchValue&gt;INV-1001&lt;/platformCore:searchValue&gt;&lt;/platformCommon:tranId&gt;
+       &lt;platformCommon:entity&gt;&lt;platformCore:searchValue internalId="55"/&gt;&lt;/platformCommon:entity&gt;
+       &lt;platformCommon:otherRefNum&gt;
+        &lt;platformCore:searchValue&gt;PO-1&lt;/platformCore:searchValue&gt;
+        &lt;platformCore:searchValue&gt;PO-2&lt;/platformCore:searchValue&gt;
+       &lt;/platformCommon:otherRefNum&gt;
+       &lt;platformCommon:customFieldList xmlns:platformCore="urn:core_2025_2.platform.webservices.netsuite.com"&gt;
+        &lt;platformCore:customField scriptId="custbody_example" xsi:type="platformCore:SearchColumnStringCustomField"&gt;
+         &lt;platformCore:searchValue&gt;hello&lt;/platformCore:searchValue&gt;
+        &lt;/platformCore:customField&gt;
+       &lt;/platformCommon:customFieldList&gt;
+      &lt;/tranSales:basic&gt;
+      &lt;tranSales:customerJoin xmlns:platformCommon="urn:common_2025_2.platform.webservices.netsuite.com"&gt;
+       &lt;platformCommon:email&gt;&lt;platformCore:searchValue&gt;a@example.com&lt;/platformCore:searchValue&gt;&lt;/platformCommon:email&gt;
+      &lt;/tranSales:customerJoin&gt;
+     &lt;/platformCore:searchRow&gt;
+    &lt;/platformCore:searchRowList&gt;
+   &lt;/platformCore:searchResult&gt;
+  &lt;/searchResponse&gt;
+ &lt;/soapenv:Body&gt;
+&lt;/soapenv:Envelope&gt;"#;
+
+#[test]
+fn parses_metadata_and_flattens_rows() {
+    let result = parse_search_response(HAPPY_RESPONSE).unwrap();
+    assert_eq!(result.total_records, 3);
+    assert_eq!(result.total_pages, 2);
+    assert_eq!(result.page_index, 1);
+    assert_eq!(result.page_size, 2);
+    assert_eq!(result.search_id, "WEBSERVICES_1234567_ABC");
+    assert_eq!(result.rows.len(), 1);
+    let row = &amp;result.rows[0];
+    assert_eq!(row["tranId"], "INV-1001");
+    assert_eq!(row["entity"], "55");                       // RecordRef internalId
+    assert_eq!(row["otherRefNum"], serde_json::json!(["PO-1", "PO-2"]));
+    assert_eq!(row["custbody_example"], "hello");          // custom field by scriptId
+    assert_eq!(row["customer.email"], "a@example.com");    // join prefix, "Join" stripped
+}
+
+#[test]
+fn unsuccessful_status_maps_to_api_error_with_netsuite_code() {
+    let xml = r#"&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"&gt;&lt;soapenv:Body&gt;
+      &lt;searchResponse xmlns="urn:messages_2025_2.platform.webservices.netsuite.com"&gt;
+       &lt;searchResult xmlns="urn:core_2025_2.platform.webservices.netsuite.com"&gt;
+        &lt;status isSuccess="false"&gt;
+         &lt;statusDetail type="ERROR"&gt;&lt;code&gt;SSS_INVALID_SRCH_ID&lt;/code&gt;&lt;message&gt;That search or mass update does not exist.&lt;/message&gt;&lt;/statusDetail&gt;
+        &lt;/status&gt;
+       &lt;/searchResult&gt;
+      &lt;/searchResponse&gt;
+     &lt;/soapenv:Body&gt;&lt;/soapenv:Envelope&gt;"#;
+    let error = parse_search_response(xml).unwrap_err();
+    match error {
+        CliError::Api { status, message, .. } =&gt; {
+            assert_eq!(status, 200);
+            assert!(message.contains("SSS_INVALID_SRCH_ID"));
+            assert!(message.contains("does not exist"));
+        }
+        other =&gt; panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[test]
+fn invalid_login_status_maps_to_auth_error() {
+    let xml = r#"&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"&gt;&lt;soapenv:Body&gt;
+      &lt;searchResponse xmlns="urn:messages_2025_2.platform.webservices.netsuite.com"&gt;
+       &lt;searchResult xmlns="urn:core_2025_2.platform.webservices.netsuite.com"&gt;
+        &lt;status isSuccess="false"&gt;
+         &lt;statusDetail type="ERROR"&gt;&lt;code&gt;INVALID_LOGIN_CREDENTIALS&lt;/code&gt;&lt;message&gt;Invalid login attempt.&lt;/message&gt;&lt;/statusDetail&gt;
+        &lt;/status&gt;
+       &lt;/searchResult&gt;
+      &lt;/searchResponse&gt;
+     &lt;/soapenv:Body&gt;&lt;/soapenv:Envelope&gt;"#;
+    assert!(matches!(parse_search_response(xml).unwrap_err(), CliError::Auth(_)));
+}
+
+#[test]
+fn soap_fault_maps_by_fault_kind() {
+    let credential_fault = r#"&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"&gt;&lt;soapenv:Body&gt;
+      &lt;soapenv:Fault&gt;&lt;faultcode&gt;soapenv:Server.userException&lt;/faultcode&gt;
+       &lt;faultstring&gt;com.netledger.common.exceptions.InvalidCredentialsException: Invalid login attempt.&lt;/faultstring&gt;
+      &lt;/soapenv:Fault&gt;&lt;/soapenv:Body&gt;&lt;/soapenv:Envelope&gt;"#;
+    assert!(matches!(parse_search_response(credential_fault).unwrap_err(), CliError::Auth(_)));
+
+    let other_fault = r#"&lt;soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"&gt;&lt;soapenv:Body&gt;
+      &lt;soapenv:Fault&gt;&lt;faultcode&gt;soapenv:Server&lt;/faultcode&gt;
+       &lt;faultstring&gt;An unexpected error occurred.&lt;/faultstring&gt;
+      &lt;/soapenv:Fault&gt;&lt;/soapenv:Body&gt;&lt;/soapenv:Envelope&gt;"#;
+    match parse_search_response(other_fault).unwrap_err() {
+        CliError::Api { status, message, .. } =&gt; {
+            assert_eq!(status, 500);
+            assert!(message.contains("unexpected error"));
+        }
+        other =&gt; panic!("expected Api error, got {other:?}"),
+    }
+}
+
+#[test]
+fn garbage_input_is_a_network_class_error() {
+    assert!(matches!(
+        parse_search_response("not xml at all").unwrap_err(),
+        CliError::Api { .. } | CliError::Network(_)
+    ));
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong> — add <code>quick-xml = "0.37"</code>. Single-pass event loop over local names (namespace prefixes vary by account, so never match on prefixes). State machine:
+<pre>use quick_xml::Reader;
+use quick_xml::events::{BytesStart, Event};
+use serde_json::{Map, Value, json};
+
+use crate::error::CliError;
+
+pub fn parse_search_response(xml: &amp;str) -&gt; Result&lt;SoapSearchResult, CliError&gt; {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut result = SoapSearchResult::default();          // derive Default
+    let mut is_success: Option&lt;bool&gt; = None;
+    let mut status_details: Vec&lt;(String, String)&gt; = Vec::new();
+    let mut fault: Option&lt;(String, String)&gt; = None;        // (faultcode, faultstring)
+
+    // element-path context, tracked as a stack of local names
+    let mut path: Vec&lt;String&gt; = Vec::new();
+    // row-building state
+    let mut current_row: Option&lt;Map&lt;String, Value&gt;&gt; = None;
+    let mut section: Option&lt;String&gt; = None;                // "basic" or "&lt;name&gt;Join"
+    let mut field: Option&lt;String&gt; = None;                  // pending field key
+    let mut values: Vec&lt;String&gt; = Vec::new();              // searchValues for that field
+    let mut pending_detail_code: Option&lt;String&gt; = None;    // statusDetail accumulation
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) =&gt; {
+                let name = local_name(&amp;element);
+                handle_element_open(&amp;name, &amp;element, /* self_closing = */ false, ...);
+                path.push(name);
+            }
+            Ok(Event::Empty(element)) =&gt; {
+                let name = local_name(&amp;element);
+                handle_element_open(&amp;name, &amp;element, /* self_closing = */ true, ...);
+            }
+            Ok(Event::Text(text)) =&gt; { /* route by path.last(): metadata slot,
+                                           searchValue text, faultstring, detail code/message */ }
+            Ok(Event::End(_)) =&gt; { let closed = path.pop(); /* commit field/row/section on
+                                     matching local names, mirror of the open handler */ }
+            Ok(Event::Eof) =&gt; break,
+            Err(read_error) =&gt; {
+                return Err(CliError::Api {
+                    status: 0,
+                    message: format!("unparseable SOAP response: {read_error}"),
+                    details: vec![],
+                });
+            }
+            _ =&gt; {}
+        }
+    }
+    finish(result, is_success, status_details, fault)
+}</pre>
+The <em>full</em> routing rules (the sketch above shows the skeleton; implement these exactly):
+<ul>
+  <li><code>local_name(&amp;BytesStart) -&gt; String</code>: <code>String::from_utf8_lossy(element.local_name().as_ref()).into_owned()</code>.</li>
+  <li><code>attr(&amp;BytesStart, name) -&gt; Option&lt;String&gt;</code>: iterate <code>element.attributes().flatten()</code>, match on <code>attribute.key.local_name().as_ref() == name.as_bytes()</code>, value via <code>String::from_utf8_lossy(&amp;attribute.value)</code>.</li>
+  <li>Open <code>status</code> → <code>is_success = attr("isSuccess").map(|v| v == "true")</code>.</li>
+  <li>Open <code>statusDetail</code> → start a new pending detail; Text under <code>code</code>/<code>message</code> fills it; close pushes <code>(code, message)</code> to <code>status_details</code>.</li>
+  <li>Open <code>Fault</code> → fault mode; Text under <code>faultcode</code>/<code>faultstring</code> fills <code>fault</code>.</li>
+  <li>Text under <code>totalRecords</code>/<code>pageSize</code>/<code>totalPages</code>/<code>pageIndex</code>/<code>searchId</code> (only when <em>not</em> inside <code>searchRow</code>) → parse into the result fields (<code>u64</code> via <code>.parse().unwrap_or(0)</code>).</li>
+  <li>Open <code>searchRow</code> → <code>current_row = Some(Map::new())</code>; close → push <code>Value::Object</code> into <code>result.rows</code>.</li>
+  <li>Inside a row, first-level child open → <code>section = Some(name)</code> (e.g. <code>basic</code>, <code>customerJoin</code>); its close clears it.</li>
+  <li>Second level: open <code>customFieldList</code> is transparent (skip); open <code>customField</code> → <code>field = attr("scriptId")</code>; any other second-level open → <code>field = Some(name)</code>. Either way <code>values.clear()</code>.</li>
+  <li>Open/Empty <code>searchValue</code> under a field → if <code>internalId</code> attr present push it; Text under <code>searchValue</code> → push text (attr wins if both; only push text when no attr was pushed for this element).</li>
+  <li>Close of the field element (or <code>customField</code>) → commit into <code>current_row</code>: key = for section <code>basic</code> just the field key; for <code>fooJoin</code> → <code>format!("{}.{}", section.strip_suffix("Join").unwrap_or(section), field)</code>; custom fields commit under their scriptId with no join prefix. Value: 0 values → <code>Value::Null</code>, 1 → <code>json!(values[0])</code>, many → <code>json!(values)</code>.</li>
+  <li><code>finish</code>: fault present → mapped error (Auth when <code>faultcode</code>+<code>faultstring</code> lowercased contains <code>credential</code> or <code>login</code>, else <code>Api{status:500}</code>). <code>is_success == Some(false)</code> → Auth when any detail code starts with <code>INVALID_LOGIN</code> or equals <code>INSUFFICIENT_PERMISSION</code>, else <code>Api{status:200, message: "CODE: message", details: [{"code":…,"message":…}, …]}</code>. <code>is_success == None</code> (no searchResult at all) → <code>Api{status:0, message:"no searchResult in SOAP response"}</code>. Otherwise → <code>Ok(result)</code>.</li>
+</ul></li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: generic SOAP search response parser with row flattening"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 6: <code>SoapClient</code> — <code>src/soap/mod.rs</code></h2>
+<p><strong>Files:</strong> Modify <code>src/soap/mod.rs</code> · Create <code>tests/saved_search_commands.rs</code> (client half)</p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub struct SoapClient { /* http, endpoint, account_id, secrets */ }
+impl SoapClient {
+    // base is e.g. account::rest_base(account_id) — or a wiremock URL in tests.
+    // Errors (Auth) if secrets.token_id/token_secret are None.
+    pub fn new(http: reqwest::Client, base: &amp;str, account_id: &amp;str,
+               secrets: TbaSecrets) -&gt; Result&lt;SoapClient, CliError&gt;
+    pub async fn search(&amp;self, search_type: &amp;SearchType, id_attribute: &amp;str,
+        saved_search_id: &amp;str, page_size: u64) -&gt; Result&lt;SoapSearchResult, CliError&gt;
+    pub async fn search_more(&amp;self, search_id: &amp;str, page_index: u64)
+        -&gt; Result&lt;SoapSearchResult, CliError&gt;
+}</pre>
+<p>Endpoint: <code>{base}/services/NetSuitePort_2025_2</code>. Headers: <code>Content-Type: text/xml; charset=utf-8</code>, <code>SOAPAction: "search"</code> / <code>"searchMoreWithId"</code> (WSDL soapAction values, quoted). Each call builds a fresh <code>TokenPassport</code> (new nonce + timestamp, signed via <code>tba::token_passport_signature</code>). The HTTP status is deliberately not trusted for routing: the body is always handed to <code>parse_search_response</code>, which recognizes faults regardless of status; a non-XML non-2xx body becomes <code>Api{status: http_status, message: body}</code>.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> in <code>tests/saved_search_commands.rs</code>:
+<pre>mod common;
+
+use netsuite_cli::secrets::TbaSecrets;
+use netsuite_cli::soap::SoapClient;
+use netsuite_cli::soap::search_types;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+fn demo_secrets() -&gt; TbaSecrets {
+    TbaSecrets {
+        consumer_key: "consumerkey123".into(),
+        consumer_secret: "consumersecret789".into(),
+        token_id: Some("tokenid456".into()),
+        token_secret: Some("tokensecret012".into()),
+    }
+}
+
+fn soap_client_for(server: &amp;MockServer) -&gt; SoapClient {
+    SoapClient::new(reqwest::Client::new(), &amp;server.uri(), "1234567_SB1", demo_secrets()).unwrap()
+}
+
+const ONE_ROW_RESPONSE: &amp;str = /* HAPPY_RESPONSE from Task 5, one row,
+                                  totalPages=1, pageIndex=1, totalRecords=1 */;
+
+#[tokio::test]
+async fn search_posts_signed_envelope_with_soapaction() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/NetSuitePort_2025_2"))
+        .and(header("SOAPAction", "\"search\""))
+        .and(header("Content-Type", "text/xml; charset=utf-8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ONE_ROW_RESPONSE))
+        .expect(1)
+        .mount(&amp;server)
+        .await;
+
+    let search_type = search_types::lookup("transaction").unwrap();
+    let result = soap_client_for(&amp;server)
+        .search(&amp;search_type, "savedSearchId", "57", 1000)
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+
+    let request: &amp;Request = &amp;server.received_requests().await.unwrap()[0];
+    let body = String::from_utf8_lossy(&amp;request.body);
+    assert!(body.contains(r#"savedSearchId="57""#));
+    assert!(body.contains("TransactionSearchAdvanced"));
+    assert!(body.contains("&lt;core:account&gt;1234567_SB1&lt;/core:account&gt;"));
+    assert!(body.contains(r#"algorithm="HMAC-SHA256""#));
+    assert!(body.contains("&lt;pageSize&gt;1000&lt;/pageSize&gt;"));
+}
+
+#[tokio::test]
+async fn search_more_posts_search_id_and_page_index() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/NetSuitePort_2025_2"))
+        .and(header("SOAPAction", "\"searchMoreWithId\""))
+        .respond_with(ResponseTemplate::new(200).set_body_string(ONE_ROW_RESPONSE))
+        .mount(&amp;server)
+        .await;
+
+    soap_client_for(&amp;server).search_more("WEBSERVICES_1234567_ABC", 2).await.unwrap();
+    let request = &amp;server.received_requests().await.unwrap()[0];
+    let body = String::from_utf8_lossy(&amp;request.body);
+    assert!(body.contains("&lt;searchId&gt;WEBSERVICES_1234567_ABC&lt;/searchId&gt;"));
+    assert!(body.contains("&lt;pageIndex&gt;2&lt;/pageIndex&gt;"));
+}
+
+#[tokio::test]
+async fn http_500_fault_body_is_parsed_not_swallowed() {
+    let server = MockServer::start().await;
+    let fault = /* credential fault XML from Task 5 */;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500).set_body_string(fault))
+        .mount(&amp;server)
+        .await;
+    let search_type = search_types::lookup("customer").unwrap();
+    let error = soap_client_for(&amp;server)
+        .search(&amp;search_type, "savedSearchId", "1", 5).await.unwrap_err();
+    assert!(matches!(error, netsuite_cli::error::CliError::Auth(_)));
+}
+
+#[test]
+fn client_without_minted_token_is_an_auth_error() {
+    let mut secrets = demo_secrets();
+    secrets.token_id = None;
+    let result = SoapClient::new(reqwest::Client::new(), "https://example.invalid", "1234567", secrets);
+    assert!(matches!(result.unwrap_err(), netsuite_cli::error::CliError::Auth(_)));
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong> in <code>src/soap/mod.rs</code>:
+<pre>pub mod envelope;
+pub mod parse;
+pub mod search_types;
+
+use crate::auth::tba;
+use crate::error::CliError;
+use crate::secrets::TbaSecrets;
+use envelope::TokenPassport;
+use parse::{SoapSearchResult, parse_search_response};
+use search_types::SearchType;
+
+pub struct SoapClient {
+    http: reqwest::Client,
+    endpoint: String,
+    account_id: String,
+    consumer_key: String,
+    consumer_secret: String,
+    token_id: String,
+    token_secret: String,
+}
+
+impl SoapClient {
+    pub fn new(http: reqwest::Client, base: &amp;str, account_id: &amp;str, secrets: TbaSecrets)
+        -&gt; Result&lt;SoapClient, CliError&gt;
+    {
+        let (Some(token_id), Some(token_secret)) = (secrets.token_id, secrets.token_secret) else {
+            return Err(CliError::Auth(
+                "no SOAP token minted for this account; run `netsuite-cli account soap-auth &lt;alias&gt;`".into(),
+            ));
+        };
+        Ok(SoapClient {
+            http,
+            endpoint: format!("{}/services/NetSuitePort_2025_2", base.trim_end_matches('/')),
+            account_id: account_id.to_string(),
+            consumer_key: secrets.consumer_key,
+            consumer_secret: secrets.consumer_secret,
+            token_id, token_secret,
+        })
+    }
+
+    pub async fn search(&amp;self, search_type: &amp;SearchType, id_attribute: &amp;str,
+        saved_search_id: &amp;str, page_size: u64) -&gt; Result&lt;SoapSearchResult, CliError&gt;
+    {
+        let envelope = envelope::search_envelope(
+            &amp;self.passport(), page_size, search_type, id_attribute, saved_search_id);
+        self.post("search", envelope).await
+    }
+
+    pub async fn search_more(&amp;self, search_id: &amp;str, page_index: u64)
+        -&gt; Result&lt;SoapSearchResult, CliError&gt;
+    {
+        let envelope = envelope::search_more_envelope(&amp;self.passport(), search_id, page_index);
+        self.post("searchMoreWithId", envelope).await
+    }
+
+    fn passport(&amp;self) -&gt; TokenPassport {
+        let nonce = tba::generate_nonce();
+        let timestamp = tba::epoch_seconds();
+        let signature = tba::token_passport_signature(
+            &amp;self.account_id, &amp;self.consumer_key, &amp;self.token_id,
+            &amp;nonce, timestamp, &amp;self.consumer_secret, &amp;self.token_secret);
+        TokenPassport {
+            account_id: self.account_id.clone(), consumer_key: self.consumer_key.clone(),
+            token_id: self.token_id.clone(), nonce, timestamp, signature,
+        }
+    }
+
+    async fn post(&amp;self, soap_action: &amp;str, envelope: String)
+        -&gt; Result&lt;SoapSearchResult, CliError&gt;
+    {
+        let response = self.http
+            .post(&amp;self.endpoint)
+            .header("Content-Type", "text/xml; charset=utf-8")
+            .header("SOAPAction", format!("\"{soap_action}\""))
+            .body(envelope)
+            .send()
+            .await
+            .map_err(|send_error| CliError::Network(
+                format!("SOAP request to {} failed: {send_error}", self.endpoint)))?;
+        let http_status = response.status().as_u16();
+        let body = response.text().await.map_err(|read_error| CliError::Network(
+            format!("reading SOAP response failed: {read_error}")))?;
+        // Faults arrive with HTTP 500 but the body is authoritative either way.
+        if body.contains("&lt;") {
+            return parse_search_response(&amp;body);
+        }
+        Err(CliError::Api { status: http_status, message: body, details: vec![] })
+    }
+}</pre></li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: SOAP client for search and searchMoreWithId"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 7: <code>saved_search::run</code> — <code>src/commands/saved_search.rs</code></h2>
+<p><strong>Files:</strong> Create <code>src/commands/saved_search.rs</code> · Modify <code>src/commands/mod.rs</code> · Extend <code>tests/saved_search_commands.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub async fn run(soap: &amp;SoapClient, saved_search_id: &amp;str, record_type: &amp;str,
+    limit: Option&lt;u64&gt;, fetch_all: bool) -&gt; Result&lt;serde_json::Value, CliError&gt;</pre>
+<p>Output shape: <code>{"items": […], "count": n, "totalRecords": n, "totalPages": n, "pageIndex": n, "hasMore": bool}</code>. With <code>--all</code>, items merge across <code>searchMoreWithId</code> pages, <code>pageIndex</code> is the last fetched page, <code>hasMore:false</code> on completion; a defensive <code>MAX_PAGES: u32 = 1000</code> cap mirrors <code>suiteql.rs</code> (returns partial merge with <code>hasMore:true</code>).</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> (same test file; craft the paged XML from Task 5's template — page 1: <code>totalRecords=3, pageSize=2, totalPages=2, pageIndex=1</code>, two rows; page 2: <code>pageIndex=2</code>, one row):
+<pre>#[tokio::test]
+async fn run_returns_first_page_when_all_not_set() {
+    // mock: search → page 1
+    let result = saved_search::run(&amp;soap_client_for(&amp;server), "57", "transaction", None, false)
+        .await.unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    assert_eq!(result["totalRecords"], 3);
+    assert_eq!(result["hasMore"], true);      // pageIndex 1 &lt; totalPages 2
+}
+
+#[tokio::test]
+async fn run_with_all_pages_through_search_more() {
+    // mocks: SOAPAction "search" → page 1; SOAPAction "searchMoreWithId" → page 2
+    let result = saved_search::run(&amp;soap_client_for(&amp;server), "57", "transaction", None, true)
+        .await.unwrap();
+    assert_eq!(result["items"].as_array().unwrap().len(), 3);
+    assert_eq!(result["count"], 3);
+    assert_eq!(result["hasMore"], false);
+    // and the searchMoreWithId request carried the searchId from page 1
+}
+
+#[tokio::test]
+async fn script_id_selects_the_script_id_attribute() {
+    // run with id "customsearch_example"; assert request body contains
+    // savedSearchScriptId="customsearch_example" and NOT savedSearchId=
+}
+
+#[tokio::test]
+async fn unknown_type_and_bad_inputs_are_usage_errors() {
+    let soap = soap_client_for(&amp;server);
+    let unknown_type = saved_search::run(&amp;soap, "57", "nonsense", None, false).await.unwrap_err();
+    assert!(matches!(unknown_type, CliError::Usage(_)));
+    assert!(unknown_type.to_string().contains("account, accountingperiod")); // lists valid types
+
+    let bad_id = saved_search::run(&amp;soap, "not-an-id", "transaction", None, false).await.unwrap_err();
+    assert!(matches!(bad_id, CliError::Usage(_)));
+
+    let bad_limit = saved_search::run(&amp;soap, "57", "transaction", Some(3), false).await.unwrap_err();
+    assert!(matches!(bad_limit, CliError::Usage(_)));   // below SOAP minimum of 5
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong>:
+<pre>use serde_json::{Value, json};
+
+use crate::error::CliError;
+use crate::soap::SoapClient;
+use crate::soap::parse::SoapSearchResult;
+use crate::soap::search_types;
+
+const DEFAULT_PAGE_SIZE: u64 = 1000;
+const MIN_PAGE_SIZE: u64 = 5;      // SOAP searchPreferences minimum
+const MAX_PAGE_SIZE: u64 = 1000;   // SOAP searchPreferences maximum
+const MAX_PAGES: u64 = 1000;       // same defensive cap as suiteql.rs
+
+pub async fn run(soap: &amp;SoapClient, saved_search_id: &amp;str, record_type: &amp;str,
+    limit: Option&lt;u64&gt;, fetch_all: bool) -&gt; Result&lt;Value, CliError&gt;
+{
+    let search_type = search_types::lookup(record_type).ok_or_else(|| CliError::Usage(format!(
+        "unknown record type '{record_type}'; valid types: {}",
+        search_types::known_type_names())))?;
+    let id_attribute = saved_search_id_attribute(saved_search_id)?;
+    let page_size = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&amp;page_size) {
+        return Err(CliError::Usage(format!(
+            "--limit must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}, got {page_size}")));
+    }
+
+    let first_page = soap.search(&amp;search_type, id_attribute, saved_search_id, page_size).await?;
+    if !fetch_all {
+        return Ok(page_output(&amp;first_page, first_page.rows.clone()));
+    }
+
+    let mut merged_rows = first_page.rows.clone();
+    let mut last_page_index = first_page.page_index;
+    while last_page_index &lt; first_page.total_pages &amp;&amp; last_page_index &lt; MAX_PAGES {
+        let next = soap.search_more(&amp;first_page.search_id, last_page_index + 1).await?;
+        merged_rows.extend(next.rows);
+        last_page_index = next.page_index;
+    }
+    Ok(json!({
+        "items": merged_rows, "count": merged_rows.len(),
+        "totalRecords": first_page.total_records,
+        "totalPages": first_page.total_pages,
+        "pageIndex": last_page_index,
+        "hasMore": last_page_index &lt; first_page.total_pages,
+    }))
+}
+
+fn saved_search_id_attribute(saved_search_id: &amp;str) -&gt; Result&lt;&amp;'static str, CliError&gt; {
+    if saved_search_id.starts_with("customsearch") {
+        Ok("savedSearchScriptId")
+    } else if !saved_search_id.is_empty()
+        &amp;&amp; saved_search_id.chars().all(|ch| ch.is_ascii_digit())
+    {
+        Ok("savedSearchId")
+    } else {
+        Err(CliError::Usage(format!(
+            "saved-search id must be a numeric internal id or a customsearch_* script id, got '{saved_search_id}'")))
+    }
+}
+
+fn page_output(page: &amp;SoapSearchResult, items: Vec&lt;Value&gt;) -&gt; Value {
+    json!({
+        "items": items, "count": page.rows.len(),
+        "totalRecords": page.total_records, "totalPages": page.total_pages,
+        "pageIndex": page.page_index,
+        "hasMore": page.page_index &lt; page.total_pages,
+    })
+}</pre>
+Guard detail: if <code>search_more</code> ever returns a <code>page_index</code> that fails to advance, break instead of looping forever (mirror <code>suiteql.rs</code>'s misbehaving-server guard — compare against the previous index and bail with <code>hasMore:true</code>).</li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: saved-search run command core with paging"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 8: generalize the loopback listener — <code>src/auth/loopback.rs</code></h2>
+<p><strong>Files:</strong> Create <code>src/auth/loopback.rs</code> · Modify <code>src/auth/authcode.rs</code>, <code>src/auth/mod.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub(crate) async fn listen_for_redirect&lt;CallbackValue&gt;(
+    port: u16,
+    parse_query: impl Fn(&amp;str) -&gt; Result&lt;CallbackValue, CliError&gt;,
+) -&gt; Result&lt;CallbackValue, CliError&gt;
+
+pub(crate) fn read_pasted_redirect&lt;CallbackValue&gt;(
+    parse_query: impl Fn(&amp;str) -&gt; Result&lt;CallbackValue, CliError&gt;,
+) -&gt; Result&lt;CallbackValue, CliError&gt;</pre>
+<p>This is a pure refactor: move <code>listen_for_redirect</code>, <code>accept_callback</code>, <code>build_loopback_tls_acceptor</code>, <code>read_request_head</code>, <code>request_line_path</code>, the timeout constants, and the response helpers from <code>authcode.rs</code> into <code>loopback.rs</code>, replacing the hardcoded <code>parse_callback_query(query, expected_state)</code> call with the injected <code>parse_query</code> closure (the success/failure browser page keys off the closure's <code>Result</code>, exactly as today). <code>read_pasted_redirect</code> moves too, generalized the same way. <code>authcode::run_login_flow</code> then calls <code>loopback::listen_for_redirect(port, |query| parse_callback_query(query, &amp;state))</code>.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Move the code</strong> as described. No behavior change intended, so no new tests — the existing <code>authcode.rs</code> unit tests (pure helpers, which stay in <code>authcode.rs</code>) and <code>tests/authcode.rs</code> integration tests are the regression net.</li>
+<li>☐ <strong>Step 2: Run the full suite</strong> — <code>cargo test</code> → green, especially <code>tests/authcode.rs</code>.</li>
+<li>☐ <strong>Step 3: Gate + commit</strong> — <code>git commit -m "refactor: extract generic HTTPS loopback listener from authcode"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 9: three-step TBA flow — <code>src/auth/tba.rs</code> (part 2)</h2>
+<p><strong>Files:</strong> Modify <code>src/auth/tba.rs</code> · Create <code>tests/tba_auth.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub struct RequestToken { pub token: String, pub secret: String }
+pub struct MintedToken { pub token_id: String, pub token_secret: String }
+
+pub async fn obtain_request_token(http: &amp;reqwest::Client, restlet_base: &amp;str,
+    consumer_key: &amp;str, consumer_secret: &amp;str, callback_url: &amp;str)
+    -&gt; Result&lt;RequestToken, CliError&gt;
+pub fn tba_authorize_url(app_base: &amp;str, request_token: &amp;str, state: &amp;str) -&gt; String
+pub fn parse_tba_callback(query: &amp;str, expected_token: &amp;str, expected_state: &amp;str)
+    -&gt; Result&lt;String, CliError&gt;              // returns oauth_verifier
+pub async fn exchange_for_access_token(http: &amp;reqwest::Client, restlet_base: &amp;str,
+    consumer_key: &amp;str, consumer_secret: &amp;str, request_token: &amp;RequestToken,
+    verifier: &amp;str) -&gt; Result&lt;MintedToken, CliError&gt;
+pub fn generate_tba_state() -&gt; String        // 32 chars, strictly alphanumeric (NetSuite rule)
+pub async fn run_tba_flow(http: &amp;reqwest::Client, restlet_base: &amp;str, app_base: &amp;str,
+    consumer_key: &amp;str, consumer_secret: &amp;str, port: u16, paste_mode: bool)
+    -&gt; Result&lt;MintedToken, CliError&gt;</pre>
+<p>Endpoints (Oracle docs, confirmed): step 1 <code>POST {restlet_base}/rest/requesttoken</code>, step 2 <code>GET {app_base}/app/login/secure/authorizetoken.nl?oauth_token=…&amp;state=…</code>, step 3 <code>POST {restlet_base}/rest/accesstoken</code>. All signatures HMAC-SHA256. Responses are form-encoded (<code>oauth_token=…&amp;oauth_token_secret=…&amp;oauth_callback_confirmed=true</code>). The callback URL is <code>https://localhost:{port}/callback</code> — same URL the OAuth 2.0 flow already uses, and it must match the integration record's TBA callback URL exactly.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> in <code>tests/tba_auth.rs</code>:
+<pre>use netsuite_cli::auth::tba;
+use wiremock::matchers::{header_exists, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[tokio::test]
+async fn request_token_step_sends_signed_oauth_header_and_parses_form_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/requesttoken"))
+        .and(header_exists("Authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "oauth_token=reqtoken111&amp;oauth_token_secret=reqtokensecret333&amp;oauth_callback_confirmed=true"))
+        .expect(1)
+        .mount(&amp;server)
+        .await;
+
+    let request_token = tba::obtain_request_token(
+        &amp;reqwest::Client::new(), &amp;server.uri(),
+        "consumerkey123", "consumersecret789", "https://localhost:8899/callback",
+    ).await.unwrap();
+    assert_eq!(request_token.token, "reqtoken111");
+    assert_eq!(request_token.secret, "reqtokensecret333");
+
+    let sent = &amp;server.received_requests().await.unwrap()[0];
+    let authorization = sent.headers.get("Authorization").unwrap().to_str().unwrap();
+    assert!(authorization.starts_with("OAuth "));
+    for expected in ["oauth_consumer_key=\"consumerkey123\"",
+                     "oauth_signature_method=\"HMAC-SHA256\"",
+                     "oauth_callback=\"https%3A%2F%2Flocalhost%3A8899%2Fcallback\"",
+                     "oauth_signature=\""] {
+        assert!(authorization.contains(expected), "missing {expected} in {authorization}");
+    }
+}
+
+#[tokio::test]
+async fn request_token_without_callback_confirmed_is_rejected() {
+    // respond without oauth_callback_confirmed=true → CliError::Auth
+}
+
+#[tokio::test]
+async fn access_token_step_includes_verifier_and_parses_minted_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rest/accesstoken"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "oauth_token=tokenid456&amp;oauth_token_secret=tokensecret012"))
+        .mount(&amp;server)
+        .await;
+
+    let minted = tba::exchange_for_access_token(
+        &amp;reqwest::Client::new(), &amp;server.uri(),
+        "consumerkey123", "consumersecret789",
+        &amp;tba::RequestToken { token: "reqtoken111".into(), secret: "reqtokensecret333".into() },
+        "verifier222",
+    ).await.unwrap();
+    assert_eq!(minted.token_id, "tokenid456");
+    assert_eq!(minted.token_secret, "tokensecret012");
+
+    let authorization = /* as above */;
+    assert!(authorization.contains("oauth_token=\"reqtoken111\""));
+    assert!(authorization.contains("oauth_verifier=\"verifier222\""));
+}
+
+#[test]
+fn tba_callback_parser_validates_token_state_and_extracts_verifier() {
+    let query = "oauth_token=reqtoken111&amp;oauth_verifier=verifier222&amp;company=1234567&amp;role=3&amp;entity=9&amp;state=STATE123";
+    assert_eq!(tba::parse_tba_callback(query, "reqtoken111", "STATE123").unwrap(), "verifier222");
+    assert!(tba::parse_tba_callback(query, "OTHERTOKEN", "STATE123").is_err());
+    assert!(tba::parse_tba_callback(query, "reqtoken111", "WRONGSTATE").is_err());
+    assert!(tba::parse_tba_callback("denied=true&amp;state=STATE123", "reqtoken111", "STATE123").is_err());
+}
+
+#[test]
+fn authorize_url_and_state_meet_netsuite_rules() {
+    let url = tba::tba_authorize_url("https://1234567-sb1.app.netsuite.com", "req token", "STATE123");
+    assert!(url.starts_with("https://1234567-sb1.app.netsuite.com/app/login/secure/authorizetoken.nl?"));
+    assert!(url.contains("oauth_token=req+token") || url.contains("oauth_token=req%20token"));
+    assert!(url.contains("state=STATE123"));
+
+    let state = tba::generate_tba_state();
+    assert_eq!(state.len(), 32);
+    assert!(state.chars().all(|ch| ch.is_ascii_alphanumeric()));
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong> — shared helper posts a signed OAuth 1.0a request and parses the form body:
+<pre>pub async fn obtain_request_token(http: &amp;reqwest::Client, restlet_base: &amp;str,
+    consumer_key: &amp;str, consumer_secret: &amp;str, callback_url: &amp;str)
+    -&gt; Result&lt;RequestToken, CliError&gt;
+{
+    let url = format!("{}/rest/requesttoken", restlet_base.trim_end_matches('/'));
+    let oauth_params: Vec&lt;(&amp;str, String)&gt; = vec![
+        ("oauth_callback", callback_url.to_string()),
+        ("oauth_consumer_key", consumer_key.to_string()),
+        ("oauth_nonce", generate_nonce()),
+        ("oauth_signature_method", "HMAC-SHA256".to_string()),
+        ("oauth_timestamp", epoch_seconds().to_string()),
+        ("oauth_version", "1.0".to_string()),
+    ];
+    let pairs = signed_form_post(http, &amp;url, oauth_params, consumer_secret, "").await?;
+    if pairs.get("oauth_callback_confirmed").map(String::as_str) != Some("true") {
+        return Err(CliError::Auth(
+            "NetSuite did not confirm the TBA callback; check the integration record's callback URL".into()));
+    }
+    Ok(RequestToken {
+        token: required(&amp;pairs, "oauth_token")?,
+        secret: required(&amp;pairs, "oauth_token_secret")?,
+    })
+}
+
+// exchange_for_access_token: same shape — params oauth_consumer_key, oauth_nonce,
+// oauth_signature_method, oauth_timestamp, oauth_token (request token),
+// oauth_verifier, oauth_version; signing key uses the request-token secret.
+
+async fn signed_form_post(http: &amp;reqwest::Client, url: &amp;str,
+    oauth_params: Vec&lt;(&amp;str, String)&gt;, consumer_secret: &amp;str, token_secret: &amp;str)
+    -&gt; Result&lt;std::collections::HashMap&lt;String, String&gt;, CliError&gt;
+{
+    let signature = oauth_signature("POST", url, &amp;oauth_params, consumer_secret, token_secret);
+    let authorization = oauth_authorization_header(&amp;oauth_params, &amp;signature);
+    let response = http.post(url)
+        .header("Authorization", authorization)
+        .send().await
+        .map_err(|send_error| CliError::Network(format!("TBA request to {url} failed: {send_error}")))?;
+    let status = response.status();
+    let body = response.text().await
+        .map_err(|read_error| CliError::Network(format!("reading TBA response failed: {read_error}")))?;
+    if !status.is_success() {
+        return Err(CliError::Auth(format!("TBA endpoint {url} returned {status}: {body}")));
+    }
+    Ok(url::form_urlencoded::parse(body.as_bytes())
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect())
+}
+
+pub fn parse_tba_callback(query: &amp;str, expected_token: &amp;str, expected_state: &amp;str)
+    -&gt; Result&lt;String, CliError&gt;
+{
+    let pairs: std::collections::HashMap&lt;String, String&gt; =
+        url::form_urlencoded::parse(query.as_bytes())
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+    if pairs.get("state").map(String::as_str) != Some(expected_state) {
+        return Err(CliError::Auth("state mismatch in TBA callback — possible CSRF, aborting".into()));
+    }
+    if pairs.get("oauth_token").map(String::as_str) != Some(expected_token) {
+        return Err(CliError::Auth("TBA callback returned a different request token, aborting".into()));
+    }
+    pairs.get("oauth_verifier").cloned()
+        .ok_or_else(|| CliError::Auth("no oauth_verifier in TBA callback (consent denied?)".into()))
+}
+
+pub async fn run_tba_flow(http: &amp;reqwest::Client, restlet_base: &amp;str, app_base: &amp;str,
+    consumer_key: &amp;str, consumer_secret: &amp;str, port: u16, paste_mode: bool)
+    -&gt; Result&lt;MintedToken, CliError&gt;
+{
+    let callback_url = format!("https://localhost:{port}/callback");
+    let request_token = obtain_request_token(http, restlet_base, consumer_key, consumer_secret, &amp;callback_url).await?;
+    let state = generate_tba_state();
+    let authorize = tba_authorize_url(app_base, &amp;request_token.token, &amp;state);
+    eprintln!("Open this URL to authorize SOAP access (or it will open automatically):\n{authorize}");
+    let _ = webbrowser::open(&amp;authorize);
+    let verifier = if paste_mode {
+        crate::auth::loopback::read_pasted_redirect(|query| parse_tba_callback(query, &amp;request_token.token, &amp;state))?
+    } else {
+        crate::auth::loopback::listen_for_redirect(port, |query| parse_tba_callback(query, &amp;request_token.token, &amp;state)).await?
+    };
+    exchange_for_access_token(http, restlet_base, consumer_key, consumer_secret, &amp;request_token, &amp;verifier).await
+}</pre>
+(<code>tba_authorize_url</code> builds with <code>url::Url</code> exactly like <code>authcode::authorize_url</code>; <code>required()</code> is a two-line helper returning <code>CliError::Auth</code> naming the missing field.)</li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: three-step TBA browser authorization flow"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 10: <code>account soap-auth</code> — command + CLI wiring</h2>
+<p><strong>Files:</strong> Modify <code>src/commands/account.rs</code>, <code>src/cli.rs</code>, <code>Cargo.toml</code> (add <code>rpassword = "7"</code>) · Extend <code>tests/account_commands.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>// commands/account.rs
+pub async fn soap_auth(config_path: &amp;Path, store: Arc&lt;dyn SecretStore&gt;,
+    alias: &amp;str, port: u16, paste_mode: bool) -&gt; Result&lt;Value, CliError&gt;
+pub fn resolve_consumer_pair(store: &amp;dyn SecretStore, alias: &amp;str)
+    -&gt; Result&lt;(String, String), CliError&gt;
+// cli.rs
+AccountAction::SoapAuth { alias: String, port: u16 /* default 8899 */, paste: bool }</pre>
+<p>Consumer-pair resolution order: <code>NETSUITE_CLI_TBA_CONSUMER_KEY</code>+<code>NETSUITE_CLI_TBA_CONSUMER_SECRET</code> env vars → stored <code>TbaSecrets</code> for the alias → interactive prompt (plain read for the key, <code>rpassword::prompt_password</code> for the secret) → non-TTY: <code>CliError::Auth</code> naming both the env vars and <code>account soap-auth</code>. TTY check: <code>std::io::IsTerminal</code> on stdin. On success, store the full <code>TbaSecrets</code> (consumer pair + minted token) and return <code>{"alias": …, "accountId": …, "soapTokenStored": true}</code>.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> — <code>resolve_consumer_pair</code> is the testable core (the full browser flow is covered by Task 9's step tests + live smoke). In <code>tests/account_commands.rs</code>:
+<pre>#[test]
+fn consumer_pair_resolution_prefers_env_then_store() {
+    // NOTE: env-var cases must run in one test (or use a mutex) — process env is global.
+    let store = MemoryStore::default();
+
+    // no env, nothing stored → Auth error naming the env vars
+    let missing = account::resolve_consumer_pair(&amp;store, "demo").unwrap_err();
+    assert!(matches!(missing, CliError::Auth(_)));
+    assert!(missing.to_string().contains("NETSUITE_CLI_TBA_CONSUMER_KEY"));
+    // (this branch is only reached when stdin is not a TTY — under `cargo test` it isn't,
+    //  which conveniently exercises the non-interactive path)
+
+    // stored pair wins when no env
+    store.set_tba("demo", &amp;TbaSecrets {
+        consumer_key: "storedkey".into(), consumer_secret: "storedsecret".into(),
+        token_id: None, token_secret: None,
+    }).unwrap();
+    assert_eq!(account::resolve_consumer_pair(&amp;store, "demo").unwrap(),
+               ("storedkey".to_string(), "storedsecret".to_string()));
+
+    // env overrides stored
+    unsafe {
+        std::env::set_var("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey");
+        std::env::set_var("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret");
+    }
+    assert_eq!(account::resolve_consumer_pair(&amp;store, "demo").unwrap(),
+               ("envkey".to_string(), "envsecret".to_string()));
+    unsafe {
+        std::env::remove_var("NETSUITE_CLI_TBA_CONSUMER_KEY");
+        std::env::remove_var("NETSUITE_CLI_TBA_CONSUMER_SECRET");
+    }
+}
+
+#[test]
+fn soap_auth_rejects_unknown_alias() {
+    // temp config without alias "ghost" → soap_auth returns Usage error
+    // (drive with a tokio runtime: tokio_test or #[tokio::test])
+}</pre></li>
+<li>☐ <strong>Step 2: Run, verify failure.</strong></li>
+<li>☐ <strong>Step 3: Implement</strong>:
+<pre>pub async fn soap_auth(config_path: &amp;Path, store: Arc&lt;dyn SecretStore&gt;,
+    alias: &amp;str, port: u16, paste_mode: bool) -&gt; Result&lt;Value, CliError&gt;
+{
+    let config = Config::load(config_path)?;
+    let entry = config.accounts.get(alias).ok_or_else(|| CliError::Usage(format!(
+        "unknown account alias '{alias}'; run `netsuite-cli account list`")))?;
+    let (consumer_key, consumer_secret) = resolve_consumer_pair(store.as_ref(), alias)?;
+    let http = reqwest::Client::new();
+    let minted = tba::run_tba_flow(
+        &amp;http,
+        &amp;domain::restlet_base(&amp;entry.account_id),
+        &amp;domain::app_base(&amp;entry.account_id),
+        &amp;consumer_key, &amp;consumer_secret, port, paste_mode,
+    ).await?;
+    store.set_tba(alias, &amp;TbaSecrets {
+        consumer_key, consumer_secret,
+        token_id: Some(minted.token_id), token_secret: Some(minted.token_secret),
+    })?;
+    Ok(json!({"alias": alias, "accountId": entry.account_id, "soapTokenStored": true}))
+}
+
+pub fn resolve_consumer_pair(store: &amp;dyn SecretStore, alias: &amp;str)
+    -&gt; Result&lt;(String, String), CliError&gt;
+{
+    if let (Ok(env_key), Ok(env_secret)) = (
+        std::env::var("NETSUITE_CLI_TBA_CONSUMER_KEY"),
+        std::env::var("NETSUITE_CLI_TBA_CONSUMER_SECRET"),
+    ) {
+        return Ok((env_key, env_secret));
+    }
+    if let Some(stored) = store.get_tba(alias)? {
+        return Ok((stored.consumer_key, stored.consumer_secret));
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::Auth(format!(
+            "no TBA consumer credentials for '{alias}': set NETSUITE_CLI_TBA_CONSUMER_KEY and \
+             NETSUITE_CLI_TBA_CONSUMER_SECRET, or run `netsuite-cli account soap-auth {alias}` \
+             in an interactive terminal")));
+    }
+    eprint!("Integration record consumer key (client id): ");
+    let mut consumer_key = String::new();
+    std::io::stdin().read_line(&amp;mut consumer_key)
+        .map_err(|read_error| CliError::Auth(format!("failed to read consumer key: {read_error}")))?;
+    let consumer_secret = rpassword::prompt_password("Integration record consumer secret (hidden): ")
+        .map_err(|read_error| CliError::Auth(format!("failed to read consumer secret: {read_error}")))?;
+    Ok((consumer_key.trim().to_string(), consumer_secret.trim().to_string()))
+}</pre>
+CLI wiring in <code>src/cli.rs</code>:
+<pre>// in AccountAction:
+/// Mint a never-expiring SOAP (TBA) token for an account via browser consent
+#[command(after_help = "Example: netsuite-cli account soap-auth demo\n\nRequires TBA + \
+    'TBA: Authorization Flow' enabled on the integration record, with callback URL \
+    https://localhost:8899/callback")]
+SoapAuth {
+    alias: String,
+    /// Loopback listener port (must match the integration record's TBA callback URL)
+    #[arg(long, default_value_t = 8899)]
+    port: u16,
+    /// Paste the redirect URL instead of running the loopback listener
+    #[arg(long)]
+    paste: bool,
+},
+// in the dispatch match (same shape as the AddAuthCode arm):
+AccountAction::SoapAuth { alias, port, paste } =&gt; {
+    account::soap_auth(&amp;crate::config::default_config_path(),
+        Arc::new(KeyringStore), alias, *port, *paste).await
+}</pre></li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: account soap-auth command with consumer-pair resolution"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 11: <code>saved-search run</code> CLI command + first-run auto-auth</h2>
+<p><strong>Files:</strong> Modify <code>src/cli.rs</code> · Extend <code>tests/saved_search_commands.rs</code> (parse tests live in <code>cli.rs</code>'s test mod if one exists; otherwise add clap-parse asserts there)</p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>Command::SavedSearch { action: SavedSearchAction }
+SavedSearchAction::Run {
+    id: String,
+    #[arg(long = "type")] record_type: String,
+    #[arg(long)] limit: Option&lt;u64&gt;,
+    #[arg(long)] all: bool,
+}
+async fn ensure_tba_secrets(alias: &amp;str, store: Arc&lt;dyn SecretStore&gt;, config_path: &amp;Path,
+    port: u16) -&gt; Result&lt;TbaSecrets, CliError&gt;   // private to cli.rs</pre>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Clap definition</strong>:
+<pre>/// Execute a saved search over SuiteTalk SOAP (requires a TBA token; see account soap-auth)
+#[command(
+    after_help = "Examples:\n  netsuite-cli saved-search run 57 --type transaction\n  \
+netsuite-cli saved-search run customsearch_example --type customrecord --all\n\n\
+NOTE: NetSuite removes SOAP web services in release 2028.2; this command stops working then."
+)]
+SavedSearch {
+    #[command(subcommand)]
+    action: SavedSearchAction,
+},</pre></li>
+<li>☐ <strong>Step 2: Dispatch + auto-auth helper</strong> in <code>cli.rs</code>:
+<pre>Command::SavedSearch { action } =&gt; match action {
+    SavedSearchAction::Run { id, record_type, limit, all } =&gt; {
+        let config_path = crate::config::default_config_path();
+        let config = Config::load(&amp;config_path)?;
+        let env_alias = std::env::var("NETSUITE_ACCOUNT").ok();
+        let alias = config.resolve_alias(cli.account.as_deref(), env_alias.as_deref())?;
+        let account_id = config.accounts[&amp;alias].account_id.clone();
+        let store: Arc&lt;dyn SecretStore&gt; = Arc::new(KeyringStore);
+        let secrets = ensure_tba_secrets(&amp;alias, store, &amp;config_path, 8899).await?;
+        let soap = crate::soap::SoapClient::new(
+            reqwest::Client::new(), &amp;crate::account::rest_base(&amp;account_id),
+            &amp;account_id, secrets)?;
+        commands::saved_search::run(&amp;soap, id, record_type, *limit, *all).await
+    }
+},
+
+async fn ensure_tba_secrets(alias: &amp;str, store: Arc&lt;dyn SecretStore&gt;,
+    config_path: &amp;Path, port: u16) -&gt; Result&lt;TbaSecrets, CliError&gt;
+{
+    if let Some(secrets) = store.get_tba(alias)?
+        &amp;&amp; secrets.token_id.is_some()
+    {
+        return Ok(secrets);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliError::Auth(format!(
+            "no SOAP token for '{alias}'; run `netsuite-cli account soap-auth {alias}` \
+             in an interactive terminal first")));
+    }
+    eprintln!("No SOAP token for '{alias}' yet — starting one-time browser authorization…");
+    commands::account::soap_auth(config_path, store.clone(), alias, port, false).await?;
+    store.get_tba(alias)?.ok_or_else(|| CliError::Auth(
+        "SOAP authorization completed but no token was stored".into()))
+}</pre></li>
+<li>☐ <strong>Step 3: Parse tests</strong> (follow the existing pattern in <code>cli.rs</code>'s test mod if present, else add one):
+<pre>#[test]
+fn saved_search_run_parses_type_limit_and_all() {
+    let cli = Cli::try_parse_from([
+        "netsuite-cli", "saved-search", "run", "customsearch_example",
+        "--type", "transaction", "--limit", "100", "--all",
+    ]).unwrap();
+    let Command::SavedSearch { action: SavedSearchAction::Run { id, record_type, limit, all } } = cli.command
+        else { panic!("wrong variant") };
+    assert_eq!(id, "customsearch_example");
+    assert_eq!(record_type, "transaction");
+    assert_eq!(limit, Some(100));
+    assert!(all);
+}
+
+#[test]
+fn saved_search_run_requires_type() {
+    assert!(Cli::try_parse_from(["netsuite-cli", "saved-search", "run", "57"]).is_err());
+}</pre></li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: saved-search run CLI command with first-run auto-auth"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 12: live smoke tests</h2>
+<p><strong>Files:</strong> Modify <code>tests/live_smoke.rs</code></p>
+<p>Gated like the existing suite (<code>#[ignore]</code>, env-driven). New env vars: <code>NETSUITE_LIVE_SAVED_SEARCH</code> (numeric id or <code>customsearch_*</code>), <code>NETSUITE_LIVE_SAVED_SEARCH_TYPE</code> (record type), and optionally <code>NETSUITE_LIVE_CUSTOM_SAVED_SEARCH</code> (a custom-record saved search id, run with <code>--type customrecord</code>). These require <code>account soap-auth</code> to have been run for <code>NETSUITE_LIVE_ALIAS</code> beforehand.</p>
+<ul class="step">
+<li>☐ <strong>Step 1: Add tests</strong>:
+<pre>#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; needs account soap-auth + NETSUITE_LIVE_SAVED_SEARCH(_TYPE)"]
+async fn saved_search_runs_over_soap_with_stored_tba_token() {
+    let alias = live_alias();
+    let saved_search_id = std::env::var("NETSUITE_LIVE_SAVED_SEARCH")
+        .expect("NETSUITE_LIVE_SAVED_SEARCH must name a saved search id");
+    let record_type = std::env::var("NETSUITE_LIVE_SAVED_SEARCH_TYPE")
+        .expect("NETSUITE_LIVE_SAVED_SEARCH_TYPE must name the record type");
+
+    let config = netsuite_cli::config::Config::load(&amp;netsuite_cli::config::default_config_path())
+        .expect("config loads");
+    let account_id = config.accounts[&amp;alias].account_id.clone();
+    let store = netsuite_cli::secrets::KeyringStore;
+    let secrets = netsuite_cli::secrets::SecretStore::get_tba(&amp;store, &amp;alias)
+        .expect("keychain readable")
+        .expect("run `netsuite-cli account soap-auth` first");
+    let soap = netsuite_cli::soap::SoapClient::new(
+        reqwest::Client::new(), &amp;netsuite_cli::account::rest_base(&amp;account_id),
+        &amp;account_id, secrets).expect("token present");
+
+    let result = netsuite_cli::commands::saved_search::run(
+        &amp;soap, &amp;saved_search_id, &amp;record_type, Some(5), false).await
+        .expect("saved search executes");
+    assert!(result["totalRecords"].as_u64().is_some());
+    assert!(result["items"].is_array());
+}
+
+#[tokio::test]
+#[ignore = "hits a real NetSuite sandbox; needs NETSUITE_LIVE_CUSTOM_SAVED_SEARCH"]
+async fn custom_record_saved_search_works_with_saved_search_id_alone() {
+    // identical shape, id from NETSUITE_LIVE_CUSTOM_SAVED_SEARCH, record type "customrecord"
+}</pre></li>
+<li>☐ <strong>Step 2: Compile check</strong> — <code>cargo test --test live_smoke</code> (builds, tests stay ignored). Run for real against the sandbox alias once <code>soap-auth</code> has been executed there; paste the observed output into the PR description.</li>
+<li>☐ <strong>Step 3: Gate + commit</strong> — <code>git commit -m "test: live smoke coverage for SOAP saved-search execution"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 13: documentation — README + SKILL.md</h2>
+<p><strong>Files:</strong> Modify <code>README.md</code>, <code>skills/netsuite-cli/SKILL.md</code></p>
+<ul class="step">
+<li>☐ <strong>Step 1: README</strong> — new "Saved searches (SOAP)" section covering, in this order:
+  <ul>
+    <li><strong>Sunset warning up front:</strong> NetSuite removes SOAP web services in 2028.2 (endpoints disabled); no new TBA/SOAP integrations can be created after 2027.1 — enable TBA on the integration record now, not later.</li>
+    <li><strong>One-time integration-record setup:</strong> on the same integration record used for M2M — check <em>Token-Based Authentication</em> and <em>TBA: Authorization Flow</em>, set the TBA callback URL to <code>https://localhost:8899/callback</code>, save, capture the consumer key/secret into the org's password manager.</li>
+    <li><strong>The Reset Credentials trap</strong>, verbatim from the spec: the consumer secret is shown exactly once at record creation; if it wasn't captured, Reset Credentials rotates the client id and breaks every M2M certificate mapping and configured <code>client_id</code> — the alternative is a second integration record just for TBA/SOAP.</li>
+    <li><strong>Per-account auth:</strong> <code>netsuite-cli account soap-auth &lt;alias&gt;</code> (or just run a saved search and let first-run auto-auth kick in). Prompts once for the consumer pair (env overrides: <code>NETSUITE_CLI_TBA_CONSUMER_KEY/SECRET</code>), opens the browser, tokens never expire. Sandbox refreshes invalidate tokens → re-run <code>soap-auth</code>.</li>
+    <li><strong>Usage:</strong> the two <code>after_help</code> examples plus <code>--limit</code>/<code>--all</code> semantics and the output shape.</li>
+  </ul></li>
+<li>☐ <strong>Step 2: SKILL.md</strong> — add <code>saved-search run</code> to the command inventory: when to prefer it over SuiteQL (the search's saved filters/formulas/columns are wanted as-is, or the data is only exposed via a saved search), the <code>--type</code> requirement (with the "resolve the type before running" tip: ask the search owner or check the search's record type in the UI), the auth-recovery recipe (exit code 3 mentioning SOAP token → <code>account soap-auth &lt;alias&gt;</code>), and the 2028.2 sunset note.</li>
+<li>☐ <strong>Step 3: Gate + commit</strong> — <code>git commit -m "docs: saved-search SOAP setup and usage"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2>Final verification (before PR)</h2>
+<ul>
+  <li>☐ <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code> — full green.</li>
+  <li>☐ Grep the diff for Creative Planning identifiers: <code>git diff origin/main --unified=0 | grep -iE "&lt;real-account-id&gt;|&lt;org-name&gt;|&lt;real-alias&gt;"</code> (substitute the org's actual identifiers) → zero occurrences in new files. Sweep committed docs too, not just code.</li>
+  <li>☐ Live smoke against the sandbox alias (run <code>account soap-auth</code> interactively first, then the two ignored tests). This also settles the one open live question: header/signature details accepted by the real endpoint (the <code>algorithm="HMAC-SHA256"</code> attribute value and quoted SOAPAction) — if NetSuite rejects either, the error will name it precisely; fix in <code>envelope.rs</code>/<code>SoapClient::post</code> and re-run.</li>
+  <li>☐ Open PR (non-draft) → run the <code>pr-review-loop</code> skill per user preferences.</li>
+</ul>
+
+</body>
+</html>

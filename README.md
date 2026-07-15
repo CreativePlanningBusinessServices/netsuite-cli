@@ -64,6 +64,10 @@ Integrations > New**. Give it a name, and under the applicable authentication se
 grant type you're setting up (see below). Saving gives you a **Client ID** — every `account add`
 call needs it via `--client-id`.
 
+`saved-search run` uses a third, separate authentication mechanism — Token-Based Authentication
+(TBA) for SuiteTalk SOAP, not one of the two OAuth 2.0 grants above — set up on the same
+integration record; see [Saved searches (SOAP)](#saved-searches-soap).
+
 ### M2M (client credentials)
 
 1. On the integration record, enable **OAuth 2.0 Client Credentials Grant (Client Credentials /
@@ -352,6 +356,79 @@ $ netsuite-cli config get
 $ netsuite-cli config set cache_ttl_hours 48
 {"cache_ttl_hours":48}
 ```
+
+## Saved searches (SOAP)
+
+> **NetSuite is sunsetting SOAP web services.** Release 2028.2 disables the SOAP endpoints
+> entirely, and no NetSuite account can create a *new* TBA/SOAP integration once it's on release
+> 2027.1 or later. If `saved-search run` is or might become part of your workflow, enable
+> Token-Based Authentication on your integration record **now** — not when you actually need it.
+
+`netsuite-cli saved-search run` executes an existing saved search over NetSuite's legacy SuiteTalk
+SOAP web services (there is no REST equivalent for running a saved search) and returns its rows as
+JSON. It needs its own one-time setup, separate from the M2M/auth-code flows above, because SOAP
+authenticates with Token-Based Authentication (TBA), not OAuth 2.0.
+
+### One-time integration-record setup
+
+Do this once per NetSuite account, on the **same integration record** you already use for M2M
+(**Setup > Integration > Manage Integrations**):
+
+1. Check **Token-Based Authentication (TBA)** and **TBA: Authorization Flow**.
+2. Set the **TBA callback URL** to `https://localhost:8899/callback` (match the port to whatever
+   `--port` you'll pass `account soap-auth`, if not the default `8899`).
+3. Save. NetSuite shows a **Consumer Key** and **Consumer Secret** — capture both into the org's
+   password manager immediately.
+
+### The Reset Credentials trap
+
+The consumer secret is shown **exactly once**, at the moment the record is saved. If it wasn't
+captured then:
+
+- **Do not click Reset Credentials** to get a fresh one. Reset Credentials rotates the
+  integration's client ID, which breaks every M2M certificate mapping and every configured
+  `client_id` that points at this record — not just the TBA/SOAP piece.
+- The safe fix is a **second integration record**, used only for TBA/SOAP, so resetting or
+  recreating its credentials never touches the M2M integration.
+
+### Per-account auth
+
+```bash
+netsuite-cli account soap-auth <alias> [--port 8899] [--paste]
+```
+
+Or skip the explicit step: just run `saved-search run`. On first use, if no SOAP token is stored
+for the account and the CLI is attached to an interactive terminal, it prompts for the integration
+record's **consumer key** (visible) and **consumer secret** (hidden), stores both in the OS
+keychain, then opens the browser for the TBA consent flow — same three-step authorization
+`soap-auth` runs explicitly. The resulting token never expires, so this normally happens once per
+account, ever. Set `NETSUITE_CLI_TBA_CONSUMER_KEY` / `NETSUITE_CLI_TBA_CONSUMER_SECRET` to supply
+the consumer pair without a prompt (CI, scripted first run). Running non-interactively with no
+stored token and no env vars fails with an `auth` error (exit `3`) naming
+`account soap-auth <alias>`.
+
+**Sandbox refresh caveat:** refreshing a sandbox from production invalidates every token stored for
+it, SOAP TBA tokens included — re-run `account soap-auth <alias>` afterward.
+
+### Usage
+
+```bash
+$ netsuite-cli saved-search run 57 --type transaction
+{"items":[...],"count":1000,"totalRecords":4820,"totalPages":5,"pageIndex":1,"hasMore":true}
+
+$ netsuite-cli saved-search run customsearch_example --type customrecord --all
+{"items":[...],"count":4820,"totalRecords":4820,"totalPages":5,"pageIndex":5,"hasMore":false}
+```
+
+`<id>` is the saved search's numeric internal id or its `customsearch_*` script id. `--type` is
+required — the record type the search is defined against (`transaction`, `customer`,
+`customrecord`, etc.; see `src/soap/search_types.rs` for the full list of 95 supported types, or
+just run it — an unknown type's error lists every valid one). `--limit` sets the SOAP page size,
+`5`–`1000` (default `1000`, the max). `--all` transparently pages through every result via
+`searchMoreWithId` and merges them into one response, same `--all` semantics as `record list` and
+`suiteql`. The output shape is `{"items", "count", "totalRecords", "totalPages", "pageIndex",
+"hasMore"}` — `count` is the number of rows in `items` (equal to `totalRecords` once `--all` has
+fetched everything).
 
 ## Output contract
 
