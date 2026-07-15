@@ -4,7 +4,8 @@ use common::client_for;
 use netsuite_cli::commands::account;
 use netsuite_cli::config::{AuthFlow, Config};
 use netsuite_cli::error::CliError;
-use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore};
+use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore, TbaSecrets};
+use std::sync::Arc;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -320,4 +321,70 @@ async fn test_propagates_api_error_on_failure() {
 
     let test_result = account::test(&client_for(&server), "prod").await;
     assert!(matches!(test_result, Err(CliError::Api { .. })));
+}
+
+/// NOTE: env-var cases must run in one test (or use a mutex) — process env is global, and
+/// `cargo test`'s parallel test threads would otherwise race each other's set_var/remove_var.
+#[test]
+fn consumer_pair_resolution_prefers_env_then_store() {
+    let store = MemoryStore::default();
+
+    // no env, nothing stored → Auth error naming the env vars
+    // (this branch is only reached when stdin is not a TTY — under `cargo test` it isn't,
+    //  which conveniently exercises the non-interactive path)
+    let missing = account::resolve_consumer_pair(&store, "demo").unwrap_err();
+    assert!(matches!(missing, CliError::Auth(_)));
+    assert!(
+        missing
+            .to_string()
+            .contains("NETSUITE_CLI_TBA_CONSUMER_KEY")
+    );
+
+    // stored pair wins when no env
+    store
+        .set_tba(
+            "demo",
+            &TbaSecrets {
+                consumer_key: "storedkey".into(),
+                consumer_secret: "storedsecret".into(),
+                token_id: None,
+                token_secret: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        account::resolve_consumer_pair(&store, "demo").unwrap(),
+        ("storedkey".to_string(), "storedsecret".to_string())
+    );
+
+    // env overrides stored
+    unsafe {
+        std::env::set_var("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey");
+        std::env::set_var("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret");
+    }
+    assert_eq!(
+        account::resolve_consumer_pair(&store, "demo").unwrap(),
+        ("envkey".to_string(), "envsecret".to_string())
+    );
+    unsafe {
+        std::env::remove_var("NETSUITE_CLI_TBA_CONSUMER_KEY");
+        std::env::remove_var("NETSUITE_CLI_TBA_CONSUMER_SECRET");
+    }
+}
+
+#[tokio::test]
+async fn soap_auth_rejects_unknown_alias() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+    Config::default().save(&config_path).unwrap();
+    let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+
+    let error = account::soap_auth(&config_path, store, "ghost", 8899, false)
+        .await
+        .unwrap_err();
+
+    match error {
+        CliError::Usage(message) => assert!(message.contains("ghost")),
+        other => panic!("expected Usage error, got {other:?}"),
+    }
 }

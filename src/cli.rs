@@ -451,6 +451,21 @@ pub enum AccountAction {
         #[arg(long)]
         paste: bool,
     },
+    /// Mint a never-expiring SOAP (TBA) token for an account via browser consent
+    #[command(
+        after_help = "Example: netsuite-cli account soap-auth demo\n\nRequires TBA + \
+        'TBA: Authorization Flow' enabled on the integration record, with callback URL \
+        https://localhost:8899/callback"
+    )]
+    SoapAuth {
+        alias: String,
+        /// Loopback listener port (must match the integration record's TBA callback URL)
+        #[arg(long, default_value_t = 8899)]
+        port: u16,
+        /// Paste the redirect URL instead of running the loopback listener
+        #[arg(long)]
+        paste: bool,
+    },
 }
 
 pub async fn cli_main() -> i32 {
@@ -881,6 +896,9 @@ async fn dispatch_account(
             }
             let context = context_for(Some(&resolved_alias))?;
             account::test(&context.client, &resolved_alias).await
+        }
+        AccountAction::SoapAuth { alias, port, paste } => {
+            account::soap_auth(&config_path, store.clone(), alias, *port, *paste).await
         }
     }
 }
