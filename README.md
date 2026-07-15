@@ -73,7 +73,9 @@ Integrations > New**, then:
    Grant** for `--flow auth-code` — plus the **REST Web Services** and
    **RESTlets** scopes.
 4. Save, then copy **both** values NetSuite shows you: the **Client ID** (every
-   `account add` call needs it via `--client-id`) and the **Client Secret**.
+   `account add` call needs it via `--client-id`) and the **Client Secret**
+   (NetSuite's TBA screens — and this CLI's saved-search prompts — call the same
+   pair the **consumer key** and **consumer secret**).
    **The secret is displayed only this once** — it is exactly what saved-search
    (TBA) auth asks for later, so store both in your password manager now.
    Recovering a lost secret means Reset Credentials, which rotates the Client ID
@@ -386,7 +388,8 @@ authenticates with Token-Based Authentication (TBA), not OAuth 2.0.
 ### Integration-record setup
 
 Already done if you followed the [NetSuite setup](#netsuite-setup) checklist — the record has TBA
-enabled and you captured the consumer key/secret at creation. On an interactive terminal,
+enabled and you captured the consumer key/secret at creation (the same pair as the Client
+ID/Client Secret; TBA just names them differently). On an interactive terminal,
 `account add` also offers to chain straight into SOAP setup right after adding an account, so you
 mint the token while that secret is still fresh; answer the prompt (or just run `account soap-auth
 <alias>` later) whenever you're ready.
@@ -411,8 +414,8 @@ netsuite-cli account soap-auth <alias> [--port 8899] [--paste]
 
 Or skip the explicit step: just run `saved-search run`. On first use, if no SOAP token is stored
 for the account and the CLI is attached to an interactive terminal, it prompts for the integration
-record's **consumer key** (visible) and **consumer secret** (hidden), stores both in the OS
-keychain, then opens the browser for the TBA consent flow — same three-step authorization
+record's **consumer key** (visible) and **consumer secret** (hidden) — the Client ID/Client Secret
+you captured at record creation, under their TBA names — stores both in the OS keychain, then opens the browser for the TBA consent flow — same three-step authorization
 `soap-auth` runs explicitly. The resulting token never expires, so this normally happens once per
 account, ever. Set `NETSUITE_CLI_TBA_CONSUMER_KEY` / `NETSUITE_CLI_TBA_CONSUMER_SECRET` to supply
 the consumer pair without a prompt (CI, scripted first run). Running non-interactively with no
