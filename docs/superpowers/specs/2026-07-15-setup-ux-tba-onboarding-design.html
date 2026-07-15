@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli First-Run TBA Onboarding — Design Spec (2026-07-15)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:860px; padding:2.5rem 1.5rem 4rem; font:16px/1.6 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.5rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.86em; }
+  code { background:var(--code-bg); padding:.1em .35em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.9rem 1rem; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:.8rem 0; font-size:.93rem; }
+  th, td { border:1px solid var(--border); padding:.45rem .65rem; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul { padding-left:1.3rem; } li { margin:.25rem 0; }
+  .buttons { display:flex; gap:.75rem; flex-wrap:wrap; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:1rem; margin:1.2rem 0; align-items:center; }
+  .buttons span { font-weight:600; }
+  .buttons a { display:inline-block; padding:.5rem 1.1rem; border-radius:8px; text-decoration:none; font-weight:600; border:1px solid var(--accent); }
+  .buttons a.primary { background:var(--accent); color:#fff; }
+  .buttons a.secondary { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>First-Run TBA Onboarding — Design Spec</h1>
+<div class="meta">2026-07-15 · New users should configure ONE integration record for both M2M OAuth 2.0 and TBA at creation time, and learn during <code>account add</code> that saved searches need a separate SOAP token — instead of discovering it weeks later after the one-time consumer secret is gone.</div>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+<h2>1. Problem</h2>
+<p>Today <code>account add</code> collects only OAuth 2.0 credentials; TBA surfaces lazily at the first <code>saved-search run</code>. The README's M2M checklist says "Note the Client ID" but never mentions enabling the TBA checkboxes or capturing the <strong>Client Secret</strong> — which NetSuite displays exactly once at record creation. The default new-user path therefore creates a TBA-less record, discards the secret, and later faces either a record edit + missing secret or the documented Reset Credentials trap (client-id rotation breaking M2M). Chosen approach (Jon, 2026-07-15): docs unification + post-add stderr tip + interactive TTY offer ("Approach B").</p>
+
+<h2>2. README restructure — one-save record creation</h2>
+<ul>
+  <li>The "NetSuite setup" intro's integration-record paragraph becomes a <strong>unified checklist executed in a single save</strong>: enable <em>OAuth 2.0 Client Credentials Grant</em> + <em>REST Web Services</em>/<em>RESTlets</em> scopes (and/or <em>Authorization Code Grant</em> for that flow), <em>Token-Based Authentication</em>, <em>TBA: Authorization Flow</em>, and TBA <em>Callback URL</em> <code>https://localhost:8899/callback</code>.</li>
+  <li>Immediately after "save": copy <strong>both</strong> the Client ID and the Client Secret, with a bold note that the secret is displayed only this once, is exactly what saved-search (SOAP/TBA) auth asks for later, and belongs in a password manager.</li>
+  <li>The M2M and auth-code sections drop their own record-creation steps and reference the checklist; each keeps only its flow-specific steps (certificate/mapping; public client + redirect URI).</li>
+  <li>The "Saved searches (SOAP)" section reframes its setup as "already complete if you followed the setup checklist", keeps the sunset warning, and keeps the Reset Credentials trap as the recovery path for <em>pre-existing</em> records created without TBA.</li>
+</ul>
+
+<h2>3. CLI: <code>account add</code> offers SOAP setup</h2>
+<table>
+  <tr><th>Condition after a successful <code>account add</code> (both flows)</th><th>Behavior</th></tr>
+  <tr><td>Alias already has a minted TBA token (<code>get_tba</code> → <code>token_id</code> present)</td><td>Nothing — no prompt, no tip (re-adds shouldn't nag).</td></tr>
+  <tr><td>stdin is a TTY, no token</td><td>stderr prompt: <code>Saved searches use SOAP/TBA auth. Set it up for '&lt;alias&gt;' now? [y/N] </code>. On <code>y</code>/<code>Y</code>/<code>yes</code>: run the existing <code>account::soap_auth</code> inline (consumer key/secret prompt → browser consent). Anything else: print the tip.</td></tr>
+  <tr><td>Not a TTY, no token</td><td>stderr tip only: <code>tip: saved searches authenticate separately (SOAP/TBA) — run `netsuite-cli account soap-auth &lt;alias&gt;` when ready (needs the consumer key/secret captured at integration-record creation)</code>. Agents/scripts are never prompted.</td></tr>
+</table>
+<ul>
+  <li>The offer lives in the <code>cli.rs</code> dispatch (a small helper called from both <code>AccountAction::Add</code> arms after success), reusing <code>commands::account::soap_auth</code> with the add's port/paste arguments where applicable (default 8899, non-paste).</li>
+  <li>The keyring read for the skip-check reuses the store handle already present in the dispatch.</li>
+</ul>
+
+<h2>4. Output contract</h2>
+<ul>
+  <li>stdout remains exactly <strong>one JSON object</strong>: the add result, gaining <code>"soapTokenStored": true|false</code> <em>only</em> when the chained setup actually ran (declined/skip paths leave the add JSON unchanged).</li>
+  <li>Chained soap-auth failure does not fail the add: exit 0, <code>"soapTokenStored": false</code>, and the soap error JSON plus <code>re-run: netsuite-cli account soap-auth &lt;alias&gt;</code> guidance on stderr. The primary operation succeeded; the retry path is explicit.</li>
+  <li>No new error kinds; exit codes unchanged.</li>
+</ul>
+
+<h2>5. Tests, docs, constraints</h2>
+<ul>
+  <li>Pure helper (e.g. <code>soap_auth_tip(alias) -&gt; String</code> and the yes/no answer parser) with unit tests; the TTY prompt branch itself stays untested, matching the sanctioned <code>ensure_tba_secrets</code> precedent.</li>
+  <li>A test covering the merge: add-result JSON + <code>soapTokenStored</code> flag composition.</li>
+  <li>SKILL.md: one line telling agents <code>account add</code> never prompts non-interactively (tip on stderr only) and that <code>account soap-auth</code> remains the explicit path.</li>
+  <li>House rules apply: gate (<code>fmt</code>/<code>clippy -D warnings</code>/<code>test</code>) before every commit, no Creative Planning identifiers in any artifact, copy-paste-correct <code>after_help</code>/README examples.</li>
+</ul>
+
+<h2>6. Out of scope</h2>
+<ul>
+  <li>Auto-detecting whether the integration record actually has TBA enabled (no API for it).</li>
+  <li>Any change to <code>saved-search run</code> auto-auth, <code>soap_auth</code> internals, or credential storage.</li>
+  <li>Windows/`--paste` variations beyond what <code>soap_auth</code> already handles.</li>
+</ul>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+</body>
+</html>

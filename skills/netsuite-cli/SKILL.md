@@ -48,6 +48,11 @@ netsuite-cli account test --account <alias>   # proves auth end to end
   account whose token may be expired.
 - Account targeting: `--account <alias>` flag → `NETSUITE_ACCOUNT` env var →
   configured default (`account set-default`).
+- `account add` never prompts when non-interactive — if no SOAP token is stored yet for the
+  alias, it prints a one-line stderr tip pointing at `account soap-auth <alias>` (a re-add with a
+  token already stored prints nothing); on a TTY it offers to chain SOAP setup immediately
+  (answer `N` to skip). The add JSON gains `"soapTokenStored"` only when the chained setup
+  actually ran.
 
 ## Recipes
 
