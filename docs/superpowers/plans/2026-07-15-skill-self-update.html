@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Self-Updating Skill — Implementation Plan (2026-07-15)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; --warn-bg:#fdf3e3; --warn-border:#e6c98a; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:920px; padding:2.5rem 1.5rem 4rem; font:15px/1.55 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); }
+  h1 { font-size:1.55rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2.2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  h2.task { background:var(--accent-soft); padding:.45rem .7rem; border-radius:8px; border-bottom:none; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.2rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.85em; }
+  code { background:var(--code-bg); padding:.1em .3em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.8rem 1rem; overflow-x:auto; line-height:1.45; }
+  .callout { background:var(--warn-bg); border:1px solid var(--warn-border); border-radius:8px; padding:.7rem 1rem; margin:.8rem 0; }
+  ul.step { list-style:none; padding-left:0; } ul.step li { margin:.6rem 0; }
+  ul { padding-left:1.3rem; }
+</style>
+</head>
+<body>
+
+<h1>Self-Updating Skill — Implementation Plan</h1>
+<div class="meta">2026-07-15 · Executes <code>docs/superpowers/specs/2026-07-15-skill-self-update-design.html</code> · Branch: <code>feature/skill-self-update</code> (already created; carries the spec commit)</div>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: superpowers:subagent-driven-development (recommended) or superpowers:executing-plans, task-by-task with checkboxes.</div>
+
+<p><strong>Goal:</strong> <code>netsuite-cli update</code> refreshes the embedded agent skill into the user's Claude skills dir, and a new <code>skill install</code> command bootstraps/refreshes it on demand — without clobbering a symlinked repo skill.</p>
+<p><strong>Architecture:</strong> A new <code>src/commands/skill.rs</code> embeds SKILL.md via <code>include_str!</code>, resolves a target with a pure guard function, and writes it. <code>update</code> re-execs the freshly-installed binary's <code>skill install</code> after the swap so the NEW embedded skill is written. Both surface through clap in <code>src/cli.rs</code>.</p>
+<p><strong>Tech stack:</strong> Rust, clap v4, serde_json, tempfile (dev), assert_cmd (dev) — all already present; no new dependencies.</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li>No Creative Planning identifiers in any repo artifact — placeholders only.</li>
+  <li>Gate before every commit: <code>cargo fmt --all &amp;&amp; cargo clippy --all-targets -- -D warnings &amp;&amp; cargo test</code>.</li>
+  <li>Commits end with <code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code>.</li>
+  <li>stdout stays exactly ONE JSON object per invocation; tips/notes go to stderr; exit codes unchanged; no new error kinds.</li>
+  <li>Every skip outcome is NON-FATAL and reported as <code>{"installed":false,"reason":"…"}</code>; a skill-refresh failure never fails the binary <code>update</code> (exit 0).</li>
+  <li>Symlink detection uses <code>std::fs::symlink_metadata</code> (never follows the link).</li>
+  <li><code>after_help</code>/README examples copy-paste correct.</li>
+</ul>
+
+<h2>File structure</h2>
+<ul>
+  <li><code>src/commands/skill.rs</code> — NEW: <code>EMBEDDED_SKILL</code> const, <code>SkillTarget</code> enum, <code>resolve_target</code> (pure), <code>install</code>.</li>
+  <li><code>src/commands/mod.rs</code> — register <code>pub mod skill;</code>.</li>
+  <li><code>src/commands/update.rs</code> — after a successful install, re-exec <code>skill install</code> unless suppressed; merge result under <code>"skill"</code>.</li>
+  <li><code>src/cli.rs</code> — <code>Command::Skill { action: SkillAction }</code> + <code>SkillAction::Install { dir }</code>; <code>Update { check, no_skill }</code>; dispatch arms; after_help.</li>
+  <li><code>tests/skill_commands.rs</code> — NEW filesystem integration suite.</li>
+  <li><code>README.md</code> — "Updating" section changes.</li>
+</ul>
+
+<div class="callout"><strong>Setup:</strong> the branch <code>feature/skill-self-update</code> already exists with the spec commit; just <code>git checkout feature/skill-self-update</code>.</div>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 1: <code>skill.rs</code> — embed, resolve, install</h2>
+<p><strong>Files:</strong> Create <code>src/commands/skill.rs</code>; Modify <code>src/commands/mod.rs</code></p>
+<p><strong>Interfaces produced:</strong></p>
+<pre>pub const EMBEDDED_SKILL: &amp;str = include_str!("../../skills/netsuite-cli/SKILL.md");
+
+pub enum SkillTarget {
+    Write(std::path::PathBuf),   // the SKILL.md file to write
+    Skip(&amp;'static str),          // reason (stable string for the JSON "reason" field)
+}
+
+/// Pure: decides where/whether to write, given the CLI --dir override, the resolved
+/// config base (None if neither $CLAUDE_CONFIG_DIR nor ~/.claude could be determined),
+/// whether that base dir exists, and the current on-disk state of the target.
+pub fn resolve_target(dir_override: Option&lt;&amp;std::path::Path&gt;, config_base: Option&lt;&amp;std::path::Path&gt;,
+    base_exists: bool) -&gt; SkillTarget
+
+pub fn install(dir_override: Option&lt;&amp;std::path::Path&gt;) -&gt; Result&lt;serde_json::Value, CliError&gt;</pre>
+<p><strong>Behavior facts:</strong> target file basename is always <code>SKILL.md</code>; under a resolved base it is <code>&lt;base&gt;/skills/netsuite-cli/SKILL.md</code>; with <code>--dir</code> it is <code>&lt;dir&gt;/SKILL.md</code> unless <code>&lt;dir&gt;</code> already ends in <code>SKILL.md</code>. Guards run in this order: (1) no dir_override and base missing → <code>Skip("no Claude config dir")</code>; (2) file or parent dir is a symlink (<code>symlink_metadata</code>) → <code>Skip("symlink — skill tracks its source repo via git")</code>; (3) file exists and content equals <code>EMBEDDED_SKILL</code> → <code>Skip("already current")</code>; else <code>Write(path)</code>. <code>install</code> performs the symlink/content checks (which <code>resolve_target</code> cannot, being pure), creates parent dirs on Write, writes, and shapes JSON.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Failing tests</strong> (in skill.rs's <code>mod tests</code>) — the pure resolver + embedded assertion (filesystem-touching cases live in Task 3's integration file):
+<pre>use std::path::{Path, PathBuf};
+
+#[test]
+fn embedded_skill_carries_the_real_frontmatter() {
+    assert!(EMBEDDED_SKILL.starts_with("---\nname: netsuite-cli"));
+    assert!(EMBEDDED_SKILL.len() &gt; 1000);
+}
+
+#[test]
+fn resolve_target_skips_when_no_override_and_base_missing() {
+    let target = resolve_target(None, Some(Path::new("/no/such/base")), false);
+    assert!(matches!(target, SkillTarget::Skip("no Claude config dir")));
+}
+
+#[test]
+fn resolve_target_builds_the_conventional_path_under_an_existing_base() {
+    let base = Path::new("/home/x/.claude");
+    match resolve_target(None, Some(base), true) {
+        SkillTarget::Write(path) =&gt;
+            assert_eq!(path, PathBuf::from("/home/x/.claude/skills/netsuite-cli/SKILL.md")),
+        other =&gt; panic!("expected Write, got {other:?}"),
+    }
+}
+
+#[test]
+fn dir_override_targets_skill_md_and_ignores_base_existence() {
+    match resolve_target(Some(Path::new("/tmp/dest")), None, false) {
+        SkillTarget::Write(path) =&gt; assert_eq!(path, PathBuf::from("/tmp/dest/SKILL.md")),
+        other =&gt; panic!("expected Write, got {other:?}"),
+    }
+}
+
+#[test]
+fn dir_override_that_already_names_skill_md_is_used_verbatim() {
+    match resolve_target(Some(Path::new("/tmp/dest/SKILL.md")), None, false) {
+        SkillTarget::Write(path) =&gt; assert_eq!(path, PathBuf::from("/tmp/dest/SKILL.md")),
+        other =&gt; panic!("expected Write, got {other:?}"),
+    }
+}</pre>
+(Add <code>#[derive(Debug)]</code> on <code>SkillTarget</code> so the <code>panic!("{other:?}")</code> compiles.)</li>
+<li>☐ <strong>Step 2: Run, verify failure</strong> — <code>cargo test --lib skill</code> → module/functions not found.</li>
+<li>☐ <strong>Step 3: Implement</strong> <code>src/commands/skill.rs</code> (register <code>pub mod skill;</code> in <code>src/commands/mod.rs</code> alphabetically):
+<pre>use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+
+use crate::error::CliError;
+
+pub const EMBEDDED_SKILL: &amp;str = include_str!("../../skills/netsuite-cli/SKILL.md");
+
+const SKILL_FILE: &amp;str = "SKILL.md";
+
+#[derive(Debug)]
+pub enum SkillTarget {
+    Write(PathBuf),
+    Skip(&amp;'static str),
+}
+
+pub fn install(dir_override: Option&lt;&amp;Path&gt;) -&gt; Result&lt;Value, CliError&gt; {
+    let config_base = config_base_dir();
+    let base_exists = config_base.as_deref().is_some_and(Path::exists);
+    let target = resolve_target(dir_override, config_base.as_deref(), base_exists);
+
+    let path = match target {
+        SkillTarget::Skip(reason) =&gt; {
+            if reason == "no Claude config dir" {
+                eprintln!(
+                    "skill not installed ({reason}); place it yourself with \
+                     `netsuite-cli skill install --dir &lt;your skills dir&gt;`"
+                );
+            }
+            return Ok(skip_json(reason));
+        }
+        SkillTarget::Write(path) =&gt; path,
+    };
+
+    // Re-check symlink + content here (resolve_target is pure and cannot touch disk).
+    if is_symlink(&amp;path) || path.parent().is_some_and(is_symlink) {
+        return Ok(skip_json("symlink — skill tracks its source repo via git"));
+    }
+    if std::fs::read_to_string(&amp;path).is_ok_and(|existing| existing == EMBEDDED_SKILL) {
+        return Ok(installed_json(&amp;path, false, Some("already current")));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|io_error| {
+            CliError::Usage(format!("cannot create {}: {io_error}", parent.display()))
+        })?;
+    }
+    std::fs::write(&amp;path, EMBEDDED_SKILL).map_err(|io_error| {
+        CliError::Usage(format!("cannot write {}: {io_error}", path.display()))
+    })?;
+    Ok(installed_json(&amp;path, true, None))
+}
+
+pub fn resolve_target(
+    dir_override: Option&lt;&amp;Path&gt;,
+    config_base: Option&lt;&amp;Path&gt;,
+    base_exists: bool,
+) -&gt; SkillTarget {
+    if let Some(dir) = dir_override {
+        let path = if dir.file_name().is_some_and(|name| name == SKILL_FILE) {
+            dir.to_path_buf()
+        } else {
+            dir.join(SKILL_FILE)
+        };
+        return SkillTarget::Write(path);
+    }
+    match config_base {
+        Some(base) if base_exists =&gt; {
+            SkillTarget::Write(base.join("skills").join("netsuite-cli").join(SKILL_FILE))
+        }
+        _ =&gt; SkillTarget::Skip("no Claude config dir"),
+    }
+}
+
+fn config_base_dir() -&gt; Option&lt;PathBuf&gt; {
+    if let Ok(explicit) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !explicit.is_empty() {
+            return Some(PathBuf::from(explicit));
+        }
+    }
+    directories::UserDirs::new().map(|dirs| dirs.home_dir().join(".claude"))
+}
+
+fn is_symlink(path: &amp;Path) -&gt; bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+fn skip_json(reason: &amp;str) -&gt; Value {
+    json!({"skill": "netsuite-cli", "installed": false, "reason": reason})
+}
+
+fn installed_json(path: &amp;Path, installed: bool, reason: Option&lt;&amp;str&gt;) -&gt; Value {
+    let mut result = json!({
+        "skill": "netsuite-cli", "path": path.display().to_string(), "installed": installed,
+    });
+    if let Some(reason) = reason {
+        result["reason"] = json!(reason);
+    }
+    result
+}</pre>
+(<code>directories</code> is already a dependency — confirm the exact <code>UserDirs</code>/home API against the version in <code>Cargo.lock</code>; if it differs, use whatever the crate exposes for the home dir, or <code>std::env::var_os("HOME")</code> as a fallback. Keep <code>config_base_dir</code> the only impure input so the resolver stays testable.)</li>
+<li>☐ <strong>Step 4: Run tests, gate, commit</strong> — <code>git commit -m "feat: embed the agent skill and add skill target resolution"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 2: <code>skill install</code> CLI + <code>update</code> re-exec</h2>
+<p><strong>Files:</strong> Modify <code>src/cli.rs</code>, <code>src/commands/update.rs</code></p>
+<p><strong>Consumes:</strong> <code>commands::skill::install(Option&lt;&amp;Path&gt;) -&gt; Result&lt;Value, CliError&gt;</code>.</p>
+<p><strong>Produces:</strong> CLI <code>netsuite-cli skill install [--dir &lt;path&gt;]</code>; <code>update</code> gains <code>--no-skill</code> and a <code>"skill"</code> field.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: clap wiring</strong> in <code>src/cli.rs</code> — add the command (near <code>Update</code>, src/cli.rs:107-113) and a subcommand enum:
+<pre>/// Install or refresh the bundled agent skill (SKILL.md) into your Claude skills dir
+#[command(
+    after_help = "Examples:\n  netsuite-cli skill install\n  \
+netsuite-cli skill install --dir ~/.config/claude/skills/netsuite-cli"
+)]
+Skill {
+    #[command(subcommand)]
+    action: SkillAction,
+},</pre>
+<pre>#[derive(Subcommand)]
+pub enum SkillAction {
+    /// Write the embedded SKILL.md to your Claude skills dir (skips a symlinked/repo-tracked copy)
+    Install {
+        /// Target dir (default: $CLAUDE_CONFIG_DIR or ~/.claude, under skills/netsuite-cli)
+        #[arg(long)]
+        dir: Option&lt;PathBuf&gt;,
+    },
+}</pre>
+Extend the <code>Update</code> variant (src/cli.rs:109-113):
+<pre>Update {
+    /// Only report whether a newer release is available; do not install it
+    #[arg(long)]
+    check: bool,
+    /// Do not refresh the bundled agent skill after updating the binary
+    #[arg(long)]
+    no_skill: bool,
+},</pre></li>
+<li>☐ <strong>Step 2: dispatch arms</strong> — update <code>Command::Update</code> (src/cli.rs:838) and add <code>Command::Skill</code>:
+<pre>Command::Update { check, no_skill } =&gt; update::run(*check, *no_skill).await,
+Command::Skill { action } =&gt; match action {
+    SkillAction::Install { dir } =&gt; commands::skill::install(dir.as_deref()),
+},</pre>
+(Confirm <code>commands</code> / <code>skill</code> are in scope at the dispatch site; the file already imports the sibling command modules — add <code>skill</code> to that <code>use</code> list if needed.)</li>
+<li>☐ <strong>Step 3: update.rs re-exec</strong> — change <code>run</code>'s signature and <code>install_update</code> to refresh the skill via the new binary:
+<pre>pub async fn run(check_only: bool, skip_skill: bool) -&gt; Result&lt;Value, CliError&gt; {
+    tokio::task::spawn_blocking(move || {
+        if check_only {
+            check_for_update()
+        } else {
+            install_update(skip_skill)
+        }
+    })
+    .await
+    .map_err(|join_error| CliError::Network(format!("update task panicked: {join_error}")))?
+}
+
+fn install_update(skip_skill: bool) -&gt; Result&lt;Value, CliError&gt; {
+    let updater = build_updater()?;
+    let status = updater
+        .update()
+        .map_err(|update_error| CliError::Network(update_error.to_string()))?;
+    let mut result = json!({ "updated": status.updated(), "version": status.version() });
+    if !skip_skill &amp;&amp; status.updated() {
+        result["skill"] = refresh_skill_via_new_binary();
+    }
+    Ok(result)
+}
+
+/// The running process is the OLD binary and still holds the OLD embedded skill, so it cannot
+/// write the new one directly. self_update has already replaced the file at current_exe(); run
+/// THAT (now-new) binary's `skill install` so the fresh embedded skill lands. Never fatal — a
+/// failure here leaves the binary updated and only the skill stale.
+fn refresh_skill_via_new_binary() -&gt; Value {
+    let exe = match std::env::current_exe() {
+        Ok(path) =&gt; path,
+        Err(error) =&gt; return skill_refresh_error(&amp;format!("cannot locate updated binary: {error}")),
+    };
+    let output = std::process::Command::new(exe).args(["skill", "install"]).output();
+    match output {
+        Ok(done) if done.status.success() =&gt; {
+            // Surface the child's stderr notes (symlink/no-config-dir tips) to the user.
+            if !done.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&amp;done.stderr));
+            }
+            serde_json::from_slice(&amp;done.stdout)
+                .unwrap_or_else(|_| skill_refresh_error("skill install produced no JSON"))
+        }
+        Ok(done) =&gt; skill_refresh_error(&amp;format!(
+            "skill install exited {}: {}",
+            done.status,
+            String::from_utf8_lossy(&amp;done.stderr).trim()
+        )),
+        Err(error) =&gt; skill_refresh_error(&amp;format!("could not run skill install: {error}")),
+    }
+}
+
+fn skill_refresh_error(message: &amp;str) -&gt; Value {
+    eprintln!("binary updated; skill refresh skipped — {message}");
+    json!({"skill": "netsuite-cli", "installed": false, "reason": message})
+}</pre>
+Update the existing test module imports if the signature change breaks a call (the current tests only exercise <code>update_available</code>, which is unchanged).</li>
+<li>☐ <strong>Step 4: Parse tests</strong> in cli.rs's test mod:
+<pre>#[test]
+fn skill_install_parses_dir_override() {
+    let cli = Cli::try_parse_from([
+        "netsuite-cli", "skill", "install", "--dir", "/tmp/x",
+    ]).unwrap();
+    let Command::Skill { action: SkillAction::Install { dir } } = cli.command
+        else { panic!("wrong variant") };
+    assert_eq!(dir, Some(PathBuf::from("/tmp/x")));
+}
+
+#[test]
+fn update_parses_no_skill_flag() {
+    let cli = Cli::try_parse_from(["netsuite-cli", "update", "--no-skill"]).unwrap();
+    let Command::Update { check, no_skill } = cli.command else { panic!("wrong variant") };
+    assert!(!check);
+    assert!(no_skill);
+}</pre></li>
+<li>☐ <strong>Step 5: Run tests, gate, commit</strong> — <code>git commit -m "feat: skill install command and skill refresh on update"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 3: filesystem integration tests</h2>
+<p><strong>Files:</strong> Create <code>tests/skill_commands.rs</code></p>
+<p>Exercises the real <code>skill install</code> against tempdirs (no network). Study an existing integration test file (e.g. <code>tests/system_commands.rs</code> or <code>tests/config_cmd.rs</code>) for how the crate drives the binary — prefer calling <code>netsuite_cli::commands::skill::install</code> directly where possible, falling back to <code>assert_cmd</code> if a full-process run is needed for the <code>--dir</code> path.</p>
+
+<ul class="step">
+<li>☐ <strong>Step 1: Tests</strong>:
+<pre>use netsuite_cli::commands::skill::{self, EMBEDDED_SKILL};
+
+#[test]
+fn install_writes_embedded_skill_to_dir_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = skill::install(Some(dir.path())).unwrap();
+    assert_eq!(result["installed"], true);
+    let written = std::fs::read_to_string(dir.path().join("SKILL.md")).unwrap();
+    assert_eq!(written, EMBEDDED_SKILL);
+    assert_eq!(result["path"], dir.path().join("SKILL.md").display().to_string());
+}
+
+#[test]
+fn second_install_reports_already_current() {
+    let dir = tempfile::tempdir().unwrap();
+    skill::install(Some(dir.path())).unwrap();
+    let again = skill::install(Some(dir.path())).unwrap();
+    assert_eq!(again["installed"], false);
+    assert_eq!(again["reason"], "already current");
+}
+
+#[test]
+fn install_skips_a_symlinked_target_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-SKILL.md");
+    std::fs::write(&amp;real, "stale").unwrap();
+    let link = dir.path().join("SKILL.md");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&amp;real, &amp;link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&amp;real, &amp;link).unwrap();
+    let result = skill::install(Some(dir.path())).unwrap();
+    assert_eq!(result["installed"], false);
+    assert!(result["reason"].as_str().unwrap().contains("symlink"));
+    // the symlinked file must be untouched
+    assert_eq!(std::fs::read_to_string(&amp;real).unwrap(), "stale");
+}
+
+#[test]
+fn changed_content_is_overwritten_on_reinstall() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("SKILL.md"), "outdated").unwrap();
+    let result = skill::install(Some(dir.path())).unwrap();
+    assert_eq!(result["installed"], true);
+    assert_eq!(std::fs::read_to_string(dir.path().join("SKILL.md")).unwrap(), EMBEDDED_SKILL);
+}</pre>
+Note: for the symlink test, <code>--dir</code> ending in a dir means the target is <code>&lt;dir&gt;/SKILL.md</code>; the test creates the symlink at exactly that path so <code>is_symlink</code> trips.</li>
+<li>☐ <strong>Step 2: Run, gate, commit</strong> — <code>git commit -m "test: filesystem coverage for skill install"</code></li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 class="task">Task 4: README "Updating" docs</h2>
+<p><strong>Files:</strong> Modify <code>README.md</code></p>
+<ul class="step">
+<li>☐ <strong>Step 1</strong> — in the "Updating" section: state that <code>netsuite-cli update</code> now also refreshes the bundled agent skill into <code>$CLAUDE_CONFIG_DIR</code>/<code>~/.claude</code> <code>/skills/netsuite-cli/SKILL.md</code>; that it is skipped (harmlessly) when that path is a symlink into a repo clone or when no Claude config dir exists (with a pointer to <code>skill install --dir</code>); that <code>--no-skill</code> opts out; and that <code>netsuite-cli skill install</code> places or refreshes the skill on demand (first-time setup for release-binary users). Include the version-skew caveat verbatim from spec §6: the first update onto a skill-aware release is done by the older binary and refreshes only the binary that hop — automatic thereafter, or run <code>skill install</code> once to bootstrap.</li>
+<li>☐ <strong>Step 2</strong> — verify examples parse (<code>cargo run -q -- skill install --help</code>, <code>cargo run -q -- update --help</code>); identifier sweep <code>git diff main | grep -icE "<real-account-id>|<org-name>|<username>"</code> → 0; gate; commit <code>git commit -m "docs: document skill self-update and skill install"</code>.</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2>Final verification (before PR)</h2>
+<ul>
+  <li>☐ Full gate green.</li>
+  <li>☐ Identifier sweep over the whole diff → 0.</li>
+  <li>☐ Live check (controller): build release, run <code>skill install --dir &lt;tmp&gt;</code> → file written; re-run → <code>already current</code>; point <code>--dir</code> at a symlink → skipped. The full <code>update</code> re-exec path is exercised naturally at the next real release (the first release carrying this code cannot self-demonstrate the refresh — version-skew caveat).</li>
+  <li>☐ Open PR (non-draft) → pr-review-loop to green.</li>
+</ul>
+
+</body>
+</html>

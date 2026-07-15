@@ -485,6 +485,43 @@ netsuite-cli update --check   # report whether a newer release exists; installs 
 netsuite-cli update           # download and install the latest release in place
 ```
 
+After swapping the binary, `update` also refreshes the bundled agent skill, writing the embedded
+`SKILL.md` to `$CLAUDE_CONFIG_DIR` (if set) or `~/.claude`, under `skills/netsuite-cli/SKILL.md`.
+The result gains a nested `"skill"` object reporting that outcome:
+
+```bash
+$ netsuite-cli update
+{"updated":true,"version":"0.4.1","skill":{"installed":true,"path":"/home/you/.claude/skills/netsuite-cli/SKILL.md"}}
+```
+
+The refresh is skipped, harmlessly, in three cases — each reported as
+`{"installed":false,"reason":"…"}`, none of which fail the update:
+
+- the target (or its parent directory) is a **symlink** — `"skill tracks its source repo via
+  git"`, protecting a developer checkout where the skill is symlinked into a git clone;
+- **no Claude config dir** exists — a stderr tip names `skill install --dir <path>` so you can
+  place it yourself;
+- the content is **already current** — a quiet no-op on repeat runs.
+
+Pass `--no-skill` to opt out of the refresh entirely. `update --check` never touches the skill —
+it only reports version availability.
+
+Run `netsuite-cli skill install [--dir <path>]` directly to place or refresh the skill on demand
+— first-time setup if you're on a release binary installed before this feature existed, or to
+point it at a non-default location:
+
+```bash
+$ netsuite-cli skill install
+{"skill":"netsuite-cli","path":"/home/you/.claude/skills/netsuite-cli/SKILL.md","installed":true}
+
+$ netsuite-cli skill install --dir ~/.config/claude/skills/netsuite-cli
+{"skill":"netsuite-cli","path":"/home/you/.config/claude/skills/netsuite-cli/SKILL.md","installed":true}
+```
+
+**Version-skew caveat:** the first update onto a skill-aware release is performed by the older,
+skill-unaware binary, so that hop refreshes only the binary — automatic from the next version, or
+run `skill install` once to bootstrap.
+
 ## Development
 
 ```bash

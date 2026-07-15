@@ -42,6 +42,8 @@ netsuite-cli account test --account <alias>   # proves auth end to end
 
 - No credentials yet? The NetSuite-side setup (integration record + certificate
   upload) needs a human admin once — steps are in the README under "NetSuite setup".
+- This skill ships embedded in the netsuite-cli binary — `netsuite-cli update` (or
+  `netsuite-cli skill install`) refreshes it automatically.
 - **M2M is the right flow for agents**: unattended, no browser, safe under
   parallel invocations. Auth-code acts as a named user but its refresh tokens
   are one-time-rotating — never run parallel commands against an auth-code

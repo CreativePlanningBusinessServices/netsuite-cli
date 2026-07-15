@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netsuite-cli Self-Updating Skill — Design Spec (2026-07-15)</title>
+<style>
+  :root { --ink:#1e2430; --muted:#5c6675; --accent:#0a6e5c; --accent-soft:#e3f2ee; --border:#d9dee6; --code-bg:#f4f6f9; }
+  * { box-sizing:border-box; }
+  body { margin:0 auto; max-width:860px; padding:2.5rem 1.5rem 4rem; font:16px/1.6 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  h1 { font-size:1.6rem; margin:0 0 .25rem; }
+  h2 { font-size:1.25rem; margin:2rem 0 .6rem; border-bottom:2px solid var(--accent-soft); padding-bottom:.3rem; }
+  .meta { color:var(--muted); font-size:.9rem; margin-bottom:1.5rem; }
+  code, pre { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:.86em; }
+  code { background:var(--code-bg); padding:.1em .35em; border-radius:4px; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:8px; padding:.9rem 1rem; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; margin:.8rem 0; font-size:.93rem; }
+  th, td { border:1px solid var(--border); padding:.45rem .65rem; text-align:left; vertical-align:top; }
+  th { background:var(--code-bg); }
+  ul { padding-left:1.3rem; } li { margin:.25rem 0; }
+  .buttons { display:flex; gap:.75rem; flex-wrap:wrap; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:1rem; margin:1.2rem 0; align-items:center; }
+  .buttons span { font-weight:600; }
+  .buttons a { display:inline-block; padding:.5rem 1.1rem; border-radius:8px; text-decoration:none; font-weight:600; border:1px solid var(--accent); }
+  .buttons a.primary { background:var(--accent); color:#fff; }
+  .buttons a.secondary { background:#fff; color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>Self-Updating Skill — Design Spec</h1>
+<div class="meta">2026-07-15 · <code>netsuite-cli update</code> refreshes the agent skill (SKILL.md) alongside the binary, and a new <code>skill install</code> command bootstraps or refreshes it on demand — so release-binary users (no repo clone) keep the skill in sync with the tool.</div>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+<h2>1. Problem</h2>
+<p>Today <code>netsuite-cli update</code> swaps only the binary (release assets are the three platform binary zips — no SKILL.md). The skill stays current only for developers whose <code>~/.claude/skills/netsuite-cli</code> is a symlink into a git-pulled repo clone. A user who installs from a release binary never receives skill updates from <code>update</code> at all. Goal (Jon, 2026-07-15): the skill self-updates with the binary, without clobbering the symlinked repo case.</p>
+
+<h2>2. Content source — embed + re-exec</h2>
+<ul>
+  <li>SKILL.md is compiled into the binary: <code>pub const EMBEDDED_SKILL: &amp;str = include_str!("../../skills/netsuite-cli/SKILL.md");</code> (from <code>src/commands/skill.rs</code>, resolves to the repo's single-file skill). The embedded copy therefore always matches the binary's exact source version.</li>
+  <li><strong>The stale-in-memory problem:</strong> <code>update</code> runs in the OLD process. After <code>self_update</code> replaces the executable file on disk, the running process still holds the OLD embedded skill — so it cannot write the new one directly. Resolution: after a successful binary swap, <code>update</code> spawns the freshly-installed binary (<code>std::env::current_exe()</code> now points at it) as <code>&lt;exe&gt; skill install</code>, which runs NEW code with the NEW embedded skill. Its stdout JSON folds into the update result under a <code>"skill"</code> key.</li>
+  <li>Re-exec failure (non-zero exit, unparseable output, missing exe) is <strong>non-fatal</strong>: the update still returns <code>{"updated":true,…}</code> exit 0, with <code>"skill":{"installed":false,"reason":"&lt;error&gt;"}</code> and a one-line stderr note. The primary operation succeeded.</li>
+  <li><code>update --check</code> is read-only and never touches the skill. New <code>update --no-skill</code> flag skips the re-exec entirely.</li>
+</ul>
+
+<h2>3. Command surface</h2>
+<table>
+  <tr><th>Command</th><th>Behavior</th><th>stdout</th></tr>
+  <tr><td><code>skill install [--dir &lt;path&gt;]</code></td><td>Resolve the target, apply the guards (§4), write <code>EMBEDDED_SKILL</code> if clear. The primitive both first-time users and <code>update</code>'s re-exec call.</td><td><code>{"skill":"netsuite-cli","path":"&lt;file&gt;","installed":true|false,"reason":"&lt;why, when not installed&gt;"}</code></td></tr>
+  <tr><td><code>update</code></td><td>Existing binary install + (unless <code>--no-skill</code>) the re-exec skill refresh; result gains a <code>"skill"</code> sub-object.</td><td><code>{"updated":bool,"version":"…","skill":{…}}</code></td></tr>
+</table>
+
+<h2>4. Target resolution &amp; guards</h2>
+<p><code>resolve_skill_target(dir_override, config_base, …)</code> — a pure function returning either a write path or a skip reason:</p>
+<ul>
+  <li><strong>Base dir:</strong> <code>$CLAUDE_CONFIG_DIR</code> if set, else <code>~/.claude</code>. Target file = <code>&lt;base&gt;/skills/netsuite-cli/SKILL.md</code>.</li>
+  <li><strong><code>--dir &lt;path&gt;</code></strong> overrides the base entirely; the target is <code>&lt;path&gt;/SKILL.md</code> (or, if <code>&lt;path&gt;</code> ends in <code>SKILL.md</code>, that exact file), parents created as needed — explicit user intent, no base-existence check.</li>
+</ul>
+<p>Guards, checked in order; every skip is <strong>non-fatal</strong> and reported via the <code>installed:false</code> + <code>reason</code> shape (plus a stderr line where noted):</p>
+<table>
+  <tr><th>Condition</th><th>Outcome</th><th>reason</th></tr>
+  <tr><td>No <code>--dir</code> and base dir does not exist</td><td>Skip; stderr tip naming <code>skill install --dir &lt;path&gt;</code></td><td><code>no Claude config dir</code></td></tr>
+  <tr><td>Target file, or its parent dir, is a symlink</td><td>Skip (protects the repo-symlink dev case)</td><td><code>symlink — skill tracks its source repo via git</code></td></tr>
+  <tr><td>Target exists and its content already equals <code>EMBEDDED_SKILL</code></td><td>Skip (idempotent, quiet re-runs)</td><td><code>already current</code></td></tr>
+  <tr><td>Otherwise</td><td>Create <code>skills/netsuite-cli</code> if missing, write the file</td><td>— (<code>installed:true</code>)</td></tr>
+</table>
+<p>Symlink detection uses <code>symlink_metadata</code> (does not follow the link) on both the file and the parent dir. Writing always overwrites a non-symlink regular file — "refresh" is the intent; hand-edited managed skills are not a supported case.</p>
+
+<h2>5. Testing</h2>
+<ul>
+  <li><strong>Unit (pure resolver):</strong> table-driven over (dir_override present?, base set/exists?, target is symlink?, existing content matches?) → expected decision (WritePath vs Skip(reason)). Uses <code>tempfile</code> dirs; no globals mutated except a scoped <code>CLAUDE_CONFIG_DIR</code> guard in a single env-owning test (process env is global — mirror the existing <code>EnvVarGuard</code> precedent).</li>
+  <li><strong>Integration (<code>tests/skill_commands.rs</code>, filesystem only, no network):</strong> <code>skill install --dir &lt;tmp&gt;</code> writes SKILL.md with the embedded content; second run reports <code>already current</code>; a symlinked target is skipped with the symlink reason; a missing base with no <code>--dir</code> skips with the config-dir reason.</li>
+  <li><strong>Embedded-content assertion:</strong> <code>EMBEDDED_SKILL</code> is non-empty and starts with the frontmatter <code>---\nname: netsuite-cli</code>.</li>
+  <li><strong>Re-exec glue</strong> in <code>update.rs</code> stays thin and is not unit-tested (needs a real binary swap + network), matching how the existing <code>check_for_update</code>/<code>install_update</code> network paths are already left to manual/live verification. Covered by the final live check.</li>
+</ul>
+
+<h2>6. Docs &amp; the one caveat</h2>
+<ul>
+  <li>README "Updating" section: <code>update</code> now also refreshes the skill; explains the symlink/no-config-dir skips and <code>--no-skill</code>; documents <code>skill install</code> for first-time placement and the <code>--dir</code> override.</li>
+  <li>SKILL.md / README note that the skill is self-managing via the binary.</li>
+  <li><strong>Version-skew caveat, documented plainly:</strong> the <em>first</em> update onto a skill-aware release is performed by the older, skill-unaware binary, so it refreshes only the binary that hop. From the next version onward the refresh is automatic; a user can run <code>skill install</code> once to bootstrap immediately.</li>
+</ul>
+
+<h2>7. Out of scope</h2>
+<ul>
+  <li>Multi-file skills (the skill is a single <code>SKILL.md</code> today; embedding one file suffices).</li>
+  <li>Bundling SKILL.md as a separate release asset or fetching it over the network (embedding removes the need).</li>
+  <li>Managing skills for any tool other than <code>netsuite-cli</code>.</li>
+  <li>Removing/uninstalling the skill.</li>
+</ul>
+
+<div class="buttons">
+  <span>Spec review:</span>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve%20spec" target="_blank">Approve — write the implementation plan</a>
+  <a class="secondary" href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request%20changes" target="_blank">Request changes</a>
+</div>
+
+</body>
+</html>
