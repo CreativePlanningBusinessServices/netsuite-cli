@@ -176,7 +176,10 @@ pub fn resolve_consumer_pair(
         std::env::var("NETSUITE_CLI_TBA_CONSUMER_KEY"),
         std::env::var("NETSUITE_CLI_TBA_CONSUMER_SECRET"),
     ) {
-        return Ok((env_key, env_secret));
+        // File-sourced env vars (e.g. `export FOO=$(cat secret.txt)`) often carry a trailing
+        // newline; trim just like the prompt path below does, or it would be persisted into
+        // the keyring and silently break HMAC signing on every SOAP call.
+        return Ok((env_key.trim().to_string(), env_secret.trim().to_string()));
     }
     if let Some(stored) = store.get_tba(alias)? {
         return Ok((stored.consumer_key, stored.consumer_secret));

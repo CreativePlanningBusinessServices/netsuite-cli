@@ -114,21 +114,35 @@ fn tba_callback_parser_validates_token_state_and_extracts_verifier() {
         tba::parse_tba_callback(query, "reqtoken111", "STATE123").unwrap(),
         "verifier222"
     );
-    assert!(tba::parse_tba_callback(query, "OTHERTOKEN", "STATE123").is_err());
     assert!(tba::parse_tba_callback(query, "reqtoken111", "WRONGSTATE").is_err());
+
+    // A denied consent typically redirects WITHOUT oauth_token at all — this must be reported
+    // as consent-denied guidance, not misdiagnosed as a token mismatch (CSRF-style) error.
+    let denied = tba::parse_tba_callback("state=STATE123", "reqtoken111", "STATE123").unwrap_err();
     assert!(
-        tba::parse_tba_callback("denied=true&state=STATE123", "reqtoken111", "STATE123").is_err()
+        denied.to_string().contains("consent denied"),
+        "expected consent-denied guidance, got: {denied}"
     );
-    // Correct token and state but no oauth_verifier — exercises the missing-verifier branch
-    // specifically, distinct from the token-mismatch case above (that query has no oauth_token
-    // at all, so it fails the token check rather than the verifier check).
+
+    // A WRONG (but present) oauth_token must still be reported as a token mismatch.
+    let mismatched = tba::parse_tba_callback(query, "OTHERTOKEN", "STATE123").unwrap_err();
     assert!(
-        tba::parse_tba_callback(
-            "oauth_token=reqtoken111&state=STATE123",
-            "reqtoken111",
-            "STATE123"
-        )
-        .is_err()
+        mismatched.to_string().contains("different request token"),
+        "expected token-mismatch error, got: {mismatched}"
+    );
+
+    // Correct token and state but no oauth_verifier — exercises the missing-verifier branch
+    // specifically, distinct from the no-oauth_token case above (that query is missing
+    // oauth_token entirely, so it hits the consent-denied branch rather than the verifier check).
+    let no_verifier = tba::parse_tba_callback(
+        "oauth_token=reqtoken111&state=STATE123",
+        "reqtoken111",
+        "STATE123",
+    )
+    .unwrap_err();
+    assert!(
+        no_verifier.to_string().contains("consent denied"),
+        "expected consent-denied guidance, got: {no_verifier}"
     );
 }
 

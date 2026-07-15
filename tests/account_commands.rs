@@ -374,9 +374,11 @@ async fn consumer_pair_resolution_prefers_env_then_store() {
         ("storedkey".to_string(), "storedsecret".to_string())
     );
 
-    // env overrides stored
-    let _key_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey");
-    let _secret_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret");
+    // env overrides stored — and file-sourced env vars often carry a trailing newline (e.g.
+    // from `export FOO=$(cat secret.txt)`), which must be trimmed just like the prompt path
+    // trims, or it would be persisted into the keyring and silently break HMAC signing.
+    let _key_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_KEY", "envkey\n");
+    let _secret_guard = EnvVarGuard::set("NETSUITE_CLI_TBA_CONSUMER_SECRET", "envsecret\n");
     assert_eq!(
         account::resolve_consumer_pair(&store, "demo", false).unwrap(),
         ("envkey".to_string(), "envsecret".to_string())

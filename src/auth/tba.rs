@@ -188,15 +188,25 @@ pub fn parse_tba_callback(
             "state mismatch in TBA callback — possible CSRF, aborting".into(),
         ));
     }
-    if pairs.get("oauth_token").map(String::as_str) != Some(expected_token) {
+    // A denied consent typically redirects WITHOUT oauth_token at all, so check for its absence
+    // (or a missing verifier) before the token-mismatch check below — otherwise a denial gets
+    // misdiagnosed as a CSRF-style token-mismatch error instead of consent-denied guidance. Only
+    // report a mismatch once an oauth_token is actually present and differs from expected.
+    let oauth_token = pairs.get("oauth_token").map(String::as_str);
+    if oauth_token.is_none() || !pairs.contains_key("oauth_verifier") {
+        return Err(CliError::Auth(
+            "no oauth_verifier in TBA callback (consent denied?)".into(),
+        ));
+    }
+    if oauth_token != Some(expected_token) {
         return Err(CliError::Auth(
             "TBA callback returned a different request token, aborting".into(),
         ));
     }
-    pairs
+    Ok(pairs
         .get("oauth_verifier")
         .cloned()
-        .ok_or_else(|| CliError::Auth("no oauth_verifier in TBA callback (consent denied?)".into()))
+        .expect("oauth_verifier presence checked above"))
 }
 
 pub fn generate_tba_state() -> String {
