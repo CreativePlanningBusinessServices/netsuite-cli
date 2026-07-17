@@ -1087,7 +1087,7 @@ async fn dispatch_account(
         } => match flow {
             AccountFlowArg::M2m => {
                 let client_id =
-                    builtin::resolve_client_id(client_id.as_deref(), builtin::builtin_client_id())?;
+                    resolve_client_id_for_alias(store.as_ref(), alias, client_id.as_deref())?;
                 let cert_id = require_flag(cert_id.as_deref(), "--flow m2m requires --cert-id")?;
                 let key = key.as_deref().ok_or_else(|| {
                     CliError::Usage("account add --flow m2m requires --key".into())
@@ -1113,7 +1113,7 @@ async fn dispatch_account(
             }
             AccountFlowArg::AuthCode => {
                 let client_id =
-                    builtin::resolve_client_id(client_id.as_deref(), builtin::builtin_client_id())?;
+                    resolve_client_id_for_alias(store.as_ref(), alias, client_id.as_deref())?;
                 let add_result = account::add_auth_code(
                     &config_path,
                     store.clone(),
@@ -1186,7 +1186,8 @@ async fn dispatch_cert(
         } => cert::generate(key_out, cert_out, *days, common_name, *force),
         CertAction::List { client_id } => {
             let context = context_for(cli.account.as_deref())?;
-            let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
+            let client_id =
+                resolve_client_id_for_alias(store.as_ref(), &context.alias, client_id.as_deref())?;
             cert::list(&context.client, &context.restlet_base, &client_id).await
         }
         CertAction::Upload {
@@ -1208,7 +1209,8 @@ async fn dispatch_cert(
                 context.role_id.as_deref(),
                 &context.alias,
             )?;
-            let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
+            let client_id =
+                resolve_client_id_for_alias(store.as_ref(), &context.alias, client_id.as_deref())?;
             cert::upload(
                 &context.client,
                 &context.restlet_base,
@@ -1224,7 +1226,8 @@ async fn dispatch_cert(
             client_id,
         } => {
             let context = context_for(cli.account.as_deref())?;
-            let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
+            let client_id =
+                resolve_client_id_for_alias(store.as_ref(), &context.alias, client_id.as_deref())?;
             cert::revoke(
                 &context.client,
                 &context.restlet_base,
@@ -1236,9 +1239,15 @@ async fn dispatch_cert(
     }
 }
 
-/// Client ID for the certificate rotation URL: explicit flag → the id stored with the
-/// selected account's credentials → the build's built-in id.
-fn cert_client_id(
+/// The client ID for an alias: explicit `--client-id` flag → the id already stored for this
+/// alias → the build's built-in id. Used by both `account add` and the `cert` commands.
+///
+/// The stored-id step matters on `account add`: re-adding or re-authenticating an existing
+/// alias without `--client-id` must keep whatever integration it was registered against (a
+/// custom one, say), not silently switch it to the built-in id while its certificate mapping
+/// still points at the original integration — which would break token requests. A brand-new
+/// alias has nothing stored, so it correctly falls through to the built-in id.
+fn resolve_client_id_for_alias(
     store: &dyn SecretStore,
     alias: &str,
     flag: Option<&str>,
@@ -1657,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn cert_client_id_prefers_flag_then_stored_credentials() {
+    fn resolve_client_id_for_alias_prefers_flag_then_stored_credentials() {
         let store = MemoryStore::default();
         store
             .set(
@@ -1669,10 +1678,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            cert_client_id(&store, "dev", Some("FLAGCID")).unwrap(),
+            resolve_client_id_for_alias(&store, "dev", Some("FLAGCID")).unwrap(),
             "FLAGCID"
         );
-        assert_eq!(cert_client_id(&store, "dev", None).unwrap(), "STOREDCID");
+        // Re-adding/re-authenticating an existing alias without --client-id must preserve the
+        // integration it was registered against, not silently switch it to the built-in id
+        // while its cert mapping still targets the original integration.
+        assert_eq!(
+            resolve_client_id_for_alias(&store, "dev", None).unwrap(),
+            "STOREDCID"
+        );
+    }
+
+    #[test]
+    fn resolve_client_id_for_alias_without_flag_or_stored_id_falls_through_to_builtin() {
+        // A brand-new alias has nothing stored; with no built-in id compiled in either, this is
+        // the same "no client ID" usage error `account add` raised before the built-in fallback.
+        let store = MemoryStore::default();
+        let resolved = resolve_client_id_for_alias(&store, "fresh", None);
+        match (resolved, builtin::builtin_client_id()) {
+            (Ok(client_id), Some(builtin)) => assert_eq!(client_id, builtin),
+            (Err(CliError::Usage(message)), None) => assert!(message.contains("--client-id")),
+            (other, builtin) => {
+                panic!("resolution {other:?} inconsistent with built-in id {builtin:?}")
+            }
+        }
     }
 
     #[test]
