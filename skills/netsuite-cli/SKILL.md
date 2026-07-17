@@ -15,6 +15,7 @@ and the repo README.
 | You have / need | Use |
 |---|---|
 | Record type + internal id | `record get <type> <id>` |
+| One sublist line or its subrecord | `record get <type> <id> --sub <sublist>/<lineId>[/<subrecord>]` |
 | Query, aggregate, filter, join | `suiteql "SELECT ..."` |
 | Run an existing saved search as-is, or reach data only exposed via one | `saved-search run <id> --type <recordtype>` |
 | Unknown record type or field names | `describe --list`, then `describe <type>` |
@@ -68,8 +69,17 @@ netsuite-cli account test --account <alias>   # proves auth end to end
 - **SuiteQL values arrive as strings** (`"count": "143"`); cast after parsing.
 - **`record list` items are id+link stubs** — fetch full rows via `record get`,
   or just use `suiteql` for bulk field reads.
-- **Sublists on update:** `record update ... --replace item` replaces the whole
-  `item` sublist; without `--replace`, body lines merge into existing ones.
+- **Sublists:** send them in `--data` as nested `{"items": [...]}`. On update,
+  keyed lines merge by key and non-keyed lines append; `--replace item` (on
+  `record create` or `record update`, comma-separated for several) swaps in
+  exactly the lines you send. Delete a sublist with
+  `--data '{"item":{"items":[]}}' --replace item` — fails if the sublist is
+  mandatory.
+- **Subrecords:** nest them inside their parent sublist line in `--data`
+  (e.g. `addressbookaddress` inside an `addressbook` item). Read one directly
+  with `record get <type> <id> --sub addressbook/24/addressbookaddress`
+  (`--sub addressbook/24` for just the line), or inline everything with
+  `record get ... --expand-sub-resources`.
 - **Data input:** `--data '<json>'`, `--data @file.json`, or `--data -` (stdin).
 - **Forms preview, never write:** `create-form` / `edit-form` / `transform --form`
   return the record as NetSuite would default it, without saving — use before a
