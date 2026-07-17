@@ -18,6 +18,14 @@ pub struct Config {
 pub struct AccountEntry {
     pub account_id: String,
     pub flow: AuthFlow,
+    /// Internal ID of the user who completed the auth-code login (from NetSuite's OAuth
+    /// callback). Not a secret; kept so `account cert upload` can default its required
+    /// entity/role mapping without asking the user to look the IDs up in the NetSuite UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    /// Internal ID of the role used for that login (same provenance and purpose as `entity_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -96,6 +104,8 @@ mod tests {
             AccountEntry {
                 account_id: "1234567".into(),
                 flow: AuthFlow::M2m,
+                entity_id: None,
+                role_id: None,
             },
         );
         config.accounts.insert(
@@ -103,6 +113,8 @@ mod tests {
             AccountEntry {
                 account_id: "1234567_SB1".into(),
                 flow: AuthFlow::AuthCode,
+                entity_id: Some("9".into()),
+                role_id: Some("3".into()),
             },
         );
         config.default_account = Some("prod".into());
@@ -118,6 +130,24 @@ mod tests {
         assert_eq!(loaded.default_account.as_deref(), Some("prod"));
         assert_eq!(loaded.accounts["sb1"].account_id, "1234567_SB1");
         assert!(matches!(loaded.accounts["sb1"].flow, AuthFlow::AuthCode));
+        assert_eq!(loaded.accounts["sb1"].entity_id.as_deref(), Some("9"));
+        assert_eq!(loaded.accounts["sb1"].role_id.as_deref(), Some("3"));
+        assert!(loaded.accounts["prod"].entity_id.is_none());
+    }
+
+    #[test]
+    fn config_written_without_entity_and_role_fields_still_loads() {
+        // Configs saved by pre-cert-support versions have no entity_id/role_id keys.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "default_account = \"prod\"\n\n[accounts.prod]\naccount_id = \"1234567\"\nflow = \"m2m\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.accounts["prod"].entity_id.is_none());
+        assert!(loaded.accounts["prod"].role_id.is_none());
     }
 
     #[test]

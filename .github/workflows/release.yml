@@ -7,6 +7,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Client ID of the org's prebuilt NetSuite integration record, embedded into release
+  # binaries so `account add` works without --client-id. Set it once as a repository
+  # variable (Settings > Secrets and variables > Actions > Variables) — it's a public
+  # OAuth client identifier, not a secret. Unset, builds still work; --client-id is
+  # simply required again.
+  NETSUITE_CLI_BUILTIN_CLIENT_ID: ${{ vars.NETSUITE_CLI_BUILTIN_CLIENT_ID }}
 
 jobs:
   build:

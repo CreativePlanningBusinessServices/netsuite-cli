@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+use crate::builtin;
 use crate::commands::describe::MetadataFormat;
 use crate::commands::{
-    self, account, config_cmd, describe, job, raw, record, restlet, suiteql, system, update,
+    self, account, cert, config_cmd, describe, job, raw, record, restlet, suiteql, system, update,
 };
 use crate::config::{AuthFlow, Config};
 use crate::context::context_for;
@@ -463,7 +464,7 @@ pub enum AccountFlowArg {
 pub enum AccountAction {
     /// Add or overwrite an account alias; the first account added becomes the default
     #[command(
-        after_help = "Examples:\n  netsuite-cli account add prod --account-id 1234567 --flow m2m --client-id CID --cert-id KID --key ./netsuite-m2m.pem\n  netsuite-cli account add dev --account-id 1234567_SB1 --flow auth-code --client-id CID --port 8899"
+        after_help = "Examples:\n  netsuite-cli account add prod --account-id 1234567 --flow m2m --client-id CID --cert-id KID --key ./netsuite-m2m.pem\n  netsuite-cli account add dev --account-id 1234567_SB1 --flow auth-code --client-id CID --port 8899\n  netsuite-cli account add dev --account-id 1234567_SB1 --flow auth-code   # built-in client ID\n\nBootstrap M2M without NetSuite UI setup: add an auth-code account (built-in client ID), then `account cert generate` + `account cert upload`, then re-add with --flow m2m --cert-id <returned id>."
     )]
     Add {
         alias: String,
@@ -471,7 +472,8 @@ pub enum AccountAction {
         account_id: String,
         #[arg(long, value_enum)]
         flow: AccountFlowArg,
-        /// Required for both flows
+        /// Integration record Client ID; omit to use the client ID built into this binary
+        /// (builds compiled with NETSUITE_CLI_BUILTIN_CLIENT_ID)
         #[arg(long = "client-id")]
         client_id: Option<String>,
         /// Required for --flow m2m
@@ -521,6 +523,75 @@ pub enum AccountAction {
         /// Paste the redirect URL instead of running the loopback listener
         #[arg(long)]
         paste: bool,
+    },
+    /// Generate M2M certificates and manage them via NetSuite's certificate rotation API
+    Cert {
+        #[command(subcommand)]
+        action: CertAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CertAction {
+    /// Generate an EC P-256 private key + self-signed certificate for M2M auth
+    #[command(
+        after_help = "Example: netsuite-cli account cert generate\n\nWrites netsuite-m2m-key.pem \
+        (keep private; never uploaded) and netsuite-m2m-cert.pem (upload this)."
+    )]
+    Generate {
+        /// Output path for the private key PEM (never leaves this machine)
+        #[arg(long = "key-out", default_value = "netsuite-m2m-key.pem")]
+        key_out: PathBuf,
+        /// Output path for the certificate PEM (what `cert upload` sends to NetSuite)
+        #[arg(long = "cert-out", default_value = "netsuite-m2m-cert.pem")]
+        cert_out: PathBuf,
+        /// Validity in days; NetSuite's ceiling is 730 (two years)
+        #[arg(long, default_value_t = 730)]
+        days: u64,
+        /// Certificate subject common name (NetSuite does not validate it)
+        #[arg(long = "common-name", default_value = "netsuite-cli")]
+        common_name: String,
+        /// Overwrite existing output files
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the certificates registered for an integration
+    #[command(after_help = "Example: netsuite-cli account cert list --account bootstrap")]
+    List {
+        /// Integration Client ID (defaults to the selected account's, then the built-in one)
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+    },
+    /// Upload a certificate, creating the M2M entity/role mapping; returns the certificate id
+    #[command(
+        after_help = "Example: netsuite-cli account cert upload --cert netsuite-m2m-cert.pem \
+        --account bootstrap\n\nThe returned certificateId is the --cert-id for \
+        `account add --flow m2m`. Requires the 'Manage own OAuth 2.0 Client Credentials \
+        certificates' permission on the logged-in role."
+    )]
+    Upload {
+        /// Certificate PEM to upload (the certificate, never the private key)
+        #[arg(long)]
+        cert: PathBuf,
+        /// Entity (user) internal id to map; defaults to the id captured at auth-code login
+        #[arg(long, allow_hyphen_values = true)]
+        entity: Option<String>,
+        /// Role internal id to map; defaults to the id captured at auth-code login
+        #[arg(long, allow_hyphen_values = true)]
+        role: Option<String>,
+        /// Integration Client ID (defaults to the selected account's, then the built-in one)
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+    },
+    /// Revoke a certificate by its certificate id
+    #[command(
+        after_help = "Example: netsuite-cli account cert revoke NPMnRyPg-WDWhPiAbisjKiH0fqnBpjOZ367wDTe0pqA"
+    )]
+    Revoke {
+        certificate_id: String,
+        /// Integration Client ID (defaults to the selected account's, then the built-in one)
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
     },
 }
 
@@ -1016,7 +1087,7 @@ async fn dispatch_account(
         } => match flow {
             AccountFlowArg::M2m => {
                 let client_id =
-                    require_flag(client_id.as_deref(), "--flow m2m requires --client-id")?;
+                    builtin::resolve_client_id(client_id.as_deref(), builtin::builtin_client_id())?;
                 let cert_id = require_flag(cert_id.as_deref(), "--flow m2m requires --cert-id")?;
                 let key = key.as_deref().ok_or_else(|| {
                     CliError::Usage("account add --flow m2m requires --key".into())
@@ -1026,7 +1097,7 @@ async fn dispatch_account(
                     store.as_ref(),
                     alias,
                     account_id,
-                    client_id,
+                    &client_id,
                     cert_id,
                     key,
                 )?;
@@ -1041,16 +1112,14 @@ async fn dispatch_account(
                 .await)
             }
             AccountFlowArg::AuthCode => {
-                let client_id = require_flag(
-                    client_id.as_deref(),
-                    "--flow auth-code requires --client-id",
-                )?;
+                let client_id =
+                    builtin::resolve_client_id(client_id.as_deref(), builtin::builtin_client_id())?;
                 let add_result = account::add_auth_code(
                     &config_path,
                     store.clone(),
                     alias,
                     account_id,
-                    client_id,
+                    &client_id,
                     *port,
                     *paste,
                 )
@@ -1098,7 +1167,114 @@ async fn dispatch_account(
         AccountAction::SoapAuth { alias, port, paste } => {
             account::soap_auth(&config_path, store.clone(), alias, *port, *paste).await
         }
+        AccountAction::Cert { action } => dispatch_cert(cli, action, &config_path, store).await,
     }
+}
+
+async fn dispatch_cert(
+    cli: &Cli,
+    action: &CertAction,
+    config_path: &Path,
+    store: Arc<dyn SecretStore>,
+) -> Result<serde_json::Value, CliError> {
+    match action {
+        CertAction::Generate {
+            key_out,
+            cert_out,
+            days,
+            common_name,
+            force,
+        } => cert::generate(key_out, cert_out, *days, common_name, *force),
+        CertAction::List { client_id } => {
+            let context = context_for(cli.account.as_deref())?;
+            let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
+            cert::list(&context.client, &context.restlet_base, &client_id).await
+        }
+        CertAction::Upload {
+            cert: cert_path,
+            entity,
+            role,
+            client_id,
+        } => {
+            let context = context_for(cli.account.as_deref())?;
+            let config = Config::load(config_path)?;
+            let entry = &config.accounts[&context.alias];
+            let entity = resolve_mapping_id(
+                "--entity",
+                entity.as_deref(),
+                entry.entity_id.as_deref(),
+                &context.alias,
+            )?;
+            let role = resolve_mapping_id(
+                "--role",
+                role.as_deref(),
+                entry.role_id.as_deref(),
+                &context.alias,
+            )?;
+            let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
+            cert::upload(
+                &context.client,
+                &context.restlet_base,
+                &client_id,
+                cert_path,
+                &entity,
+                &role,
+            )
+            .await
+        }
+        CertAction::Revoke {
+            certificate_id,
+            client_id,
+        } => {
+            let context = context_for(cli.account.as_deref())?;
+            let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
+            cert::revoke(
+                &context.client,
+                &context.restlet_base,
+                &client_id,
+                certificate_id,
+            )
+            .await
+        }
+    }
+}
+
+/// Client ID for the certificate rotation URL: explicit flag → the id stored with the
+/// selected account's credentials → the build's built-in id.
+fn cert_client_id(
+    store: &dyn SecretStore,
+    alias: &str,
+    flag: Option<&str>,
+) -> Result<String, CliError> {
+    if let Some(explicit) = flag {
+        return Ok(explicit.to_string());
+    }
+    if let Some(
+        AccountSecrets::M2m { client_id, .. } | AccountSecrets::AuthCode { client_id, .. },
+    ) = store.get(alias)?
+    {
+        return Ok(client_id);
+    }
+    builtin::resolve_client_id(None, builtin::builtin_client_id())
+}
+
+/// The upload mapping needs an entity and role id; NetSuite reports both on the auth-code
+/// callback and `account add --flow auth-code` records them, so flags are only needed for
+/// accounts added before that (or to map a different user/role than the one that logged in).
+fn resolve_mapping_id(
+    flag_name: &str,
+    flag: Option<&str>,
+    recorded: Option<&str>,
+    alias: &str,
+) -> Result<String, CliError> {
+    flag.or(recorded).map(str::to_string).ok_or_else(|| {
+        CliError::Usage(format!(
+            "account '{alias}' has no recorded {} id — pass {flag_name} <internal id>, or re-add \
+             the account with `account add {alias} --flow auth-code …` (logins record the \
+             entity/role automatically)",
+            flag_name.trim_start_matches("--"),
+        ))
+    })
 }
 
 fn require_flag<'flag>(value: Option<&'flag str>, message: &str) -> Result<&'flag str, CliError> {
@@ -1263,6 +1439,8 @@ mod tests {
             AccountEntry {
                 account_id: "1234567".into(),
                 flow: AuthFlow::M2m,
+                entity_id: None,
+                role_id: None,
             },
         );
         config.default_account = Some(alias.to_string());
@@ -1427,6 +1605,96 @@ mod tests {
         assert_eq!(merged["alias"], "demo");
         let failed = with_soap_token_flag(serde_json::json!({"alias": "demo"}), false);
         assert_eq!(failed["soapTokenStored"], false);
+    }
+
+    #[test]
+    fn account_cert_subcommands_parse() {
+        Cli::try_parse_from(["netsuite-cli", "account", "cert", "generate"])
+            .expect("generate with defaults parses");
+        Cli::try_parse_from([
+            "netsuite-cli",
+            "account",
+            "cert",
+            "generate",
+            "--key-out",
+            "/tmp/k.pem",
+            "--cert-out",
+            "/tmp/c.pem",
+            "--days",
+            "365",
+            "--force",
+        ])
+        .expect("generate with overrides parses");
+        Cli::try_parse_from(["netsuite-cli", "account", "cert", "list"]).expect("list parses");
+        Cli::try_parse_from(["netsuite-cli", "account", "cert", "revoke", "CERTID123"])
+            .expect("revoke parses");
+    }
+
+    #[test]
+    fn account_cert_upload_accepts_negative_entity_ids() {
+        let cli = Cli::try_parse_from([
+            "netsuite-cli",
+            "account",
+            "cert",
+            "upload",
+            "--cert",
+            "cert.pem",
+            "--entity",
+            "-5",
+            "--role",
+            "1000",
+        ])
+        .expect("upload with negative entity id parses");
+        let Command::Account {
+            action:
+                AccountAction::Cert {
+                    action: CertAction::Upload { entity, role, .. },
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(entity.as_deref(), Some("-5"));
+        assert_eq!(role.as_deref(), Some("1000"));
+    }
+
+    #[test]
+    fn cert_client_id_prefers_flag_then_stored_credentials() {
+        let store = MemoryStore::default();
+        store
+            .set(
+                "dev",
+                &AccountSecrets::AuthCode {
+                    client_id: "STOREDCID".into(),
+                    refresh_token: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            cert_client_id(&store, "dev", Some("FLAGCID")).unwrap(),
+            "FLAGCID"
+        );
+        assert_eq!(cert_client_id(&store, "dev", None).unwrap(), "STOREDCID");
+    }
+
+    #[test]
+    fn resolve_mapping_id_prefers_flag_and_errors_when_nothing_is_recorded() {
+        assert_eq!(
+            resolve_mapping_id("--entity", Some("7"), Some("9"), "dev").unwrap(),
+            "7"
+        );
+        assert_eq!(
+            resolve_mapping_id("--entity", None, Some("9"), "dev").unwrap(),
+            "9"
+        );
+        let error = resolve_mapping_id("--role", None, None, "dev").unwrap_err();
+        match error {
+            CliError::Usage(message) => {
+                assert!(message.contains("--role"));
+                assert!(message.contains("auth-code"));
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
     }
 
     #[test]

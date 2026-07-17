@@ -1,4 +1,5 @@
 pub mod account;
+pub mod cert;
 pub mod config_cmd;
 pub mod describe;
 pub mod job;

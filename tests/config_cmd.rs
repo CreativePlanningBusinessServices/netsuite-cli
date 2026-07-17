@@ -9,6 +9,8 @@ fn config_with_alias(alias: &str) -> Config {
         AccountEntry {
             account_id: "1234567".into(),
             flow: AuthFlow::M2m,
+            entity_id: None,
+            role_id: None,
         },
     );
     config

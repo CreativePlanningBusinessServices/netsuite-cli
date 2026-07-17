@@ -36,13 +36,45 @@ and the repo README.
 ```bash
 netsuite-cli --version || true   # not installed? README "Install" has release + cargo paths
 netsuite-cli account list        # any accounts registered?
-netsuite-cli account add <alias> --account-id <ID> --flow m2m \
-    --client-id <CLIENT_ID> --cert-id <CERT_ID> --key <path/to/key.pem>
 netsuite-cli account test --account <alias>   # proves auth end to end
 ```
 
-- No credentials yet? The NetSuite-side setup (integration record + certificate
-  upload) needs a human admin once — steps are in the README under "NetSuite setup".
+No account registered yet? Two valid paths:
+
+**Have M2M credentials already** (client id + cert id + key file):
+
+```bash
+netsuite-cli account add <alias> --account-id <ID> --flow m2m \
+    --client-id <CLIENT_ID> --cert-id <CERT_ID> --key <path/to/key.pem>
+```
+
+**Have only a browser login (built-in client ID):** release builds embed a prebuilt
+integration's Client ID, making `--client-id` optional on every command. Authenticate via
+auth-code with the built-in client ID, then use that access token to drive NetSuite's
+certificate-rotation API and self-provision M2M — no NetSuite UI steps:
+
+```bash
+netsuite-cli account add bootstrap --account-id <ID> --flow auth-code  # one browser login (a human must complete it); records the user's entity/role ids
+netsuite-cli account cert generate                                     # writes netsuite-m2m-key.pem (secret) + netsuite-m2m-cert.pem
+netsuite-cli account cert upload --cert netsuite-m2m-cert.pem --account bootstrap
+#   → {"certificateId": "..."}  (uploads via the certificate rotation API, mapping the
+#      cert to the logged-in user + role; needs the "Manage own OAuth 2.0 Client
+#      Credentials certificates" permission on that role)
+netsuite-cli account add <alias> --account-id <ID> --flow m2m \
+    --cert-id <certificateId> --key netsuite-m2m-key.pem               # client id defaults to the built-in one
+netsuite-cli account test --account <alias>
+```
+
+The `bootstrap` auth-code account is itself a fully valid way to authenticate — keep using
+it directly if M2M isn't needed. If the build has no built-in client ID (`account add`
+says so), fall back to the README's "NetSuite setup" for the one-time integration-record
+steps a human admin must do.
+
+The built-in integration is **OAuth 2.0-only (REST)**. It does not cover `saved-search run`
+(SOAP/TBA), which needs the consumer key/secret of a separate TBA-only integration record —
+never the built-in client ID. When `account add` offers to chain SOAP setup and you don't
+have that pair, answer `N`; everything except `saved-search run` works without it.
+
 - This skill ships embedded in the netsuite-cli binary — `netsuite-cli update` (or
   `netsuite-cli skill install`) refreshes it automatically.
 - **M2M is the right flow for agents**: unattended, no browser, safe under
@@ -138,7 +170,7 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
 |---|---|---|
 | 1 | API | Parse stderr JSON: `details[].["o:errorCode"]` (`NONEXISTENT_ID`, `INVALID_CONTENT`, …) says what to fix |
 | 2 | usage | Re-run with `--help`; the examples are exact |
-| 3 | auth | M2M: credentials wrong/revoked → re-run `account add`. Auth-code: refresh token expired → re-run `account add <alias> --flow auth-code ...`. `saved-search run`: message mentions "SOAP token" → run `account soap-auth <alias>` (interactive; needs the integration record's TBA consumer key/secret — see README "Saved searches (SOAP)") |
+| 3 | auth | M2M: credentials wrong/revoked/expired → rotate via `account cert generate` + `account cert upload` (over an auth-code login), then re-run `account add --flow m2m` with the new certificateId. Auth-code: refresh token expired → re-run `account add <alias> --flow auth-code ...`. `saved-search run`: message mentions "SOAP token" → run `account soap-auth <alias>` (interactive; needs the integration record's TBA consumer key/secret — see README "Saved searches (SOAP)") |
 | 4 | network | Retries with backoff (429/5xx) already happened — the failure is real. Exception: `saved-search run`'s SOAP client has no retry loop, so a transient network/5xx there is unretried — safe to retry the command yourself |
 
 ## Gotchas
