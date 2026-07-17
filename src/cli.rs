@@ -1167,14 +1167,13 @@ async fn dispatch_account(
         AccountAction::SoapAuth { alias, port, paste } => {
             account::soap_auth(&config_path, store.clone(), alias, *port, *paste).await
         }
-        AccountAction::Cert { action } => dispatch_cert(cli, action, &config_path, store).await,
+        AccountAction::Cert { action } => dispatch_cert(cli, action, store).await,
     }
 }
 
 async fn dispatch_cert(
     cli: &Cli,
     action: &CertAction,
-    config_path: &Path,
     store: Arc<dyn SecretStore>,
 ) -> Result<serde_json::Value, CliError> {
     match action {
@@ -1197,18 +1196,16 @@ async fn dispatch_cert(
             client_id,
         } => {
             let context = context_for(cli.account.as_deref())?;
-            let config = Config::load(config_path)?;
-            let entry = &config.accounts[&context.alias];
             let entity = resolve_mapping_id(
                 "--entity",
                 entity.as_deref(),
-                entry.entity_id.as_deref(),
+                context.entity_id.as_deref(),
                 &context.alias,
             )?;
             let role = resolve_mapping_id(
                 "--role",
                 role.as_deref(),
-                entry.role_id.as_deref(),
+                context.role_id.as_deref(),
                 &context.alias,
             )?;
             let client_id = cert_client_id(store.as_ref(), &context.alias, client_id.as_deref())?;
@@ -1258,9 +1255,10 @@ fn cert_client_id(
     builtin::resolve_client_id(None, builtin::builtin_client_id())
 }
 
-/// The upload mapping needs an entity and role id; NetSuite reports both on the auth-code
-/// callback and `account add --flow auth-code` records them, so flags are only needed for
-/// accounts added before that (or to map a different user/role than the one that logged in).
+/// The upload mapping needs an entity and role id. Auth-code logins capture both from
+/// NetSuite's callback (`account add --flow auth-code` records them), so flags are only needed
+/// for M2M accounts, accounts added before capture existed, or to map a different user/role
+/// than the one that logged in.
 fn resolve_mapping_id(
     flag_name: &str,
     flag: Option<&str>,
@@ -1269,9 +1267,9 @@ fn resolve_mapping_id(
 ) -> Result<String, CliError> {
     flag.or(recorded).map(str::to_string).ok_or_else(|| {
         CliError::Usage(format!(
-            "account '{alias}' has no recorded {} id — pass {flag_name} <internal id>, or re-add \
-             the account with `account add {alias} --flow auth-code …` (logins record the \
-             entity/role automatically)",
+            "account '{alias}' has no recorded {} id — pass {flag_name} <internal id> \
+             (auth-code logins capture the entity/role automatically; M2M accounts always \
+             need the flag)",
             flag_name.trim_start_matches("--"),
         ))
     })
