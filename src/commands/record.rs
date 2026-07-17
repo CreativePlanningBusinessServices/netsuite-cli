@@ -14,16 +14,19 @@ pub async fn get(
     record_id: &str,
     fields: Option<String>,
     expand_sub_resources: bool,
+    sub_path: Option<String>,
 ) -> Result<Value, CliError> {
     let query = view_query(fields, expand_sub_resources);
+    let mut path = format!("/services/rest/record/v1/{record_type}/{record_id}");
+    if let Some(sub) = sub_path {
+        let sub = sub.trim_matches('/');
+        if !sub.is_empty() {
+            path.push('/');
+            path.push_str(sub);
+        }
+    }
     let response = client
-        .request(
-            reqwest::Method::GET,
-            &format!("/services/rest/record/v1/{record_type}/{record_id}"),
-            &query,
-            &[],
-            None,
-        )
+        .request(reqwest::Method::GET, &path, &query, &[], None)
         .await?;
     Ok(response.body.unwrap_or(Value::Null))
 }
@@ -91,12 +94,21 @@ pub async fn list(
     }
 }
 
-pub async fn create(client: &NsClient, record_type: &str, body: Value) -> Result<Value, CliError> {
+pub async fn create(
+    client: &NsClient,
+    record_type: &str,
+    body: Value,
+    replace_sublists: Option<String>,
+) -> Result<Value, CliError> {
+    let mut query: Vec<(&str, String)> = Vec::new();
+    if let Some(sublists) = replace_sublists {
+        query.push(("replace", sublists));
+    }
     let response = client
         .request(
             reqwest::Method::POST,
             &format!("/services/rest/record/v1/{record_type}"),
-            &[],
+            &query,
             &[],
             Some(&body),
         )

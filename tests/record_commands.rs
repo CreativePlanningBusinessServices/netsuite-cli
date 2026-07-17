@@ -23,6 +23,7 @@ async fn get_passes_fields_and_expand_params() {
         "42",
         Some("companyName,email".into()),
         true,
+        None,
     )
     .await
     .unwrap();
@@ -46,6 +47,7 @@ async fn create_returns_id_from_location_header() {
         &client_for(&server),
         "customer",
         serde_json::json!({"companyName": "Acme"}),
+        None,
     )
     .await
     .unwrap();
@@ -55,6 +57,57 @@ async fn create_returns_id_from_location_header() {
             "id": "647", "location": "https://x/services/rest/record/v1/customer/647"
         })
     );
+}
+
+#[tokio::test]
+async fn create_sends_replace_param() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/services/rest/record/v1/salesOrder"))
+        .and(query_param("replace", "item,shipGroup"))
+        .respond_with(ResponseTemplate::new(204).insert_header(
+            "Location",
+            "https://x/services/rest/record/v1/salesOrder/12",
+        ))
+        .mount(&server)
+        .await;
+
+    let created = record::create(
+        &client_for(&server),
+        "salesOrder",
+        serde_json::json!({"item": {"items": []}}),
+        Some("item,shipGroup".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created["id"], "12");
+}
+
+#[tokio::test]
+async fn get_sub_path_targets_nested_subrecord() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/services/rest/record/v1/customer/42/addressbook/24/addressbookaddress",
+        ))
+        .and(query_param("fields", "city,zip"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"city": "New York"})),
+        )
+        .mount(&server)
+        .await;
+
+    let subrecord = record::get(
+        &client_for(&server),
+        "customer",
+        "42",
+        Some("city,zip".into()),
+        false,
+        Some("/addressbook/24/addressbookaddress/".into()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subrecord["city"], "New York");
 }
 
 #[tokio::test]
@@ -70,6 +123,7 @@ async fn create_errors_when_location_header_missing() {
         &client_for(&server),
         "customer",
         serde_json::json!({"companyName": "Acme"}),
+        None,
     )
     .await;
 

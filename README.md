@@ -219,6 +219,9 @@ $ netsuite-cli account set-default sandbox
 $ netsuite-cli record get customer 1234 --fields companyName,email
 {"id":"1234","companyName":"Acme Corp","email":"ap@acme.example","links":[{"rel":"self","href":"https://1234567-sb1.suitetalk.api.netsuite.com/services/rest/record/v1/customer/1234"}]}
 
+$ netsuite-cli record get customer 1234 --sub addressbook/24/addressbookaddress
+{"city":"New York","state":"NY","zip":"10001","country":{"id":"US","refName":"United States"}}
+
 $ netsuite-cli record list customer --q 'email CONTAIN "@acme.com"' --pretty
 {
   "links": [],
@@ -234,6 +237,9 @@ $ netsuite-cli record create customer --data '{"companyName":"Acme"}'
 
 $ netsuite-cli record update customer 1234 --data '{"email":"new@acme.example"}'
 {"updated":true,"id":"1234"}
+
+$ netsuite-cli record create salesOrder --data @order.json --replace item   # replace form-defaulted lines
+$ netsuite-cli record update salesOrder 7 --data '{"item":{"items":[]}}' --replace item   # delete a sublist
 
 $ netsuite-cli record upsert customer ACME-001 --data '{"companyName":"Acme"}'
 {"upserted":true,"externalId":"ACME-001"}
@@ -269,6 +275,15 @@ same preview for plain creates and updates. `select-options` returns the valid
 dropdown values for a field — pass `--data` with the field values the options
 depend on, or an existing record id positional for that record's context. Every
 id positional also accepts NetSuite's `eid:<externalId>` form.
+
+Sublists ride along in `--data` as nested `{"items": [...]}` objects. On
+`update`, keyed sublist lines merge by key and non-keyed lines append; pass
+`--replace <sublist,...>` (on `create` or `update`) to swap in exactly the lines
+you send — with an empty `items` array (or `null`) that deletes the sublist.
+Subrecords nest inside their parent line the same way (e.g.
+`addressbookaddress` inside an `addressbook` item); read one directly with
+`record get <type> <id> --sub <sublist>/<lineId>/<subrecord>`, or inline all of
+them with `--expand-sub-resources`.
 
 `--data` accepts inline JSON, `@path/to/file.json`, or `-` to read from stdin. `record list` and
 `suiteql` support `--all` to transparently follow `hasMore` pagination and merge every page's

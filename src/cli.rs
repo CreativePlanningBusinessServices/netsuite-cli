@@ -293,7 +293,7 @@ pub enum JobAction {
 #[derive(Subcommand)]
 pub enum RecordAction {
     #[command(
-        after_help = "Example: netsuite-cli record get customer 1234 --fields companyName,email"
+        after_help = "Examples:\n  netsuite-cli record get customer 1234 --fields companyName,email\n  netsuite-cli record get customer 1234 --sub addressbook/24/addressbookaddress"
     )]
     Get {
         record_type: String,
@@ -302,6 +302,10 @@ pub enum RecordAction {
         fields: Option<String>,
         #[arg(long)]
         expand_sub_resources: bool,
+        /// Sublist line or subrecord path appended to the record URL
+        /// (e.g. addressbook/24 or addressbook/24/addressbookaddress)
+        #[arg(long)]
+        sub: Option<String>,
     },
     #[command(
         after_help = "Example: netsuite-cli record list customer --q 'email CONTAIN \"@acme.com\"' --all"
@@ -318,12 +322,15 @@ pub enum RecordAction {
         all: bool,
     },
     #[command(
-        after_help = "Example: netsuite-cli record create customer --data '{\"companyName\":\"Acme\"}'"
+        after_help = "Examples:\n  netsuite-cli record create customer --data '{\"companyName\":\"Acme\"}'\n  netsuite-cli record create salesOrder --data @order.json --replace item"
     )]
     Create {
         record_type: String,
         #[arg(long)]
         data: String,
+        /// Comma-separated sublists to replace instead of merging with form defaults
+        #[arg(long)]
+        replace: Option<String>,
     },
     #[command(
         after_help = "Example: netsuite-cli record update customer 1234 --data @patch.json --replace addressBook"
@@ -565,6 +572,7 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                     id,
                     fields,
                     expand_sub_resources,
+                    sub,
                 } => {
                     record::get(
                         &context.client,
@@ -572,6 +580,7 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                         id,
                         fields.clone(),
                         *expand_sub_resources,
+                        sub.clone(),
                     )
                     .await
                 }
@@ -592,9 +601,18 @@ async fn dispatch(cli: &Cli) -> Result<serde_json::Value, CliError> {
                     )
                     .await
                 }
-                RecordAction::Create { record_type, data } => {
-                    record::create(&context.client, record_type, commands::read_data_arg(data)?)
-                        .await
+                RecordAction::Create {
+                    record_type,
+                    data,
+                    replace,
+                } => {
+                    record::create(
+                        &context.client,
+                        record_type,
+                        commands::read_data_arg(data)?,
+                        replace.clone(),
+                    )
+                    .await
                 }
                 RecordAction::Update {
                     record_type,
