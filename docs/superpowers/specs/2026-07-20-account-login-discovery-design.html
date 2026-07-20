@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design: account login with account discovery</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55; max-width: 900px; margin: 2rem auto; padding: 0 1.25rem; color: #1a1a1a; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #ddd; background: #161616; }
+    code, pre { background: #262626; }
+    table th { background: #262626; }
+    .callout { background: #2a2418; border-color: #8a6d1a; }
+    .decision { background: #182430; border-color: #2a5a8a; }
+  }
+  h1 { font-size: 1.6rem; border-bottom: 2px solid #888; padding-bottom: .4rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.2rem; border-bottom: 1px solid #bbb; padding-bottom: .25rem; }
+  code, pre { background: #f2f2f2; border-radius: 4px; padding: .1em .35em; font-size: .92em; }
+  pre { padding: .8em 1em; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #999; padding: .45em .7em; text-align: left; vertical-align: top; }
+  th { background: #f2f2f2; }
+  .callout { background: #fdf6e3; border-left: 4px solid #b58900; padding: .7em 1em; margin: 1.2em 0; }
+  .decision { background: #eef6fc; border-left: 4px solid #268bd2; padding: .7em 1em; margin: 1.2em 0; }
+  li { margin: .3em 0; }
+  .buttons a {
+    display: inline-block; padding: .5em 1.1em; margin: .2em .3em .2em 0; border-radius: 6px;
+    text-decoration: none; font-weight: 600; border: 1px solid #268bd2; color: #268bd2;
+  }
+  .buttons a:first-child { background: #268bd2; color: #fff; }
+</style>
+</head>
+<body>
+
+<h1>account login with account discovery</h1>
+<p><strong>Date:</strong> 2026-07-20 (rescoped from the 2026-07-17 embedded-credentials design) &nbsp;•&nbsp;
+<strong>Status:</strong> pending review</p>
+
+<p class="buttons">
+  <a href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve" target="_blank">✅ Approve — write the implementation plan</a> &nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request+changes" target="_blank">✏️ Request changes</a>
+</p>
+
+<h2>Goal</h2>
+<p>
+One command takes a user from a fresh machine to an authenticated CLI against any NetSuite
+account, without knowing the account id in advance:
+</p>
+<pre>netsuite-cli account login myaccount</pre>
+<p>
+The browser opens, the user logs in and picks an account/role on NetSuite&rsquo;s own chooser, and
+the CLI learns which account was chosen from the OAuth callback. No <code>--account-id</code>,
+no <code>--client-id</code>, no NetSuite UI setup (the built-in client id from PR&nbsp;#10
+auto-installs its integration record into the target account on first consent).
+</p>
+
+<h2>Scope history</h2>
+<div class="decision">
+<ul>
+  <li><strong>2026-07-17:</strong> original design bundled this command with embedded TBA
+      consumer credentials (GitHub-secret injection, binary obfuscation) for zero-setup
+      saved-search.</li>
+  <li><strong>2026-07-20 (Jon):</strong> PR&nbsp;#10 (merged) shipped the built-in OAuth2 client
+      id and UI-free M2M bootstrap via the certificate rotation API, and made the case for
+      keeping TBA off the built-in record (a TBA credential reset rotates the client id,
+      which would invalidate every distributed binary&rsquo;s embedded id and every M2M cert
+      mapping). Jon adopted that position: <strong>no TBA consumer secret is embedded.</strong>
+      Saved-search keeps its bring-your-own-credentials TBA setup on a separate record. With no
+      secret in the binary, the GitHub-secret/obfuscation machinery from the original design is
+      dropped, and the original design&rsquo;s claim that M2M can never be zero-touch is
+      corrected &mdash; PR&nbsp;#10&rsquo;s <code>account cert</code> commands already do exactly
+      that. What remains is this spec: <code>account login</code> with account discovery.</li>
+</ul>
+</div>
+
+<h2>Prerequisites (already in place)</h2>
+<ul>
+  <li>PR&nbsp;#10 merged: <code>src/builtin.rs</code> (built-in client id + resolution order),
+      entity/role capture from the OAuth callback, <code>account cert</code> bootstrap.</li>
+  <li><code>NETSUITE_CLI_BUILTIN_CLIENT_ID</code> repository variable is set, so release builds
+      embed the org&rsquo;s public-client id.</li>
+  <li><code>rest_base</code> already normalizes NetSuite account ids of the
+      <code>1234567_SB1</code> form into URL hosts.</li>
+</ul>
+
+<h2>Command</h2>
+<pre>netsuite-cli account login &lt;alias&gt; [--account-id &lt;id&gt;] [--client-id &lt;id&gt;] [--paste]</pre>
+<ol>
+  <li><strong>Resolve the client id</strong> with PR&nbsp;#10&rsquo;s existing order: explicit
+      <code>--client-id</code> &rarr; id already stored for this alias (re-login keeps the
+      integration the alias was registered against) &rarr; built-in id. No client id anywhere
+      &rarr; the same actionable usage error <code>account add</code> gives.</li>
+  <li><strong>Browser PKCE flow with account discovery.</strong> Without <code>--account-id</code>,
+      the authorize URL targets <code>https://system.netsuite.com/app/login/oauth2/authorize.nl</code>
+      and NetSuite presents its account/role chooser during login; the callback&rsquo;s
+      <code>company</code> parameter identifies the chosen account. With <code>--account-id</code>,
+      the authorize URL is pinned to that account&rsquo;s host as today. The token-endpoint URL is
+      therefore built <em>after</em> the callback, from the discovered (or pinned) account id.</li>
+  <li><strong>Store</strong> exactly as <code>account add --flow auth-code</code> does today
+      (config entry with captured entity/role ids, token in the keyring), so the alias
+      immediately works with every other command and with the <code>account cert</code> M2M
+      bootstrap.</li>
+  <li><strong>Offer TBA chaining</strong> identically to <code>account add</code>&rsquo;s existing
+      behavior (TTY prompt / non-TTY stderr tip) &mdash; with the user&rsquo;s own TBA
+      consumer pair, never a built-in one. Nothing new here; it is the same
+      <code>soap-auth</code> path.</li>
+</ol>
+<p>
+No <code>--port</code>: the callback port stays fixed at 8899 because the registered redirect URI
+must match exactly.
+</p>
+
+<h2>Implementation shape</h2>
+<table>
+<tr><th>Piece</th><th>Change</th></tr>
+<tr>
+  <td><code>src/auth/authcode.rs</code></td>
+  <td><code>AuthCodeGrant</code>/<code>LoginOutcome</code> gain <code>company: Option&lt;String&gt;</code>
+      parsed from the callback (alongside the existing entity/role capture). The login flow is
+      restructured so the token URL can be derived post-callback; the existing pre-pinned path
+      is the degenerate case where the account id is known up front.</td>
+</tr>
+<tr>
+  <td><code>src/cli.rs</code></td>
+  <td>New <code>AccountAction::Login</code> variant + dispatch. Reuses
+      <code>resolve_client_id_for_alias</code> unchanged.</td>
+</tr>
+<tr>
+  <td><code>src/commands/account.rs</code></td>
+  <td>New <code>login()</code> orchestration: discovery-capable flow &rarr; normalize the
+      callback&rsquo;s <code>company</code> value (<code>1234567_SB2</code> form) to the stored
+      account-id convention &rarr; <code>store_auth_code_account</code> &rarr; existing TBA
+      chain offer. No new auth protocol code.</td>
+</tr>
+<tr>
+  <td>Docs/skill</td>
+  <td>README quick-start gains the one-command path; SKILL.md bootstrap section leads with
+      <code>account login</code>; <code>account add</code> examples unchanged.</td>
+</tr>
+</table>
+
+<h2>What does not change</h2>
+<ul>
+  <li><code>account add</code> (both flows), <code>account cert</code>, and all existing aliases
+      behave exactly as on current main.</li>
+  <li>M2M remains the recommended flow for agents (auth-code refresh tokens rotate one-time;
+      parallel invocations race). <code>login</code> is the human quick-start and the first step
+      of the M2M bootstrap.</li>
+  <li>Saved-search TBA setup still requires the separate TBA record&rsquo;s consumer pair.</li>
+</ul>
+
+<h2>Validation plan</h2>
+<ul>
+  <li><strong>Unit/wiremock:</strong> callback parsing with/without <code>company</code>;
+      account-id normalization cases (production, <code>_SB1</code>, <code>_RP</code> forms);
+      login orchestration storing the discovered id; client-id resolution reuse; usage error
+      when no client id is available.</li>
+  <li><strong>Live:</strong> <code>account login</code> with no flags against (a) SB2 and (b) an
+      account with no prior netsuite-cli integration record, verifying the record auto-installs
+      and the discovered account id round-trips into working <code>suiteql</code> calls.</li>
+</ul>
+
+<h2>Decision</h2>
+<p class="buttons">
+  <a href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve" target="_blank">✅ Approve — write the implementation plan</a> &nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=changes&amp;l=Request+changes" target="_blank">✏️ Request changes</a>
+</p>
+
+</body>
+</html>
