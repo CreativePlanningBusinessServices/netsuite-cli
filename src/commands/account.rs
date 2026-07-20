@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::account as domain;
-use crate::auth::TokenResponse;
 use crate::auth::authcode;
 use crate::auth::m2m::{M2mConfig, build_assertion};
 use crate::auth::tba;
@@ -51,7 +50,7 @@ pub fn add_m2m(
     // the config still points at an alias with no stored credentials, which is a self-describing
     // and re-runnable state ("no credentials stored for '<alias>'; run account add"). The
     // reverse order can leave secrets under an alias the config never learns about.
-    write_account_entry(config_path, alias, account_id, AuthFlow::M2m)?;
+    write_account_entry(config_path, alias, account_id, AuthFlow::M2m, None, None)?;
     store.set(alias, &secrets)?;
     // Re-registering an alias must not leave a stale cached bearer token from the previous
     // credentials being served until it expires or 401s.
@@ -86,7 +85,7 @@ pub async fn add_auth_code(
         "{}/services/rest/auth/oauth2/v1/token",
         domain::rest_base(account_id)
     );
-    let token =
+    let login =
         authcode::run_login_flow(&http, &app_base, &token_url, client_id, port, paste_mode).await?;
     store_auth_code_account(
         config_path,
@@ -94,7 +93,7 @@ pub async fn add_auth_code(
         alias,
         account_id,
         client_id,
-        &token,
+        &login,
     )
 }
 
@@ -288,6 +287,8 @@ fn write_account_entry(
     alias: &str,
     account_id: &str,
     flow: AuthFlow,
+    entity_id: Option<String>,
+    role_id: Option<String>,
 ) -> Result<(), CliError> {
     let mut config = Config::load(config_path)?;
     config.accounts.insert(
@@ -295,6 +296,8 @@ fn write_account_entry(
         AccountEntry {
             account_id: account_id.to_string(),
             flow,
+            entity_id,
+            role_id,
         },
     );
     if config.default_account.is_none() {
@@ -303,7 +306,7 @@ fn write_account_entry(
     config.save(config_path)
 }
 
-/// Pure config/secret-store persistence for an already-obtained auth-code token. Split out
+/// Pure config/secret-store persistence for an already-obtained auth-code login. Split out
 /// from `add_auth_code` so it can be unit tested without running the real browser login flow.
 fn store_auth_code_account(
     config_path: &Path,
@@ -311,13 +314,21 @@ fn store_auth_code_account(
     alias: &str,
     account_id: &str,
     client_id: &str,
-    token: &TokenResponse,
+    login: &authcode::LoginOutcome,
 ) -> Result<Value, CliError> {
+    let token = &login.token;
     // Write the config entry before touching the keychain: if the secrets write below fails,
     // the config still points at an alias with no stored credentials, which is a self-describing
     // and re-runnable state ("no credentials stored for '<alias>'; run account add"). The
     // reverse order can leave secrets under an alias the config never learns about.
-    write_account_entry(config_path, alias, account_id, AuthFlow::AuthCode)?;
+    write_account_entry(
+        config_path,
+        alias,
+        account_id,
+        AuthFlow::AuthCode,
+        login.entity.clone(),
+        login.role.clone(),
+    )?;
     store.set(
         alias,
         &AccountSecrets::AuthCode {
@@ -346,7 +357,17 @@ fn store_auth_code_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TokenResponse;
+    use crate::auth::authcode::LoginOutcome;
     use crate::secrets::MemoryStore;
+
+    fn login_outcome(token: TokenResponse) -> LoginOutcome {
+        LoginOutcome {
+            token,
+            entity: Some("9".into()),
+            role: Some("3".into()),
+        }
+    }
 
     /// Always fails `set`, to prove the config entry is written before the keychain write is
     /// attempted — so a keychain failure leaves a self-describing, re-runnable state instead of
@@ -427,9 +448,15 @@ mod tests {
             refresh_token: Some("REFRESH1".into()),
         };
 
-        let error =
-            store_auth_code_account(&config_path, &store, "dev", "1234567_SB1", "CID", &token)
-                .unwrap_err();
+        let error = store_auth_code_account(
+            &config_path,
+            &store,
+            "dev",
+            "1234567_SB1",
+            "CID",
+            &login_outcome(token),
+        )
+        .unwrap_err();
 
         assert!(matches!(error, CliError::Auth(_)));
         let config = Config::load(&config_path).unwrap();
@@ -450,9 +477,15 @@ mod tests {
             refresh_token: Some("REFRESH1".into()),
         };
 
-        let result =
-            store_auth_code_account(&config_path, &store, "dev", "1234567_SB1", "CID", &token)
-                .unwrap();
+        let result = store_auth_code_account(
+            &config_path,
+            &store,
+            "dev",
+            "1234567_SB1",
+            "CID",
+            &login_outcome(token),
+        )
+        .unwrap();
         assert_eq!(
             result,
             json!({"alias": "dev", "accountId": "1234567_SB1", "flow": "auth-code"})
@@ -476,6 +509,8 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.accounts["dev"].account_id, "1234567_SB1");
         assert!(matches!(config.accounts["dev"].flow, AuthFlow::AuthCode));
+        assert_eq!(config.accounts["dev"].entity_id.as_deref(), Some("9"));
+        assert_eq!(config.accounts["dev"].role_id.as_deref(), Some("3"));
         assert_eq!(config.default_account.as_deref(), Some("dev"));
     }
 
@@ -484,14 +519,22 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         let store = MemoryStore::default();
-        write_account_entry(&config_path, "prod", "1234567", AuthFlow::M2m).unwrap();
+        write_account_entry(&config_path, "prod", "1234567", AuthFlow::M2m, None, None).unwrap();
 
         let token = TokenResponse {
             access_token: "ACCESS2".into(),
             expires_in: 3600,
             refresh_token: Some("REFRESH2".into()),
         };
-        store_auth_code_account(&config_path, &store, "dev", "1234567_SB1", "CID", &token).unwrap();
+        store_auth_code_account(
+            &config_path,
+            &store,
+            "dev",
+            "1234567_SB1",
+            "CID",
+            &login_outcome(token),
+        )
+        .unwrap();
 
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.default_account.as_deref(), Some("prod"));

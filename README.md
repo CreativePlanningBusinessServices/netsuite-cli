@@ -17,10 +17,16 @@ gh release download -R CreativePlanningBusinessServices/netsuite-cli \
     --pattern "*aarch64-apple-darwin*" && unzip -o netsuite-cli-*.zip
 install -m 0755 netsuite-cli "$HOME/.local/bin/"   # any writable PATH dir
 
-# Bootstrap (credentials: see "NetSuite setup" below — one-time human step)
+# Bootstrap — with the built-in client ID (release builds), no NetSuite UI setup needed:
+netsuite-cli account add bootstrap --account-id <ID> --flow auth-code   # one browser login
+netsuite-cli account cert generate
+netsuite-cli account cert upload --cert netsuite-m2m-cert.pem --account bootstrap
 netsuite-cli account add <alias> --account-id <ID> --flow m2m \
-    --client-id <CLIENT_ID> --cert-id <CERT_ID> --key <key.pem>
+    --cert-id <certificateId from upload> --key netsuite-m2m-key.pem
 netsuite-cli account test --account <alias>
+# (or, with credentials from a manually created integration record — see "NetSuite setup":)
+# netsuite-cli account add <alias> --account-id <ID> --flow m2m \
+#     --client-id <CLIENT_ID> --cert-id <CERT_ID> --key <key.pem>
 
 # The three commands that cover most work
 netsuite-cli describe --list                       # what record types exist?
@@ -49,6 +55,50 @@ in place — see [Updating](#updating).
 
 ## NetSuite setup
 
+### The built-in client ID (skip the integration record)
+
+Every `account add` needs an OAuth client ID, which normally means someone creates a NetSuite
+**Integration record** first (next section). Release builds instead embed the org's prebuilt
+integration's Client ID at compile time (`NETSUITE_CLI_BUILTIN_CLIENT_ID`, a repository
+variable read by the release workflow — a client ID for a PKCE public client is an
+identifier, not a secret). With a built-in client ID, `--client-id` becomes optional on
+`account add` (both flows) and on every `account cert` command, and the whole
+[M2M bootstrap](#bootstrap-m2m-from-the-cli-certificate-rotation-api) runs without touching
+the NetSuite UI:
+
+1. `account add <alias> --account-id <ID> --flow auth-code` — browser login using the
+   built-in client ID; this alone is a fully valid way to authenticate the CLI.
+2. Use that login's access token to upload an M2M certificate over NetSuite's certificate
+   rotation API (`account cert generate` + `account cert upload`).
+3. `account add <alias> --account-id <ID> --flow m2m --cert-id <id> --key <key.pem>` — done;
+   unattended M2M from here on.
+
+Builds without an embedded ID (e.g. local `cargo build`) behave exactly as before:
+`--client-id` is required, sourced from your own integration record. To embed one locally:
+`NETSUITE_CLI_BUILTIN_CLIENT_ID=<id> cargo build --release`.
+
+**The prebuilt integration record is OAuth 2.0-only — do not enable TBA on it.** Create it
+with exactly:
+
+- **OAuth 2.0 > Authorization Code Grant**, with **Public Client** checked and Redirect URI
+  `https://localhost:8899/callback`;
+- **OAuth 2.0 > Client Credentials (Machine to Machine) Grant**;
+- scopes **REST Web Services**, **RESTlets**, and **SuiteAnalytics Connect** (the CLI's
+  auth-code login always requests all three: `rest_webservices`, `restlets`, `suite_analytics`
+  — a missing scope fails the login);
+- **Token-Based Authentication left unchecked.**
+
+Keeping TBA off this record is deliberate: recovering a lost TBA consumer secret requires
+**Reset Credentials**, which rotates the Client ID — and rotating *this* record's Client ID
+would invalidate the ID embedded in every distributed binary (until a new release) plus every
+M2M certificate mapping. Saved-search (SOAP/TBA) auth instead uses its own separate,
+TBA-only integration record — see [Saved searches (SOAP)](#saved-searches-soap) — whose
+credentials can be reset without touching REST auth. A consequence: the SOAP setup that
+`account add` offers to chain into needs that TBA record's consumer key/secret, never the
+built-in client ID; answer `N` to the prompt if you don't have them at hand.
+
+### Grants and the integration record
+
 `netsuite-cli` supports two OAuth 2.0 grants, chosen per account with `account add --flow`:
 
 - **`m2m`** (client credentials, machine-to-machine) — no browser, no user session, no refresh
@@ -59,9 +109,14 @@ in place — see [Updating](#updating).
   `netsuite-cli` persists automatically. Use this when the integration needs to act as a specific
   user rather than a dedicated integration record.
 
-Both flows — and saved-search execution — share a single NetSuite **Integration record**.
-Create it once with everything enabled in the same save: **Setup > Integration > Manage
-Integrations > New**, then:
+This checklist is for a **self-managed** integration record (no built-in client ID, or your
+own separate setup). Both flows — and saved-search execution — *can* share a single NetSuite
+**Integration record** created with everything enabled in the same save, which is the
+fewest-moving-parts option for a personal/dev setup. The safer layout, and the one the org's
+prebuilt integration uses, is to keep TBA on a **separate record** so a TBA credential reset
+can never rotate the Client ID your OAuth flows and M2M certificate mappings depend on (see
+[The Reset Credentials trap](#the-reset-credentials-trap-recovery-path) — skip step 2 below
+in that case). **Setup > Integration > Manage Integrations > New**, then:
 
 1. Give it a name.
 2. Under **Authentication**, check **Token-Based Authentication** and
@@ -74,8 +129,8 @@ Integrations > New**, then:
    (Machine to Machine) Grant** for `--flow m2m` and/or **Authorization Code
    Grant** for `--flow auth-code` — plus the **REST Web Services** and
    **RESTlets** scopes.
-4. Save, then copy **both** values NetSuite shows you: the **Client ID** (every
-   `account add` call needs it via `--client-id`) and the **Client Secret**
+4. Save, then copy **both** values NetSuite shows you: the **Client ID** (`account add`
+   needs it via `--client-id` whenever the built-in client ID isn't used) and the **Client Secret**
    (NetSuite's TBA screens — and this CLI's saved-search prompts — call the same
    pair the **consumer key** and **consumer secret**).
    **The secret is displayed only this once** — it is exactly what saved-search
@@ -91,8 +146,10 @@ integration record by the checklist above; see [Saved searches (SOAP)](#saved-se
 
 1. On the integration record from the setup checklist above (Client Credentials grant + scopes
    already enabled), note the **Client ID**.
-2. Generate a certificate/key pair. NetSuite accepts RSA (3072/4096-bit, signed with RSA-PSS) or
-   EC (P-256/384/521) keys, with a maximum validity of 2 years (`-days 730`):
+2. Generate a certificate/key pair — `netsuite-cli account cert generate` does this in one
+   step (EC P-256, 730 days), or use openssl directly. NetSuite accepts RSA (3072/4096-bit,
+   signed with RSA-PSS) or EC (P-256/384/521) keys, with a maximum validity of 2 years
+   (`-days 730`):
 
    ```bash
    # EC P-256 (recommended — smaller assertions, faster to sign)
@@ -133,11 +190,61 @@ integration record by the checklist above; see [Saved searches (SOAP)](#saved-se
    look like `1234567_SB1`, release preview like `1234567_RP`, etc — visible in the account's
    URL or **Setup > Company > Company Information**).
 
+### Bootstrap M2M from the CLI (certificate rotation API)
+
+The manual steps above (generate with openssl, upload in the NetSuite UI) have a fully
+CLI-driven equivalent built on NetSuite's [OAuth 2.0 Client Credentials certificate rotation
+endpoint](https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/article_92130837826.html):
+authenticate once with the **auth-code flow** (using the [built-in client
+ID](#the-built-in-client-id-skip-the-integration-record) or your own), then use that access
+token to register an M2M certificate programmatically.
+
+```bash
+# 1. One-time browser login. The OAuth callback reports your user (entity) and role internal
+#    ids and the CLI records them in config.toml for step 3's mapping.
+netsuite-cli account add bootstrap --account-id 1234567 --flow auth-code
+
+# 2. Generate an EC P-256 key + self-signed certificate (valid 730 days, NetSuite's max).
+#    The key is written 0600 and never leaves the machine; only the cert is uploaded.
+netsuite-cli account cert generate
+# {"keyPath":"netsuite-m2m-key.pem","certPath":"netsuite-m2m-cert.pem","algorithm":"EC P-256",...}
+
+# 3. Upload the certificate. This creates the M2M mapping (integration + entity + role) that
+#    the UI's "OAuth 2.0 Client Credentials (M2M) Setup" page would, and returns the
+#    certificate id NetSuite expects as the JWT kid.
+netsuite-cli account cert upload --cert netsuite-m2m-cert.pem --account bootstrap
+# {"certificateId":"NPMnRyPg-...","details":{...}}
+
+# 4. Register the unattended M2M account with that certificate id.
+netsuite-cli account add prod --account-id 1234567 --flow m2m \
+    --cert-id NPMnRyPg-... --key netsuite-m2m-key.pem
+netsuite-cli account test --account prod
+```
+
+Also available: `account cert list` (see what's registered, including expiry) and
+`account cert revoke <certificateId>` (rotate a compromised or expiring cert — upload the
+replacement first, re-run `account add --flow m2m` with the new id, then revoke the old one).
+
+Notes and requirements:
+
+- The logged-in role needs the **"Manage own OAuth 2.0 Client Credentials certificates"**
+  permission (Setup type); without it the API returns 403. The token must carry the REST Web
+  Services scope, which the CLI's auth-code login always requests.
+- `--entity`/`--role` on `cert upload` override the recorded mapping ids (e.g. to map a
+  service account instead of yourself); `--client-id` on any cert command overrides the
+  integration whose certificates are managed.
+- NetSuite allows at most **5 active certificates** per integration record; revoked and
+  expired ones don't count. Max validity is 2 years (`account cert generate` defaults to it).
+- M2M mappings are **not copied to sandboxes** and a **sandbox refresh clears them** — re-run
+  steps 1–4 against the sandbox account id afterward.
+- Accounts added with `--flow auth-code` by an older CLI version have no recorded entity/role;
+  either pass `--entity`/`--role` explicitly or re-run `account add --flow auth-code`.
+
 ### Auth-code (authorization code + PKCE)
 
 1. On the integration record from the setup checklist above (Authorization Code Grant + REST Web
    Services/RESTlets scopes already enabled), check **Public Client** (no client secret — the CLI
-   authenticates with PKCE instead), add the **SuiteAnalytics Workbook** scope (not part of the
+   authenticates with PKCE instead), add the **SuiteAnalytics Connect** scope (not part of the
    checklist's baseline, but needed for this flow), and set the **Redirect URI** to
    `https://localhost:8899/callback` (or `https://localhost:<port>/callback` if you'll pass a
    custom `--port` to `account add`/`account test --reauth`). Save and note the **Client ID**.
@@ -211,7 +318,22 @@ $ netsuite-cli account test --alias sandbox
 
 $ netsuite-cli account set-default sandbox
 {"default":"sandbox"}
+
+$ netsuite-cli account cert generate
+{"keyPath":"netsuite-m2m-key.pem","certPath":"netsuite-m2m-cert.pem","algorithm":"EC P-256","validDays":730,"validUntil":"2028-07-17T00:00:00Z"}
+
+$ netsuite-cli account cert list --account bootstrap
+{"certificates":[{"certificate_id":"NPMnRyPg-...","algorithm":"EC","valid_until":"2028-07-17","revoked":false,...}]}
+
+$ netsuite-cli account cert upload --cert netsuite-m2m-cert.pem --account bootstrap
+{"certificateId":"NPMnRyPg-...","details":{...}}
+
+$ netsuite-cli account cert revoke NPMnRyPg-... --account bootstrap
+{"revoked":true,"certificateId":"NPMnRyPg-..."}
 ```
+
+The `cert` subcommands drive M2M certificate lifecycle end to end — see
+[Bootstrap M2M from the CLI](#bootstrap-m2m-from-the-cli-certificate-rotation-api).
 
 ### `record` — CRUD against `record/v1`
 

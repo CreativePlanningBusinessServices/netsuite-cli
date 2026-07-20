@@ -397,6 +397,8 @@ async fn consumer_pair_resolution_prefers_env_then_store() {
         netsuite_cli::config::AccountEntry {
             account_id: "0000000".to_string(),
             flow: AuthFlow::M2m,
+            entity_id: None,
+            role_id: None,
         },
     );
     config.save(&config_path).unwrap();
@@ -435,6 +437,8 @@ async fn consumer_pair_resolution_prefers_env_then_store() {
         netsuite_cli::config::AccountEntry {
             account_id: "0000000".to_string(),
             flow: AuthFlow::M2m,
+            entity_id: None,
+            role_id: None,
         },
     );
     config.accounts.insert(
@@ -442,6 +446,8 @@ async fn consumer_pair_resolution_prefers_env_then_store() {
         netsuite_cli::config::AccountEntry {
             account_id: "0000000".to_string(),
             flow: AuthFlow::M2m,
+            entity_id: None,
+            role_id: None,
         },
     );
     config.save(&config_path).unwrap();

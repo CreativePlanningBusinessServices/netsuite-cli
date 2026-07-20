@@ -62,7 +62,17 @@ pub fn authorize_url(
     url.to_string()
 }
 
-pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<String, CliError> {
+/// What NetSuite's authorization callback carries besides the code: the internal IDs of the
+/// user (`entity`) and role that just logged in. They're recorded so the certificate rotation
+/// API (`account cert upload`) can default its required entity/role mapping fields later.
+#[derive(Debug, PartialEq)]
+pub struct AuthCodeGrant {
+    pub code: String,
+    pub entity: Option<String>,
+    pub role: Option<String>,
+}
+
+pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<AuthCodeGrant, CliError> {
     let pairs: Vec<(String, String)> = url::form_urlencoded::parse(query.as_bytes())
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
@@ -82,7 +92,13 @@ pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<String,
             "state mismatch in OAuth callback — possible CSRF, aborting".into(),
         ));
     }
-    lookup("code").ok_or_else(|| CliError::Auth("no authorization code in callback".into()))
+    let code =
+        lookup("code").ok_or_else(|| CliError::Auth("no authorization code in callback".into()))?;
+    Ok(AuthCodeGrant {
+        code,
+        entity: lookup("entity"),
+        role: lookup("role"),
+    })
 }
 
 pub async fn exchange_code(
@@ -273,6 +289,14 @@ impl TokenProvider for AuthCodeProvider {
     }
 }
 
+/// A completed interactive login: the token NetSuite issued plus the entity/role IDs its
+/// callback reported for the user who logged in.
+pub struct LoginOutcome {
+    pub token: TokenResponse,
+    pub entity: Option<String>,
+    pub role: Option<String>,
+}
+
 /// Interactive login: opens the browser at the authorize URL, then either reads the
 /// pasted redirect URL (`paste_mode`) or runs a one-shot HTTPS loopback listener to
 /// catch the redirect itself. NetSuite rejects plain `http://` redirect URIs, so the
@@ -284,7 +308,7 @@ pub async fn run_login_flow(
     client_id: &str,
     port: u16,
     paste_mode: bool,
-) -> Result<TokenResponse, CliError> {
+) -> Result<LoginOutcome, CliError> {
     let pkce = generate_pkce();
     let state = generate_state();
     let redirect_uri = format!("https://localhost:{port}/callback");
@@ -304,21 +328,26 @@ pub async fn run_login_flow(
     eprintln!("Open this URL to log in (or it will open automatically):\n{url}");
     let _ = webbrowser::open(&url);
 
-    let code = if paste_mode {
+    let grant = if paste_mode {
         loopback::read_pasted_redirect(|query| parse_callback_query(query, &state))?
     } else {
         loopback::listen_for_redirect(port, |query| parse_callback_query(query, &state)).await?
     };
 
-    exchange_code(
+    let token = exchange_code(
         http,
         token_url,
         client_id,
-        &code,
+        &grant.code,
         &redirect_uri,
         &pkce.verifier,
     )
-    .await
+    .await?;
+    Ok(LoginOutcome {
+        token,
+        entity: grant.entity,
+        role: grant.role,
+    })
 }
 
 #[cfg(test)]
@@ -374,8 +403,18 @@ mod tests {
     fn callback_query_parsing_extracts_code_and_validates_state() {
         let parsed =
             parse_callback_query("code=abc123&state=EXPECTED&role=3&entity=9", "EXPECTED").unwrap();
-        assert_eq!(parsed, "abc123");
+        assert_eq!(parsed.code, "abc123");
+        assert_eq!(parsed.entity.as_deref(), Some("9"));
+        assert_eq!(parsed.role.as_deref(), Some("3"));
         assert!(parse_callback_query("code=abc&state=WRONG", "EXPECTED").is_err());
         assert!(parse_callback_query("error=access_denied&state=EXPECTED", "EXPECTED").is_err());
+    }
+
+    #[test]
+    fn callback_without_entity_and_role_still_yields_the_code() {
+        let parsed = parse_callback_query("code=abc123&state=EXPECTED", "EXPECTED").unwrap();
+        assert_eq!(parsed.code, "abc123");
+        assert!(parsed.entity.is_none());
+        assert!(parsed.role.is_none());
     }
 }
