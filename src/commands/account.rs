@@ -155,7 +155,13 @@ fn handle_account_switch(
     let Some(previous_account_id) = previous else {
         return Ok(None);
     };
-    if previous_account_id == landed {
+    // Compare via account_domain_id rather than raw equality: NetSuite account ids are
+    // case-insensitive and accept either `_` or `-` before the sandbox/role suffix (both map to
+    // the same host, e.g. `1234567-sb2` and `1234567_SB2`), so a re-login that lands back in the
+    // "same" account under a differently-spelled id must not look like a switch.
+    if crate::account::account_domain_id(previous_account_id)
+        == crate::account::account_domain_id(landed)
+    {
         return Ok(None);
     }
     store.delete_tba(alias)?;
@@ -662,6 +668,34 @@ mod tests {
 
         assert!(notice.is_none(), "brand-new alias: no notice");
         assert!(store.get_tba("dev").unwrap().is_none());
+    }
+
+    #[test]
+    fn handle_account_switch_treats_equivalent_account_id_spellings_as_unchanged() {
+        let hyphenated_store = MemoryStore::default();
+        hyphenated_store.set_tba("dev", &seeded_tba()).unwrap();
+        let notice =
+            handle_account_switch(&hyphenated_store, "dev", Some("1234567-sb2"), "1234567_SB2")
+                .unwrap();
+        assert!(
+            notice.is_none(),
+            "hyphen/underscore variants of the same account: no notice"
+        );
+        assert!(
+            hyphenated_store.get_tba("dev").unwrap().is_some(),
+            "TBA must survive when the account is the same, just spelled differently"
+        );
+
+        let case_only_store = MemoryStore::default();
+        case_only_store.set_tba("dev", &seeded_tba()).unwrap();
+        let notice =
+            handle_account_switch(&case_only_store, "dev", Some("1234567_sb2"), "1234567_SB2")
+                .unwrap();
+        assert!(notice.is_none(), "case-only difference: no notice");
+        assert!(
+            case_only_store.get_tba("dev").unwrap().is_some(),
+            "TBA must survive when the account is the same, just spelled differently"
+        );
     }
 
     #[test]
