@@ -108,8 +108,12 @@ pub async fn login(
     paste_mode: bool,
 ) -> Result<Value, CliError> {
     // Read the alias's previous account id before store_auth_code_account overwrites the config
-    // entry — this is the only chance to see it.
-    let previous_account_id = Config::load(config_path)?
+    // entry — this is the only chance to see it. Same load also guards against clobbering an
+    // M2M-registered alias: check before opening the browser so a login the user was never going
+    // to be allowed to keep doesn't cost them a trip through NetSuite's login/consent screen.
+    let existing_config = Config::load(config_path)?;
+    ensure_login_wont_clobber_m2m(&existing_config, alias)?;
+    let previous_account_id = existing_config
         .accounts
         .get(alias)
         .map(|entry| entry.account_id.clone());
@@ -144,6 +148,27 @@ pub async fn login(
         eprintln!("{notice}");
     }
     Ok(result)
+}
+
+/// Refuses to let `login()` run against an alias already registered for M2M (certificate) auth:
+/// `store_auth_code_account` unconditionally overwrites both the config entry and the keychain
+/// secrets for `alias`, so an unattended agent alias set up via `account add --flow m2m` would
+/// silently lose its cert_id + private-key PEM to a casual `account login <alias>`. Auth-code
+/// entries and unknown aliases are fine — re-login of an existing auth-code alias, or first-time
+/// registration of a new one, is exactly what `login()` is for.
+fn ensure_login_wont_clobber_m2m(config: &Config, alias: &str) -> Result<(), CliError> {
+    match config.accounts.get(alias) {
+        Some(AccountEntry {
+            flow: AuthFlow::M2m,
+            ..
+        }) => Err(CliError::Usage(format!(
+            "'{alias}' is registered for m2m (certificate) auth; `account login` would replace \
+             those credentials with an auth-code token. Pick a different alias, or re-register \
+             deliberately with `account add {alias} --flow m2m ...` if you meant to redo the \
+             certificate setup"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Handles a re-login that discovers a different account than the one `alias` was previously
@@ -704,6 +729,54 @@ mod tests {
             case_only_store.get_tba("dev").unwrap().is_some(),
             "TBA must survive when the account is the same, just spelled differently"
         );
+    }
+
+    #[test]
+    fn ensure_login_wont_clobber_m2m_refuses_an_alias_registered_for_m2m() {
+        let mut config = Config::default();
+        config.accounts.insert(
+            "prod".into(),
+            AccountEntry {
+                account_id: "1234567".into(),
+                flow: AuthFlow::M2m,
+                entity_id: None,
+                role_id: None,
+            },
+        );
+
+        let error = ensure_login_wont_clobber_m2m(&config, "prod").unwrap_err();
+
+        match error {
+            CliError::Usage(message) => {
+                assert!(message.contains("prod"));
+                assert!(message.contains("m2m"));
+                assert!(message.contains("account add"));
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_login_wont_clobber_m2m_allows_an_alias_already_registered_for_auth_code() {
+        let mut config = Config::default();
+        config.accounts.insert(
+            "dev".into(),
+            AccountEntry {
+                account_id: "1234567_SB1".into(),
+                flow: AuthFlow::AuthCode,
+                entity_id: Some("9".into()),
+                role_id: Some("3".into()),
+            },
+        );
+
+        ensure_login_wont_clobber_m2m(&config, "dev").unwrap();
+    }
+
+    #[test]
+    fn ensure_login_wont_clobber_m2m_allows_a_brand_new_alias() {
+        let config = Config::default();
+
+        ensure_login_wont_clobber_m2m(&config, "dev").unwrap();
     }
 
     #[test]
