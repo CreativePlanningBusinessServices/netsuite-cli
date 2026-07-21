@@ -92,6 +92,41 @@ pub async fn add_auth_code(
     )
 }
 
+/// `account login` has no --port flag: the registered redirect URI on the integration record
+/// is https://localhost:8899/callback and OAuth requires an exact match.
+pub const LOGIN_CALLBACK_PORT: u16 = 8899;
+
+/// One-shot browser login. With `account_id: None` the account is discovered from the OAuth
+/// callback (NetSuite's own account/role chooser decides). Stores the alias exactly like
+/// `add_auth_code`, so the result works with every command including the cert bootstrap.
+pub async fn login(
+    config_path: &Path,
+    store: Arc<dyn SecretStore>,
+    alias: &str,
+    account_id: Option<&str>,
+    client_id: &str,
+    paste_mode: bool,
+) -> Result<Value, CliError> {
+    let http = reqwest::Client::new();
+    let login = authcode::run_login_flow(
+        &http,
+        account_id,
+        client_id,
+        LOGIN_CALLBACK_PORT,
+        paste_mode,
+    )
+    .await?;
+    let landed_account_id = login.account_id.clone();
+    store_auth_code_account(
+        config_path,
+        store.as_ref(),
+        alias,
+        &landed_account_id,
+        client_id,
+        &login,
+    )
+}
+
 /// Mints a never-expiring SOAP (TBA) token via browser consent and stores it alongside the
 /// consumer pair used to obtain it, so a later `soap_auth` re-run (or the SOAP client itself)
 /// can find both without prompting again.
