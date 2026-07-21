@@ -70,6 +70,10 @@ pub struct AuthCodeGrant {
     pub code: String,
     pub entity: Option<String>,
     pub role: Option<String>,
+    /// The account id the login landed in (e.g. `1234567_SB1`), reported by NetSuite as the
+    /// callback's `company` parameter. This is what makes account discovery possible when the
+    /// authorize URL went to system.netsuite.com instead of a specific account's host.
+    pub company: Option<String>,
 }
 
 pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<AuthCodeGrant, CliError> {
@@ -98,6 +102,7 @@ pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<AuthCod
         code,
         entity: lookup("entity"),
         role: lookup("role"),
+        company: lookup("company"),
     })
 }
 
@@ -401,20 +406,25 @@ mod tests {
 
     #[test]
     fn callback_query_parsing_extracts_code_and_validates_state() {
-        let parsed =
-            parse_callback_query("code=abc123&state=EXPECTED&role=3&entity=9", "EXPECTED").unwrap();
+        let parsed = parse_callback_query(
+            "code=abc123&state=EXPECTED&role=3&entity=9&company=1234567_SB1",
+            "EXPECTED",
+        )
+        .unwrap();
         assert_eq!(parsed.code, "abc123");
         assert_eq!(parsed.entity.as_deref(), Some("9"));
         assert_eq!(parsed.role.as_deref(), Some("3"));
+        assert_eq!(parsed.company.as_deref(), Some("1234567_SB1"));
         assert!(parse_callback_query("code=abc&state=WRONG", "EXPECTED").is_err());
         assert!(parse_callback_query("error=access_denied&state=EXPECTED", "EXPECTED").is_err());
     }
 
     #[test]
-    fn callback_without_entity_and_role_still_yields_the_code() {
+    fn callback_without_entity_role_or_company_still_yields_the_code() {
         let parsed = parse_callback_query("code=abc123&state=EXPECTED", "EXPECTED").unwrap();
         assert_eq!(parsed.code, "abc123");
         assert!(parsed.entity.is_none());
         assert!(parsed.role.is_none());
+        assert!(parsed.company.is_none());
     }
 }
