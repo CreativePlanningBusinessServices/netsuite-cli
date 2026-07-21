@@ -80,13 +80,8 @@ pub async fn add_auth_code(
     paste_mode: bool,
 ) -> Result<Value, CliError> {
     let http = reqwest::Client::new();
-    let app_base = domain::app_base(account_id);
-    let token_url = format!(
-        "{}/services/rest/auth/oauth2/v1/token",
-        domain::rest_base(account_id)
-    );
     let login =
-        authcode::run_login_flow(&http, &app_base, &token_url, client_id, port, paste_mode).await?;
+        authcode::run_login_flow(&http, Some(account_id), client_id, port, paste_mode).await?;
     store_auth_code_account(
         config_path,
         store.as_ref(),
@@ -95,6 +90,120 @@ pub async fn add_auth_code(
         client_id,
         &login,
     )
+}
+
+/// `account login` has no --port flag: the registered redirect URI on the integration record
+/// is https://localhost:8899/callback and OAuth requires an exact match.
+pub const LOGIN_CALLBACK_PORT: u16 = 8899;
+
+/// One-shot browser login. With `account_id: None` the account is discovered from the OAuth
+/// callback (NetSuite's own account/role chooser decides). Stores the alias exactly like
+/// `add_auth_code`, so the result works with every command including the cert bootstrap.
+pub async fn login(
+    config_path: &Path,
+    store: Arc<dyn SecretStore>,
+    alias: &str,
+    account_id: Option<&str>,
+    client_id: &str,
+    paste_mode: bool,
+) -> Result<Value, CliError> {
+    // Read the alias's previous account id before store_auth_code_account overwrites the config
+    // entry — this is the only chance to see it. Same load also guards against clobbering an
+    // M2M-registered alias: check before opening the browser so a login the user was never going
+    // to be allowed to keep doesn't cost them a trip through NetSuite's login/consent screen.
+    let existing_config = Config::load(config_path)?;
+    ensure_login_wont_clobber_m2m(&existing_config, alias)?;
+    let previous_account_id = existing_config
+        .accounts
+        .get(alias)
+        .map(|entry| entry.account_id.clone());
+    let http = reqwest::Client::new();
+    let login = authcode::run_login_flow(
+        &http,
+        account_id,
+        client_id,
+        LOGIN_CALLBACK_PORT,
+        paste_mode,
+    )
+    .await?;
+    let result = store_auth_code_account(
+        config_path,
+        store.as_ref(),
+        alias,
+        &login.account_id,
+        client_id,
+        &login,
+    )?;
+    // Persist first, purge/notify second: handle_account_switch deletes TBA secrets and reports
+    // "the alias now points at {landed}", both of which must not happen until that's actually
+    // true. Doing this before store_auth_code_account risked deleting TBA credentials — and
+    // printing a false switch notice — for an alias that, on a failed write, still pointed at the
+    // old account.
+    if let Some(notice) = handle_account_switch(
+        store.as_ref(),
+        alias,
+        previous_account_id.as_deref(),
+        &login.account_id,
+    )? {
+        eprintln!("{notice}");
+    }
+    Ok(result)
+}
+
+/// Refuses to let `login()` run against an alias already registered for M2M (certificate) auth:
+/// `store_auth_code_account` unconditionally overwrites both the config entry and the keychain
+/// secrets for `alias`, so an unattended agent alias set up via `account add --flow m2m` would
+/// silently lose its cert_id + private-key PEM to a casual `account login <alias>`. Auth-code
+/// entries and unknown aliases are fine — re-login of an existing auth-code alias, or first-time
+/// registration of a new one, is exactly what `login()` is for.
+fn ensure_login_wont_clobber_m2m(config: &Config, alias: &str) -> Result<(), CliError> {
+    match config.accounts.get(alias) {
+        Some(AccountEntry {
+            flow: AuthFlow::M2m,
+            ..
+        }) => Err(CliError::Usage(format!(
+            "'{alias}' is registered for m2m (certificate) auth; `account login` would replace \
+             those credentials with an auth-code token. Pick a different alias, or re-register \
+             deliberately with `account add {alias} --flow m2m ...` if you meant to redo the \
+             certificate setup"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Handles a re-login that discovers a different account than the one `alias` was previously
+/// registered to: clears any stored SOAP (TBA) credentials for the alias — they were minted
+/// against the old account, and left alone they'd be silently reused (`offer_soap_setup` sees an
+/// existing `token_id` and skips setup), leaving SOAP/`saved-search run` on the old account while
+/// REST moves to the new one — and returns a notice naming both accounts. `Ok(None)` for a
+/// brand-new alias or when the account is unchanged; TBA secrets are left untouched in both those
+/// cases, since `login()` stores the discovered account either way and should only speak up (and
+/// only clear TBA) when that's a change worth flagging.
+fn handle_account_switch(
+    store: &dyn SecretStore,
+    alias: &str,
+    previous: Option<&str>,
+    landed: &str,
+) -> Result<Option<String>, CliError> {
+    let Some(previous_account_id) = previous else {
+        return Ok(None);
+    };
+    // Compare via account_domain_id rather than raw equality: NetSuite account ids are
+    // case-insensitive and accept either `_` or `-` before the sandbox/role suffix (both map to
+    // the same host, e.g. `1234567-sb2` and `1234567_SB2`), so a re-login that lands back in the
+    // "same" account under a differently-spelled id must not look like a switch.
+    if crate::account::account_domain_id(previous_account_id)
+        == crate::account::account_domain_id(landed)
+    {
+        return Ok(None);
+    }
+    store.delete_tba(alias)?;
+    Ok(Some(format!(
+        "note: '{alias}' was registered to account {previous_account_id}; the login you \
+         completed landed in {landed} — the alias now points at {landed} and its stored SOAP \
+         (TBA) credentials were cleared; re-run `netsuite-cli account soap-auth {alias}` if you \
+         use saved searches"
+    )))
 }
 
 /// Mints a never-expiring SOAP (TBA) token via browser consent and stores it alongside the
@@ -364,6 +473,7 @@ mod tests {
     fn login_outcome(token: TokenResponse) -> LoginOutcome {
         LoginOutcome {
             token,
+            account_id: "1234567_SB1".into(),
             entity: Some("9".into()),
             role: Some("3".into()),
         }
@@ -538,6 +648,135 @@ mod tests {
 
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.default_account.as_deref(), Some("prod"));
+    }
+
+    fn seeded_tba() -> crate::secrets::TbaSecrets {
+        crate::secrets::TbaSecrets {
+            consumer_key: "consumerkey123".into(),
+            consumer_secret: "consumersecret789".into(),
+            token_id: Some("tokenid456".into()),
+            token_secret: Some("tokensecret012".into()),
+        }
+    }
+
+    #[test]
+    fn handle_account_switch_clears_tba_and_notes_the_switch_when_account_changes() {
+        let store = MemoryStore::default();
+        store.set_tba("dev", &seeded_tba()).unwrap();
+
+        let notice = handle_account_switch(&store, "dev", Some("1234567_SB1"), "7654321_RP")
+            .unwrap()
+            .expect("account changed, notice expected");
+
+        assert!(notice.contains("dev"));
+        assert!(notice.contains("1234567_SB1"));
+        assert!(notice.contains("7654321_RP"));
+        assert!(notice.contains("soap-auth"));
+        assert!(
+            store.get_tba("dev").unwrap().is_none(),
+            "stale TBA credentials from the old account must be cleared"
+        );
+    }
+
+    #[test]
+    fn handle_account_switch_leaves_tba_alone_when_account_is_unchanged() {
+        let store = MemoryStore::default();
+        store.set_tba("dev", &seeded_tba()).unwrap();
+
+        let notice =
+            handle_account_switch(&store, "dev", Some("1234567_SB1"), "1234567_SB1").unwrap();
+
+        assert!(notice.is_none(), "same account: no notice");
+        assert!(
+            store.get_tba("dev").unwrap().is_some(),
+            "TBA must survive a re-login that lands in the same account"
+        );
+    }
+
+    #[test]
+    fn handle_account_switch_leaves_tba_alone_for_a_brand_new_alias() {
+        let store = MemoryStore::default();
+
+        let notice = handle_account_switch(&store, "dev", None, "1234567_SB1").unwrap();
+
+        assert!(notice.is_none(), "brand-new alias: no notice");
+        assert!(store.get_tba("dev").unwrap().is_none());
+    }
+
+    #[test]
+    fn handle_account_switch_treats_equivalent_account_id_spellings_as_unchanged() {
+        let hyphenated_store = MemoryStore::default();
+        hyphenated_store.set_tba("dev", &seeded_tba()).unwrap();
+        let notice =
+            handle_account_switch(&hyphenated_store, "dev", Some("1234567-sb2"), "1234567_SB2")
+                .unwrap();
+        assert!(
+            notice.is_none(),
+            "hyphen/underscore variants of the same account: no notice"
+        );
+        assert!(
+            hyphenated_store.get_tba("dev").unwrap().is_some(),
+            "TBA must survive when the account is the same, just spelled differently"
+        );
+
+        let case_only_store = MemoryStore::default();
+        case_only_store.set_tba("dev", &seeded_tba()).unwrap();
+        let notice =
+            handle_account_switch(&case_only_store, "dev", Some("1234567_sb2"), "1234567_SB2")
+                .unwrap();
+        assert!(notice.is_none(), "case-only difference: no notice");
+        assert!(
+            case_only_store.get_tba("dev").unwrap().is_some(),
+            "TBA must survive when the account is the same, just spelled differently"
+        );
+    }
+
+    #[test]
+    fn ensure_login_wont_clobber_m2m_refuses_an_alias_registered_for_m2m() {
+        let mut config = Config::default();
+        config.accounts.insert(
+            "prod".into(),
+            AccountEntry {
+                account_id: "1234567".into(),
+                flow: AuthFlow::M2m,
+                entity_id: None,
+                role_id: None,
+            },
+        );
+
+        let error = ensure_login_wont_clobber_m2m(&config, "prod").unwrap_err();
+
+        match error {
+            CliError::Usage(message) => {
+                assert!(message.contains("prod"));
+                assert!(message.contains("m2m"));
+                assert!(message.contains("account add"));
+            }
+            other => panic!("expected Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_login_wont_clobber_m2m_allows_an_alias_already_registered_for_auth_code() {
+        let mut config = Config::default();
+        config.accounts.insert(
+            "dev".into(),
+            AccountEntry {
+                account_id: "1234567_SB1".into(),
+                flow: AuthFlow::AuthCode,
+                entity_id: Some("9".into()),
+                role_id: Some("3".into()),
+            },
+        );
+
+        ensure_login_wont_clobber_m2m(&config, "dev").unwrap();
+    }
+
+    #[test]
+    fn ensure_login_wont_clobber_m2m_allows_a_brand_new_alias() {
+        let config = Config::default();
+
+        ensure_login_wont_clobber_m2m(&config, "dev").unwrap();
     }
 
     #[test]

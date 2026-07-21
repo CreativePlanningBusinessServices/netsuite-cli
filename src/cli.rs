@@ -491,6 +491,28 @@ pub enum AccountAction {
         #[arg(long)]
         paste: bool,
     },
+    /// One-command browser login; discovers the account from NetSuite's own chooser
+    #[command(
+        after_help = "Examples:\n  netsuite-cli account login myaccount\n  netsuite-cli \
+        account login myaccount --account-id 1234567_SB1\n  netsuite-cli account login \
+        myaccount --paste\n\nWithout --account-id, NetSuite's login page lets you pick the \
+        account and role, and the CLI records whichever account you chose. The callback port \
+        is fixed at 8899 — the integration record's registered redirect URI must match \
+        exactly. Uses the built-in client ID unless --client-id (or an id already stored for \
+        the alias) overrides it."
+    )]
+    Login {
+        alias: String,
+        /// Pin the login to one account instead of discovering it from the callback
+        #[arg(long = "account-id")]
+        account_id: Option<String>,
+        /// Integration record Client ID; omit to use the alias's stored id or the built-in one
+        #[arg(long = "client-id")]
+        client_id: Option<String>,
+        /// Paste the redirect URL manually instead of running the loopback listener
+        #[arg(long)]
+        paste: bool,
+    },
     /// List configured account aliases (never prints secrets)
     List,
     /// Change which alias is used when --account/$NETSUITE_ACCOUNT is not given
@@ -1135,6 +1157,33 @@ async fn dispatch_account(
                 .await)
             }
         },
+        AccountAction::Login {
+            alias,
+            account_id,
+            client_id,
+            paste,
+        } => {
+            let client_id =
+                resolve_client_id_for_alias(store.as_ref(), alias, client_id.as_deref())?;
+            let add_result = account::login(
+                &config_path,
+                store.clone(),
+                alias,
+                account_id.as_deref(),
+                &client_id,
+                *paste,
+            )
+            .await?;
+            Ok(offer_soap_setup(
+                alias,
+                &config_path,
+                store.clone(),
+                account::LOGIN_CALLBACK_PORT,
+                *paste,
+                add_result,
+            )
+            .await)
+        }
         AccountAction::List => account::list(&config_path),
         AccountAction::SetDefault { alias } => account::set_default(&config_path, alias),
         AccountAction::Remove { alias } => account::remove(&config_path, store.as_ref(), alias),
@@ -1635,6 +1684,39 @@ mod tests {
         Cli::try_parse_from(["netsuite-cli", "account", "cert", "list"]).expect("list parses");
         Cli::try_parse_from(["netsuite-cli", "account", "cert", "revoke", "CERTID123"])
             .expect("revoke parses");
+    }
+
+    #[test]
+    fn account_login_parses_with_and_without_flags() {
+        Cli::try_parse_from(["netsuite-cli", "account", "login", "my"]).expect("bare login parses");
+        let cli = Cli::try_parse_from([
+            "netsuite-cli",
+            "account",
+            "login",
+            "my",
+            "--account-id",
+            "1234567_SB1",
+            "--client-id",
+            "CID",
+            "--paste",
+        ])
+        .expect("login with overrides parses");
+        let Command::Account {
+            action:
+                AccountAction::Login {
+                    alias,
+                    account_id,
+                    client_id,
+                    paste,
+                },
+        } = cli.command
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(alias, "my");
+        assert_eq!(account_id.as_deref(), Some("1234567_SB1"));
+        assert_eq!(client_id.as_deref(), Some("CID"));
+        assert!(paste);
     }
 
     #[test]

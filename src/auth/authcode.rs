@@ -63,13 +63,18 @@ pub fn authorize_url(
 }
 
 /// What NetSuite's authorization callback carries besides the code: the internal IDs of the
-/// user (`entity`) and role that just logged in. They're recorded so the certificate rotation
-/// API (`account cert upload`) can default its required entity/role mapping fields later.
+/// user (`entity`) and role that just logged in, plus the account (`company`) the login landed
+/// in. They're recorded so the certificate rotation API (`account cert upload`) can default its
+/// required entity/role mapping fields later.
 #[derive(Debug, PartialEq)]
 pub struct AuthCodeGrant {
     pub code: String,
     pub entity: Option<String>,
     pub role: Option<String>,
+    /// The account id the login landed in (e.g. `1234567_SB1`), reported by NetSuite as the
+    /// callback's `company` parameter. This is what makes account discovery possible when the
+    /// authorize URL went to system.netsuite.com instead of a specific account's host.
+    pub company: Option<String>,
 }
 
 pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<AuthCodeGrant, CliError> {
@@ -98,6 +103,7 @@ pub fn parse_callback_query(query: &str, expected_state: &str) -> Result<AuthCod
         code,
         entity: lookup("entity"),
         role: lookup("role"),
+        company: lookup("company"),
     })
 }
 
@@ -289,10 +295,58 @@ impl TokenProvider for AuthCodeProvider {
     }
 }
 
-/// A completed interactive login: the token NetSuite issued plus the entity/role IDs its
-/// callback reported for the user who logged in.
+/// The account a completed login belongs to: a pinned --account-id wins (trusted, user-supplied,
+/// used as-is); otherwise the callback's `company` parameter (present when authorizing via
+/// system.netsuite.com) is required and validated — without it, or with a value that doesn't look
+/// like a NetSuite account id, the CLI cannot know which account issued the grant.
+pub fn resolved_account_id(
+    pinned: Option<&str>,
+    company: Option<&str>,
+) -> Result<String, CliError> {
+    pinned
+        .map(str::to_string)
+        .or_else(|| {
+            company
+                .filter(|candidate| looks_like_netsuite_account_id(candidate))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            CliError::Auth(
+                "NetSuite's callback did not report which account was chosen — re-run with \
+                 --account-id <id>"
+                    .into(),
+            )
+        })
+}
+
+/// Whether `candidate` has NetSuite's account-id shape: a nonempty run of ASCII alphanumerics
+/// (covers numeric ids like `1234567` and letter-prefixed test-drive/partner ids like
+/// `TSTDRV1234567`), optionally followed by one underscore and an alphanumeric suffix (e.g.
+/// `1234567_SB1`). The callback's `company` value becomes a URL host
+/// (`crate::account::rest_base`), so this is a security boundary, not just cosmetic validation —
+/// it rejects things like `evil.example/x` that would otherwise redirect the token exchange (auth
+/// code + PKCE verifier) to an attacker-controlled host: `.` and `/` can't appear in an
+/// alphanumeric run, so there's no way to escape the `*.suitetalk.api.netsuite.com` suffix.
+fn looks_like_netsuite_account_id(candidate: &str) -> bool {
+    let (base, rest) = match candidate.split_once('_') {
+        Some((base, suffix)) => (base, Some(suffix)),
+        None => (candidate, None),
+    };
+    if base.is_empty() || !base.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return false;
+    }
+    match rest {
+        Some(suffix) => !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_alphanumeric()),
+        None => true,
+    }
+}
+
+/// A completed interactive login: the token NetSuite issued, the account it landed in
+/// (pinned or discovered), plus the entity/role IDs its callback reported for the user who
+/// logged in.
 pub struct LoginOutcome {
     pub token: TokenResponse,
+    pub account_id: String,
     pub entity: Option<String>,
     pub role: Option<String>,
 }
@@ -301,10 +355,13 @@ pub struct LoginOutcome {
 /// pasted redirect URL (`paste_mode`) or runs a one-shot HTTPS loopback listener to
 /// catch the redirect itself. NetSuite rejects plain `http://` redirect URIs, so the
 /// listener terminates TLS with a throwaway self-signed cert for `localhost`.
+///
+/// With `account_id: None` the authorize URL goes to system.netsuite.com, NetSuite shows its
+/// own account/role chooser during login, and the chosen account arrives in the callback's
+/// `company` parameter — which is why the token URL can only be built after the callback.
 pub async fn run_login_flow(
     http: &reqwest::Client,
-    app_base: &str,
-    token_url: &str,
+    account_id: Option<&str>,
     client_id: &str,
     port: u16,
     paste_mode: bool,
@@ -316,8 +373,12 @@ pub async fn run_login_flow(
         .iter()
         .map(|scope| scope.to_string())
         .collect();
+    let app_base = match account_id {
+        Some(pinned) => crate::account::app_base(pinned),
+        None => "https://system.netsuite.com".to_string(),
+    };
     let url = authorize_url(
-        app_base,
+        &app_base,
         client_id,
         &redirect_uri,
         &scopes,
@@ -334,9 +395,14 @@ pub async fn run_login_flow(
         loopback::listen_for_redirect(port, |query| parse_callback_query(query, &state)).await?
     };
 
+    let resolved = resolved_account_id(account_id, grant.company.as_deref())?;
+    let token_url = format!(
+        "{}/services/rest/auth/oauth2/v1/token",
+        crate::account::rest_base(&resolved)
+    );
     let token = exchange_code(
         http,
-        token_url,
+        &token_url,
         client_id,
         &grant.code,
         &redirect_uri,
@@ -345,6 +411,7 @@ pub async fn run_login_flow(
     .await?;
     Ok(LoginOutcome {
         token,
+        account_id: resolved,
         entity: grant.entity,
         role: grant.role,
     })
@@ -401,20 +468,66 @@ mod tests {
 
     #[test]
     fn callback_query_parsing_extracts_code_and_validates_state() {
-        let parsed =
-            parse_callback_query("code=abc123&state=EXPECTED&role=3&entity=9", "EXPECTED").unwrap();
+        let parsed = parse_callback_query(
+            "code=abc123&state=EXPECTED&role=3&entity=9&company=1234567_SB1",
+            "EXPECTED",
+        )
+        .unwrap();
         assert_eq!(parsed.code, "abc123");
         assert_eq!(parsed.entity.as_deref(), Some("9"));
         assert_eq!(parsed.role.as_deref(), Some("3"));
+        assert_eq!(parsed.company.as_deref(), Some("1234567_SB1"));
         assert!(parse_callback_query("code=abc&state=WRONG", "EXPECTED").is_err());
         assert!(parse_callback_query("error=access_denied&state=EXPECTED", "EXPECTED").is_err());
     }
 
     #[test]
-    fn callback_without_entity_and_role_still_yields_the_code() {
+    fn callback_without_entity_role_or_company_still_yields_the_code() {
         let parsed = parse_callback_query("code=abc123&state=EXPECTED", "EXPECTED").unwrap();
         assert_eq!(parsed.code, "abc123");
         assert!(parsed.entity.is_none());
         assert!(parsed.role.is_none());
+        assert!(parsed.company.is_none());
+    }
+
+    #[test]
+    fn resolved_account_id_prefers_pinned_then_company_then_errors() {
+        assert_eq!(
+            resolved_account_id(Some("1234567"), Some("7654321_SB1")).unwrap(),
+            "1234567"
+        );
+        assert_eq!(
+            resolved_account_id(None, Some("7654321_SB1")).unwrap(),
+            "7654321_SB1"
+        );
+        assert_eq!(
+            resolved_account_id(None, Some("7654321_RP")).unwrap(),
+            "7654321_RP"
+        );
+        assert_eq!(
+            resolved_account_id(None, Some("TSTDRV1234567")).unwrap(),
+            "TSTDRV1234567"
+        );
+        let error = resolved_account_id(None, None).unwrap_err();
+        match error {
+            CliError::Auth(message) => assert!(message.contains("--account-id")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_account_id_rejects_a_company_that_is_not_a_netsuite_account_id() {
+        let empty_company_error = resolved_account_id(None, Some("")).unwrap_err();
+        match empty_company_error {
+            CliError::Auth(message) => assert!(message.contains("--account-id")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
+
+        let malicious_company_error =
+            resolved_account_id(None, Some("evil.example/x")).unwrap_err();
+        match malicious_company_error {
+            CliError::Auth(message) => assert!(message.contains("--account-id")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
     }
 }
