@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan: account login with account discovery</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55; max-width: 960px; margin: 2rem auto; padding: 0 1.25rem; color: #1a1a1a; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { color: #ddd; background: #161616; }
+    code, pre { background: #262626; }
+    table th { background: #262626; }
+    .task { border-color: #444; }
+    .callout { background: #2a2418; border-color: #8a6d1a; }
+  }
+  h1 { font-size: 1.55rem; border-bottom: 2px solid #888; padding-bottom: .4rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.4rem; }
+  h3 { font-size: 1.05rem; margin-top: 1.6rem; }
+  code, pre { background: #f2f2f2; border-radius: 4px; padding: .1em .35em; font-size: .88em; }
+  pre { padding: .8em 1em; overflow-x: auto; line-height: 1.4; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #999; padding: .4em .7em; text-align: left; vertical-align: top; }
+  th { background: #f2f2f2; }
+  .task { border: 1px solid #bbb; border-radius: 8px; padding: 0 1.2em 1em; margin: 1.6em 0; }
+  .callout { background: #fdf6e3; border-left: 4px solid #b58900; padding: .7em 1em; margin: 1.2em 0; }
+  li.step { list-style: none; margin: .8em 0; }
+  li.step::before { content: "☐ "; font-size: 1.1em; }
+  ul.steps { padding-left: .5em; }
+  .buttons a {
+    display: inline-block; padding: .5em 1.1em; margin: .2em .3em .2em 0; border-radius: 6px;
+    text-decoration: none; font-weight: 600; border: 1px solid #268bd2; color: #268bd2;
+  }
+  .buttons a:first-child { background: #268bd2; color: #fff; }
+</style>
+</head>
+<body>
+
+<h1>account login with account discovery — implementation plan</h1>
+
+<p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: use
+<code>superpowers:subagent-driven-development</code> (recommended) or
+<code>superpowers:executing-plans</code> to implement this plan task-by-task. Steps are ☐
+checkboxes.</p>
+
+<p><strong>Goal:</strong> a one-shot <code>netsuite-cli account login &lt;alias&gt;</code> that
+discovers the NetSuite account from the OAuth callback, so a fresh machine authenticates with
+zero flags and zero NetSuite UI setup.</p>
+
+<p><strong>Architecture:</strong> extend the existing auth-code PKCE machinery
+(<code>src/auth/authcode.rs</code>) to parse the callback&rsquo;s <code>company</code> parameter
+and defer token-URL construction until after the callback; add a thin
+<code>account login</code> command that reuses PR&nbsp;#10&rsquo;s client-id resolution, the
+existing storage path, and the existing SOAP-chaining offer. Spec:
+<code>docs/superpowers/specs/2026-07-20-account-login-discovery-design.html</code>.</p>
+
+<p><strong>Tech stack:</strong> Rust (edition 2024), clap derive, wiremock/tokio tests. No new
+dependencies.</p>
+
+<p class="buttons">
+  <a href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-Driven" target="_blank">🤖 Execute: subagent-driven (recommended)</a> &nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline" target="_blank">📝 Execute: inline in this session</a>
+</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li>No new crate dependencies.</li>
+  <li>stdout stays machine-JSON only; human text goes to stderr.</li>
+  <li><code>account login</code> has <strong>no <code>--port</code></strong> — the callback port
+      is fixed at 8899 because the registered redirect URI must match exactly.</li>
+  <li>Never put a real account id in code, tests, or docs — use <code>1234567</code> /
+      <code>1234567_SB1</code> placeholder forms (repo is public; recurring leak hazard).</li>
+  <li>TDD per task: write the failing test, watch it fail, implement, watch it pass, commit.</li>
+  <li>Run <code>cargo fmt</code> and <code>cargo clippy --all-targets</code> before every
+      commit; both must be clean.</li>
+</ul>
+
+<h2>File map</h2>
+<table>
+<tr><th>File</th><th>Role in this feature</th></tr>
+<tr><td><code>src/auth/authcode.rs</code></td><td>Callback <code>company</code> capture; discovery-capable <code>run_login_flow</code>; pure <code>resolved_account_id</code> helper (Tasks 1&ndash;2)</td></tr>
+<tr><td><code>src/commands/account.rs</code></td><td><code>login()</code> orchestration + <code>LOGIN_CALLBACK_PORT</code>; <code>add_auth_code</code> updated to the new flow signature (Tasks 2&ndash;3)</td></tr>
+<tr><td><code>src/cli.rs</code></td><td><code>AccountAction::Login</code> variant + dispatch arm (Task 3)</td></tr>
+<tr><td><code>README.md</code>, <code>skills/netsuite-cli/SKILL.md</code></td><td>Quick-start and bootstrap docs lead with <code>account login</code> (Task 4)</td></tr>
+</table>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h2>Task 1: capture <code>company</code> from the OAuth callback</h2>
+
+<p><strong>Files:</strong> modify <code>src/auth/authcode.rs</code> (struct
+<code>AuthCodeGrant</code> at ~line 68, <code>parse_callback_query</code> at ~line 75, and its
+<code>mod tests</code>).</p>
+
+<p><strong>Interfaces &mdash; produces:</strong> <code>AuthCodeGrant.company:
+Option&lt;String&gt;</code>, consumed by Task 2.</p>
+
+<ul class="steps">
+<li class="step"><strong>Step 1: extend the existing callback tests to expect
+<code>company</code>.</strong> In <code>src/auth/authcode.rs</code> tests, change the two
+callback tests to:
+<pre>#[test]
+fn callback_query_parsing_extracts_code_and_validates_state() {
+    let parsed = parse_callback_query(
+        "code=abc123&amp;state=EXPECTED&amp;role=3&amp;entity=9&amp;company=1234567_SB1",
+        "EXPECTED",
+    )
+    .unwrap();
+    assert_eq!(parsed.code, "abc123");
+    assert_eq!(parsed.entity.as_deref(), Some("9"));
+    assert_eq!(parsed.role.as_deref(), Some("3"));
+    assert_eq!(parsed.company.as_deref(), Some("1234567_SB1"));
+    assert!(parse_callback_query("code=abc&amp;state=WRONG", "EXPECTED").is_err());
+    assert!(parse_callback_query("error=access_denied&amp;state=EXPECTED", "EXPECTED").is_err());
+}
+
+#[test]
+fn callback_without_entity_role_or_company_still_yields_the_code() {
+    let parsed = parse_callback_query("code=abc123&amp;state=EXPECTED", "EXPECTED").unwrap();
+    assert_eq!(parsed.code, "abc123");
+    assert!(parsed.entity.is_none());
+    assert!(parsed.role.is_none());
+    assert!(parsed.company.is_none());
+}</pre>
+(The second test renames the existing
+<code>callback_without_entity_and_role_still_yields_the_code</code>.)</li>
+
+<li class="step"><strong>Step 2: watch them fail.</strong> Run:
+<pre>cargo test --lib callback</pre>
+Expected: compile error &mdash; <code>AuthCodeGrant</code> has no field <code>company</code>.
+That is the correct failure (feature missing).</li>
+
+<li class="step"><strong>Step 3: implement.</strong> Add the field and parse it:
+<pre>#[derive(Debug, PartialEq)]
+pub struct AuthCodeGrant {
+    pub code: String,
+    pub entity: Option&lt;String&gt;,
+    pub role: Option&lt;String&gt;,
+    /// The account id the login landed in (e.g. `1234567_SB1`), reported by NetSuite as the
+    /// callback's `company` parameter. This is what makes account discovery possible when the
+    /// authorize URL went to system.netsuite.com instead of a specific account's host.
+    pub company: Option&lt;String&gt;,
+}</pre>
+and in <code>parse_callback_query</code>&rsquo;s final <code>Ok(...)</code>:
+<pre>    Ok(AuthCodeGrant {
+        code,
+        entity: lookup("entity"),
+        role: lookup("role"),
+        company: lookup("company"),
+    })</pre></li>
+
+<li class="step"><strong>Step 4: watch them pass.</strong> Run:
+<pre>cargo test --lib callback</pre>
+Expected: both tests PASS; <code>cargo test</code> shows no other lib-test failures.</li>
+
+<li class="step"><strong>Step 5: commit.</strong>
+<pre>git add src/auth/authcode.rs
+git commit -m "feat: capture company (account id) from OAuth callback"</pre></li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h2>Task 2: discovery-capable login flow</h2>
+
+<p><strong>Files:</strong> modify <code>src/auth/authcode.rs</code>
+(<code>LoginOutcome</code> ~line 294, <code>run_login_flow</code> ~line 304, tests) and
+<code>src/commands/account.rs</code> (<code>add_auth_code</code> ~line 73, tests&rsquo;
+<code>login_outcome</code> helper ~line 986).</p>
+
+<p><strong>Interfaces &mdash; produces:</strong></p>
+<pre>pub fn resolved_account_id(pinned: Option&lt;&amp;str&gt;, company: Option&lt;&amp;str&gt;)
+    -&gt; Result&lt;String, CliError&gt;   // pinned wins; else company; else CliError::Auth
+
+pub struct LoginOutcome {
+    pub token: TokenResponse,
+    pub account_id: String,          // NEW: pinned or discovered
+    pub entity: Option&lt;String&gt;,
+    pub role: Option&lt;String&gt;,
+}
+
+pub async fn run_login_flow(
+    http: &amp;reqwest::Client,
+    account_id: Option&lt;&amp;str&gt;,        // CHANGED: replaces app_base + token_url params
+    client_id: &amp;str,
+    port: u16,
+    paste_mode: bool,
+) -&gt; Result&lt;LoginOutcome, CliError&gt;</pre>
+
+<ul class="steps">
+<li class="step"><strong>Step 1: write failing tests for the pure resolver</strong> in
+<code>src/auth/authcode.rs</code>&rsquo;s <code>mod tests</code>:
+<pre>#[test]
+fn resolved_account_id_prefers_pinned_then_company_then_errors() {
+    assert_eq!(
+        resolved_account_id(Some("1234567"), Some("7654321_SB1")).unwrap(),
+        "1234567"
+    );
+    assert_eq!(
+        resolved_account_id(None, Some("7654321_SB1")).unwrap(),
+        "7654321_SB1"
+    );
+    let error = resolved_account_id(None, None).unwrap_err();
+    match error {
+        CliError::Auth(message) =&gt; assert!(message.contains("--account-id")),
+        other =&gt; panic!("expected Auth error, got {other:?}"),
+    }
+}</pre></li>
+
+<li class="step"><strong>Step 2: watch it fail.</strong> Run:
+<pre>cargo test --lib resolved_account_id</pre>
+Expected: compile error &mdash; <code>resolved_account_id</code> not found.</li>
+
+<li class="step"><strong>Step 3: implement the resolver</strong> in
+<code>src/auth/authcode.rs</code> (above <code>LoginOutcome</code>):
+<pre>/// The account a completed login belongs to: a pinned --account-id wins; otherwise the
+/// callback's `company` parameter (present when authorizing via system.netsuite.com) is
+/// required — without it the CLI cannot know which account issued the grant.
+pub fn resolved_account_id(
+    pinned: Option&lt;&amp;str&gt;,
+    company: Option&lt;&amp;str&gt;,
+) -&gt; Result&lt;String, CliError&gt; {
+    pinned.or(company).map(str::to_string).ok_or_else(|| {
+        CliError::Auth(
+            "NetSuite's callback did not report which account was chosen — re-run with \
+             --account-id &lt;id&gt;"
+                .into(),
+        )
+    })
+}</pre></li>
+
+<li class="step"><strong>Step 4: watch it pass.</strong>
+<pre>cargo test --lib resolved_account_id</pre>
+Expected: PASS.</li>
+
+<li class="step"><strong>Step 5: restructure <code>run_login_flow</code>.</strong> Replace the
+<code>app_base: &amp;str, token_url: &amp;str</code> parameters with
+<code>account_id: Option&lt;&amp;str&gt;</code>, derive the authorize host up front and the token
+URL after the callback, and return the resolved account id. Full new body:
+<pre>/// Interactive login: opens the browser at the authorize URL, then either reads the
+/// pasted redirect URL (`paste_mode`) or runs a one-shot HTTPS loopback listener to
+/// catch the redirect itself. NetSuite rejects plain `http://` redirect URIs, so the
+/// listener terminates TLS with a throwaway self-signed cert for `localhost`.
+///
+/// With `account_id: None` the authorize URL goes to system.netsuite.com, NetSuite shows its
+/// own account/role chooser during login, and the chosen account arrives in the callback's
+/// `company` parameter — which is why the token URL can only be built after the callback.
+pub async fn run_login_flow(
+    http: &amp;reqwest::Client,
+    account_id: Option&lt;&amp;str&gt;,
+    client_id: &amp;str,
+    port: u16,
+    paste_mode: bool,
+) -&gt; Result&lt;LoginOutcome, CliError&gt; {
+    let pkce = generate_pkce();
+    let state = generate_state();
+    let redirect_uri = format!("https://localhost:{port}/callback");
+    let scopes: Vec&lt;String&gt; = ["restlets", "rest_webservices", "suite_analytics"]
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect();
+    let app_base = match account_id {
+        Some(pinned) =&gt; crate::account::app_base(pinned),
+        None =&gt; "https://system.netsuite.com".to_string(),
+    };
+    let url = authorize_url(
+        &amp;app_base,
+        client_id,
+        &amp;redirect_uri,
+        &amp;scopes,
+        &amp;state,
+        &amp;pkce.challenge,
+    );
+
+    eprintln!("Open this URL to log in (or it will open automatically):\n{url}");
+    let _ = webbrowser::open(&amp;url);
+
+    let grant = if paste_mode {
+        loopback::read_pasted_redirect(|query| parse_callback_query(query, &amp;state))?
+    } else {
+        loopback::listen_for_redirect(port, |query| parse_callback_query(query, &amp;state)).await?
+    };
+
+    let resolved = resolved_account_id(account_id, grant.company.as_deref())?;
+    let token_url = format!(
+        "{}/services/rest/auth/oauth2/v1/token",
+        crate::account::rest_base(&amp;resolved)
+    );
+    let token = exchange_code(
+        http,
+        &amp;token_url,
+        client_id,
+        &amp;grant.code,
+        &amp;redirect_uri,
+        &amp;pkce.verifier,
+    )
+    .await?;
+    Ok(LoginOutcome {
+        token,
+        account_id: resolved,
+        entity: grant.entity,
+        role: grant.role,
+    })
+}</pre>
+Add the <code>account_id</code> field to <code>LoginOutcome</code> exactly as shown in the
+Interfaces block above.</li>
+
+<li class="step"><strong>Step 6: update the one caller.</strong> In
+<code>src/commands/account.rs</code>, <code>add_auth_code</code> becomes:
+<pre>pub async fn add_auth_code(
+    config_path: &amp;Path,
+    store: Arc&lt;dyn SecretStore&gt;,
+    alias: &amp;str,
+    account_id: &amp;str,
+    client_id: &amp;str,
+    port: u16,
+    paste_mode: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let http = reqwest::Client::new();
+    let login =
+        authcode::run_login_flow(&amp;http, Some(account_id), client_id, port, paste_mode).await?;
+    store_auth_code_account(
+        config_path,
+        store.as_ref(),
+        alias,
+        account_id,
+        client_id,
+        &amp;login,
+    )
+}</pre>
+(The <code>app_base</code>/<code>token_url</code> locals disappear; if <code>domain::app_base</code>
+is now unused in this file, remove the dangling import usage &mdash; <code>domain::rest_base</code>
+and <code>domain::restlet_base</code> are still used by <code>soap_auth</code>.)
+Also update the tests&rsquo; helper in the same file:
+<pre>fn login_outcome(token: TokenResponse) -&gt; LoginOutcome {
+    LoginOutcome {
+        token,
+        account_id: "1234567_SB1".into(),
+        entity: Some("9".into()),
+        role: Some("3".into()),
+    }
+}</pre></li>
+
+<li class="step"><strong>Step 7: full suite green.</strong>
+<pre>cargo test</pre>
+Expected: all suites pass (the compiler surfaces any caller or struct-literal misses;
+fix until green). Then <code>cargo fmt &amp;&amp; cargo clippy --all-targets</code> — clean.</li>
+
+<li class="step"><strong>Step 8: commit.</strong>
+<pre>git add src/auth/authcode.rs src/commands/account.rs
+git commit -m "feat: discovery-capable login flow — token URL derived post-callback"</pre></li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h2>Task 3: the <code>account login</code> command</h2>
+
+<p><strong>Files:</strong> modify <code>src/commands/account.rs</code> (new <code>login()</code>
+next to <code>add_auth_code</code>), <code>src/cli.rs</code> (<code>AccountAction</code> enum
+~line 465 and <code>dispatch_account</code> match ~line 1114, plus <code>mod tests</code>).</p>
+
+<p><strong>Interfaces &mdash; consumes:</strong> Task 2&rsquo;s <code>run_login_flow</code> and
+<code>LoginOutcome.account_id</code>; PR&nbsp;#10&rsquo;s
+<code>resolve_client_id_for_alias(store, alias, flag)</code> and
+<code>offer_soap_setup(alias, config_path, store, port, paste_mode, add_result)</code>, both
+already in <code>src/cli.rs</code>. <strong>Produces:</strong>
+<code>account::login()</code> and <code>account::LOGIN_CALLBACK_PORT: u16</code>.</p>
+
+<ul class="steps">
+<li class="step"><strong>Step 1: write the failing CLI parse test</strong> in
+<code>src/cli.rs</code>&rsquo;s <code>mod tests</code> (next to
+<code>account_cert_subcommands_parse</code>):
+<pre>#[test]
+fn account_login_parses_with_and_without_flags() {
+    Cli::try_parse_from(["netsuite-cli", "account", "login", "my"]).expect("bare login parses");
+    let cli = Cli::try_parse_from([
+        "netsuite-cli",
+        "account",
+        "login",
+        "my",
+        "--account-id",
+        "1234567_SB1",
+        "--client-id",
+        "CID",
+        "--paste",
+    ])
+    .expect("login with overrides parses");
+    let Command::Account {
+        action:
+            AccountAction::Login {
+                alias,
+                account_id,
+                client_id,
+                paste,
+            },
+    } = cli.command
+    else {
+        panic!("wrong variant")
+    };
+    assert_eq!(alias, "my");
+    assert_eq!(account_id.as_deref(), Some("1234567_SB1"));
+    assert_eq!(client_id.as_deref(), Some("CID"));
+    assert!(paste);
+}</pre></li>
+
+<li class="step"><strong>Step 2: watch it fail.</strong>
+<pre>cargo test --lib account_login_parses</pre>
+Expected: compile error &mdash; no variant <code>Login</code>.</li>
+
+<li class="step"><strong>Step 3: add the variant</strong> to <code>AccountAction</code> in
+<code>src/cli.rs</code> (after <code>Add</code>):
+<pre>    /// One-command browser login; discovers the account from NetSuite's own chooser
+    #[command(
+        after_help = "Examples:\n  netsuite-cli account login myaccount\n  netsuite-cli \
+        account login myaccount --account-id 1234567_SB1\n  netsuite-cli account login \
+        myaccount --paste\n\nWithout --account-id, NetSuite's login page lets you pick the \
+        account and role, and the CLI records whichever account you chose. The callback port \
+        is fixed at 8899 — the integration record's registered redirect URI must match \
+        exactly. Uses the built-in client ID unless --client-id (or an id already stored for \
+        the alias) overrides it."
+    )]
+    Login {
+        alias: String,
+        /// Pin the login to one account instead of discovering it from the callback
+        #[arg(long = "account-id")]
+        account_id: Option&lt;String&gt;,
+        /// Integration record Client ID; omit to use the alias's stored id or the built-in one
+        #[arg(long = "client-id")]
+        client_id: Option&lt;String&gt;,
+        /// Paste the redirect URL manually instead of running the loopback listener
+        #[arg(long)]
+        paste: bool,
+    },</pre></li>
+
+<li class="step"><strong>Step 4: implement <code>account::login</code></strong> in
+<code>src/commands/account.rs</code> (directly below <code>add_auth_code</code>):
+<pre>/// `account login` has no --port flag: the registered redirect URI on the integration record
+/// is https://localhost:8899/callback and OAuth requires an exact match.
+pub const LOGIN_CALLBACK_PORT: u16 = 8899;
+
+/// One-shot browser login. With `account_id: None` the account is discovered from the OAuth
+/// callback (NetSuite's own account/role chooser decides). Stores the alias exactly like
+/// `add_auth_code`, so the result works with every command including the cert bootstrap.
+pub async fn login(
+    config_path: &amp;Path,
+    store: Arc&lt;dyn SecretStore&gt;,
+    alias: &amp;str,
+    account_id: Option&lt;&amp;str&gt;,
+    client_id: &amp;str,
+    paste_mode: bool,
+) -&gt; Result&lt;Value, CliError&gt; {
+    let http = reqwest::Client::new();
+    let login = authcode::run_login_flow(
+        &amp;http,
+        account_id,
+        client_id,
+        LOGIN_CALLBACK_PORT,
+        paste_mode,
+    )
+    .await?;
+    let landed_account_id = login.account_id.clone();
+    store_auth_code_account(
+        config_path,
+        store.as_ref(),
+        alias,
+        &amp;landed_account_id,
+        client_id,
+        &amp;login,
+    )
+}</pre></li>
+
+<li class="step"><strong>Step 5: add the dispatch arm</strong> in
+<code>dispatch_account</code>&rsquo;s match (after the <code>Add</code> arm, before
+<code>List</code>), mirroring the <code>AuthCode</code> arm&rsquo;s SOAP chaining:
+<pre>        AccountAction::Login {
+            alias,
+            account_id,
+            client_id,
+            paste,
+        } =&gt; {
+            let client_id =
+                resolve_client_id_for_alias(store.as_ref(), alias, client_id.as_deref())?;
+            let add_result = account::login(
+                &amp;config_path,
+                store.clone(),
+                alias,
+                account_id.as_deref(),
+                &amp;client_id,
+                *paste,
+            )
+            .await?;
+            Ok(offer_soap_setup(
+                alias,
+                &amp;config_path,
+                store.clone(),
+                account::LOGIN_CALLBACK_PORT,
+                *paste,
+                add_result,
+            )
+            .await)
+        }</pre></li>
+
+<li class="step"><strong>Step 6: watch everything pass.</strong>
+<pre>cargo test</pre>
+Expected: the new parse test and all existing suites PASS. Then
+<code>cargo fmt &amp;&amp; cargo clippy --all-targets</code> — clean. Sanity-check the help
+output renders:
+<pre>cargo run -- account login --help</pre>
+Expected: usage shows <code>&lt;ALIAS&gt;</code>, <code>--account-id</code>,
+<code>--client-id</code>, <code>--paste</code> and no <code>--port</code>.</li>
+
+<li class="step"><strong>Step 7: commit.</strong>
+<pre>git add src/cli.rs src/commands/account.rs
+git commit -m "feat: account login — one-shot browser auth with account discovery"</pre></li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h2>Task 4: documentation &amp; skill</h2>
+
+<p><strong>Files:</strong> modify <code>README.md</code> (quick-start block ~line 20 and the
+built-in-client-id section ~line 69), <code>skills/netsuite-cli/SKILL.md</code> (bootstrap
+section ~line 51).</p>
+
+<ul class="steps">
+<li class="step"><strong>Step 1: README quick start.</strong> In the quick-start code block,
+replace the line
+<pre>netsuite-cli account add bootstrap --account-id &lt;ID&gt; --flow auth-code   # one browser login</pre>
+with
+<pre>netsuite-cli account login bootstrap        # one browser login — account discovered, no ids needed</pre>
+In the &ldquo;built-in client ID&rdquo; section, replace numbered step 1
+(&ldquo;<code>account add &lt;alias&gt; --account-id &lt;ID&gt; --flow auth-code</code> — browser
+login using the built-in client ID; this alone is a fully valid way to authenticate the
+CLI.&rdquo;) with:
+<pre>1. `account login &lt;alias&gt;` — browser login using the built-in client ID. You don't even
+   need the account id: NetSuite's login page lets you pick the account and role, and the CLI
+   records whichever one you chose (`--account-id` pins it instead; `account add
+   --flow auth-code` still works as before). This alone is a fully valid way to authenticate
+   the CLI.</pre></li>
+
+<li class="step"><strong>Step 2: SKILL.md bootstrap.</strong> In the &ldquo;Have only a browser
+login&rdquo; path, replace the first command line of the code block:
+<pre>netsuite-cli account add bootstrap --account-id &lt;ID&gt; --flow auth-code  # one browser login (a human must complete it); records the user's entity/role ids</pre>
+with
+<pre>netsuite-cli account login bootstrap   # one browser login (a human must complete it); the account is discovered from the callback — no --account-id needed; records the user's entity/role ids</pre></li>
+
+<li class="step"><strong>Step 3: verify docs build nothing but stay consistent.</strong> Run:
+<pre>grep -n "account login" README.md skills/netsuite-cli/SKILL.md</pre>
+Expected: both files mention the new command; no remaining quick-start path requires
+<code>--account-id</code> for the browser bootstrap. Run <code>cargo test --test
+skill_commands</code> (the embedded-skill tests) — PASS.</li>
+
+<li class="step"><strong>Step 4: commit.</strong>
+<pre>git add README.md skills/netsuite-cli/SKILL.md
+git commit -m "docs: lead bootstrap with account login (account discovery)"</pre></li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h2>Task 5: verification &amp; PR</h2>
+
+<ul class="steps">
+<li class="step"><strong>Step 1: full local gate.</strong>
+<pre>cargo fmt --check &amp;&amp; cargo clippy --all-targets &amp;&amp; cargo test</pre>
+Expected: no fmt diffs, no clippy warnings, all tests pass.</li>
+
+<li class="step"><strong>Step 2: live validation (controller/Jon &mdash; needs a browser).</strong>
+From a debug build: <code>cargo run -- account login smoke-login</code> with no flags &mdash;
+NetSuite shows the account chooser; after login, verify the stored account id matches the chosen
+account (<code>netsuite-cli account list</code>) and <code>cargo run -- suiteql "SELECT id FROM
+customer" --limit 1 --account smoke-login</code> returns a row. If the machine's build lacks a
+built-in client id, pass <code>--client-id</code> with an existing public-client integration's
+id. Clean up with <code>account remove smoke-login</code>. Auto-install verification against a
+fresh account happens when convenient — it needs an account that has never seen the built-in
+integration.</li>
+
+<li class="step"><strong>Step 3: PR.</strong> Push the branch, open a non-draft PR titled
+&ldquo;feat: account login with account discovery&rdquo;, then run the
+<code>pr-review-loop</code> skill to green (CI + review threads).</li>
+</ul>
+</div>
+
+<h2>Out of scope (per spec)</h2>
+<ul>
+  <li>No embedded TBA credentials, no GitHub-secret injection, no obfuscation (dropped
+      2026-07-20).</li>
+  <li>No changes to <code>account add</code>, <code>account cert</code>, M2M, or saved-search
+      behavior.</li>
+  <li>No <code>--port</code> on <code>login</code>.</li>
+</ul>
+
+<h2>How should we execute?</h2>
+<p class="buttons">
+  <a href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-Driven" target="_blank">🤖 Execute: subagent-driven (recommended)</a> &nbsp;
+  <a href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline" target="_blank">📝 Execute: inline in this session</a>
+</p>
+
+</body>
+</html>
