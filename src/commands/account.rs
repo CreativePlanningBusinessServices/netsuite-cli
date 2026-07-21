@@ -107,6 +107,8 @@ pub async fn login(
     client_id: &str,
     paste_mode: bool,
 ) -> Result<Value, CliError> {
+    // Read the alias's previous account id before store_auth_code_account overwrites the config
+    // entry — this is the only chance to see it.
     let previous_account_id = Config::load(config_path)?
         .accounts
         .get(alias)
@@ -120,6 +122,19 @@ pub async fn login(
         paste_mode,
     )
     .await?;
+    let result = store_auth_code_account(
+        config_path,
+        store.as_ref(),
+        alias,
+        &login.account_id,
+        client_id,
+        &login,
+    )?;
+    // Persist first, purge/notify second: handle_account_switch deletes TBA secrets and reports
+    // "the alias now points at {landed}", both of which must not happen until that's actually
+    // true. Doing this before store_auth_code_account risked deleting TBA credentials — and
+    // printing a false switch notice — for an alias that, on a failed write, still pointed at the
+    // old account.
     if let Some(notice) = handle_account_switch(
         store.as_ref(),
         alias,
@@ -128,14 +143,7 @@ pub async fn login(
     )? {
         eprintln!("{notice}");
     }
-    store_auth_code_account(
-        config_path,
-        store.as_ref(),
-        alias,
-        &login.account_id,
-        client_id,
-        &login,
-    )
+    Ok(result)
 }
 
 /// Handles a re-login that discovers a different account than the one `alias` was previously
