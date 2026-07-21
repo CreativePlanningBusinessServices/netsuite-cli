@@ -107,6 +107,10 @@ pub async fn login(
     client_id: &str,
     paste_mode: bool,
 ) -> Result<Value, CliError> {
+    let previous_account_id = Config::load(config_path)?
+        .accounts
+        .get(alias)
+        .map(|entry| entry.account_id.clone());
     let http = reqwest::Client::new();
     let login = authcode::run_login_flow(
         &http,
@@ -116,15 +120,34 @@ pub async fn login(
         paste_mode,
     )
     .await?;
-    let landed_account_id = login.account_id.clone();
+    if let Some(notice) =
+        account_switch_notice(alias, previous_account_id.as_deref(), &login.account_id)
+    {
+        eprintln!("{notice}");
+    }
     store_auth_code_account(
         config_path,
         store.as_ref(),
         alias,
-        &landed_account_id,
+        &login.account_id,
         client_id,
         &login,
     )
+}
+
+/// Returns a note when re-login switches an existing alias to a different account than the one
+/// it was previously registered to — `None` for a brand-new alias or when the account is
+/// unchanged, since `login()` stores the discovered account either way and should only speak up
+/// when that's a change worth flagging.
+fn account_switch_notice(alias: &str, previous: Option<&str>, landed: &str) -> Option<String> {
+    let previous_account_id = previous?;
+    if previous_account_id == landed {
+        return None;
+    }
+    Some(format!(
+        "note: '{alias}' was registered to account {previous_account_id}; the login you \
+         completed landed in {landed} — the alias now points at {landed}"
+    ))
 }
 
 /// Mints a never-expiring SOAP (TBA) token via browser consent and stores it alongside the
@@ -569,6 +592,29 @@ mod tests {
 
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.default_account.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn account_switch_notice_is_silent_when_account_is_unchanged_or_alias_is_new() {
+        assert_eq!(
+            account_switch_notice("dev", Some("1234567_SB1"), "1234567_SB1"),
+            None,
+            "same account: no notice"
+        );
+        assert_eq!(
+            account_switch_notice("dev", None, "1234567_SB1"),
+            None,
+            "brand-new alias: no notice"
+        );
+    }
+
+    #[test]
+    fn account_switch_notice_names_both_accounts_when_alias_switches_account() {
+        let notice = account_switch_notice("dev", Some("1234567_SB1"), "7654321_RP")
+            .expect("account changed, notice expected");
+        assert!(notice.contains("dev"));
+        assert!(notice.contains("1234567_SB1"));
+        assert!(notice.contains("7654321_RP"));
     }
 
     #[test]

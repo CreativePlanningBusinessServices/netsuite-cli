@@ -21,8 +21,8 @@ pub struct MintedToken {
 
 /// Interactive TBA (Token-Based Authentication) authorization: obtains a request token,
 /// sends the user to NetSuite to authorize it, then exchanges the resulting verifier for a
-/// minted access token. Mirrors authcode::run_login_flow's shape (see that function for the
-/// loopback-vs-paste rationale) but drives NetSuite's three-step OAuth 1.0a REST endpoints
+/// minted access token. Mirrors authcode::run_login_flow's flow structure (see that function for
+/// the loopback-vs-paste mechanics) but drives NetSuite's three-step OAuth 1.0a REST endpoints
 /// instead of OAuth 2.0. Not directly unit-testable since it opens a browser and blocks on a
 /// redirect — the step functions and pure helpers below carry the test coverage instead.
 pub async fn run_tba_flow(

@@ -63,8 +63,9 @@ pub fn authorize_url(
 }
 
 /// What NetSuite's authorization callback carries besides the code: the internal IDs of the
-/// user (`entity`) and role that just logged in. They're recorded so the certificate rotation
-/// API (`account cert upload`) can default its required entity/role mapping fields later.
+/// user (`entity`) and role that just logged in, plus the account (`company`) the login landed
+/// in. They're recorded so the certificate rotation API (`account cert upload`) can default its
+/// required entity/role mapping fields later.
 #[derive(Debug, PartialEq)]
 pub struct AuthCodeGrant {
     pub code: String,
@@ -294,20 +295,48 @@ impl TokenProvider for AuthCodeProvider {
     }
 }
 
-/// The account a completed login belongs to: a pinned --account-id wins; otherwise the
-/// callback's `company` parameter (present when authorizing via system.netsuite.com) is
-/// required — without it the CLI cannot know which account issued the grant.
+/// The account a completed login belongs to: a pinned --account-id wins (trusted, user-supplied,
+/// used as-is); otherwise the callback's `company` parameter (present when authorizing via
+/// system.netsuite.com) is required and validated — without it, or with a value that doesn't look
+/// like a NetSuite account id, the CLI cannot know which account issued the grant.
 pub fn resolved_account_id(
     pinned: Option<&str>,
     company: Option<&str>,
 ) -> Result<String, CliError> {
-    pinned.or(company).map(str::to_string).ok_or_else(|| {
-        CliError::Auth(
-            "NetSuite's callback did not report which account was chosen — re-run with \
-             --account-id <id>"
-                .into(),
-        )
-    })
+    pinned
+        .map(str::to_string)
+        .or_else(|| {
+            company
+                .filter(|candidate| looks_like_netsuite_account_id(candidate))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| {
+            CliError::Auth(
+                "NetSuite's callback did not report which account was chosen — re-run with \
+                 --account-id <id>"
+                    .into(),
+            )
+        })
+}
+
+/// Whether `candidate` has NetSuite's account-id shape: a nonempty run of ASCII digits,
+/// optionally followed by one underscore and an alphanumeric suffix (e.g. `1234567` or
+/// `1234567_SB1`). The callback's `company` value becomes a URL host
+/// (`crate::account::rest_base`), so this is a security boundary, not just cosmetic validation —
+/// it rejects things like `evil.example/x` that would otherwise redirect the token exchange (auth
+/// code + PKCE verifier) to an attacker-controlled host.
+fn looks_like_netsuite_account_id(candidate: &str) -> bool {
+    let (digits, rest) = match candidate.split_once('_') {
+        Some((digits, suffix)) => (digits, Some(suffix)),
+        None => (candidate, None),
+    };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    match rest {
+        Some(suffix) => !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_alphanumeric()),
+        None => true,
+    }
 }
 
 /// A completed interactive login: the token NetSuite issued, the account it landed in
@@ -469,8 +498,28 @@ mod tests {
             resolved_account_id(None, Some("7654321_SB1")).unwrap(),
             "7654321_SB1"
         );
+        assert_eq!(
+            resolved_account_id(None, Some("7654321_RP")).unwrap(),
+            "7654321_RP"
+        );
         let error = resolved_account_id(None, None).unwrap_err();
         match error {
+            CliError::Auth(message) => assert!(message.contains("--account-id")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_account_id_rejects_a_company_that_is_not_a_netsuite_account_id() {
+        let empty_company_error = resolved_account_id(None, Some("")).unwrap_err();
+        match empty_company_error {
+            CliError::Auth(message) => assert!(message.contains("--account-id")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
+
+        let malicious_company_error =
+            resolved_account_id(None, Some("evil.example/x")).unwrap_err();
+        match malicious_company_error {
             CliError::Auth(message) => assert!(message.contains("--account-id")),
             other => panic!("expected Auth error, got {other:?}"),
         }
