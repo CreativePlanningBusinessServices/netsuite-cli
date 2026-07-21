@@ -120,9 +120,12 @@ pub async fn login(
         paste_mode,
     )
     .await?;
-    if let Some(notice) =
-        account_switch_notice(alias, previous_account_id.as_deref(), &login.account_id)
-    {
+    if let Some(notice) = handle_account_switch(
+        store.as_ref(),
+        alias,
+        previous_account_id.as_deref(),
+        &login.account_id,
+    )? {
         eprintln!("{notice}");
     }
     store_auth_code_account(
@@ -135,19 +138,33 @@ pub async fn login(
     )
 }
 
-/// Returns a note when re-login switches an existing alias to a different account than the one
-/// it was previously registered to — `None` for a brand-new alias or when the account is
-/// unchanged, since `login()` stores the discovered account either way and should only speak up
-/// when that's a change worth flagging.
-fn account_switch_notice(alias: &str, previous: Option<&str>, landed: &str) -> Option<String> {
-    let previous_account_id = previous?;
+/// Handles a re-login that discovers a different account than the one `alias` was previously
+/// registered to: clears any stored SOAP (TBA) credentials for the alias — they were minted
+/// against the old account, and left alone they'd be silently reused (`offer_soap_setup` sees an
+/// existing `token_id` and skips setup), leaving SOAP/`saved-search run` on the old account while
+/// REST moves to the new one — and returns a notice naming both accounts. `Ok(None)` for a
+/// brand-new alias or when the account is unchanged; TBA secrets are left untouched in both those
+/// cases, since `login()` stores the discovered account either way and should only speak up (and
+/// only clear TBA) when that's a change worth flagging.
+fn handle_account_switch(
+    store: &dyn SecretStore,
+    alias: &str,
+    previous: Option<&str>,
+    landed: &str,
+) -> Result<Option<String>, CliError> {
+    let Some(previous_account_id) = previous else {
+        return Ok(None);
+    };
     if previous_account_id == landed {
-        return None;
+        return Ok(None);
     }
-    Some(format!(
+    store.delete_tba(alias)?;
+    Ok(Some(format!(
         "note: '{alias}' was registered to account {previous_account_id}; the login you \
-         completed landed in {landed} — the alias now points at {landed}"
-    ))
+         completed landed in {landed} — the alias now points at {landed} and its stored SOAP \
+         (TBA) credentials were cleared; re-run `netsuite-cli account soap-auth {alias}` if you \
+         use saved searches"
+    )))
 }
 
 /// Mints a never-expiring SOAP (TBA) token via browser consent and stores it alongside the
@@ -594,27 +611,57 @@ mod tests {
         assert_eq!(config.default_account.as_deref(), Some("prod"));
     }
 
+    fn seeded_tba() -> crate::secrets::TbaSecrets {
+        crate::secrets::TbaSecrets {
+            consumer_key: "consumerkey123".into(),
+            consumer_secret: "consumersecret789".into(),
+            token_id: Some("tokenid456".into()),
+            token_secret: Some("tokensecret012".into()),
+        }
+    }
+
     #[test]
-    fn account_switch_notice_is_silent_when_account_is_unchanged_or_alias_is_new() {
-        assert_eq!(
-            account_switch_notice("dev", Some("1234567_SB1"), "1234567_SB1"),
-            None,
-            "same account: no notice"
-        );
-        assert_eq!(
-            account_switch_notice("dev", None, "1234567_SB1"),
-            None,
-            "brand-new alias: no notice"
+    fn handle_account_switch_clears_tba_and_notes_the_switch_when_account_changes() {
+        let store = MemoryStore::default();
+        store.set_tba("dev", &seeded_tba()).unwrap();
+
+        let notice = handle_account_switch(&store, "dev", Some("1234567_SB1"), "7654321_RP")
+            .unwrap()
+            .expect("account changed, notice expected");
+
+        assert!(notice.contains("dev"));
+        assert!(notice.contains("1234567_SB1"));
+        assert!(notice.contains("7654321_RP"));
+        assert!(notice.contains("soap-auth"));
+        assert!(
+            store.get_tba("dev").unwrap().is_none(),
+            "stale TBA credentials from the old account must be cleared"
         );
     }
 
     #[test]
-    fn account_switch_notice_names_both_accounts_when_alias_switches_account() {
-        let notice = account_switch_notice("dev", Some("1234567_SB1"), "7654321_RP")
-            .expect("account changed, notice expected");
-        assert!(notice.contains("dev"));
-        assert!(notice.contains("1234567_SB1"));
-        assert!(notice.contains("7654321_RP"));
+    fn handle_account_switch_leaves_tba_alone_when_account_is_unchanged() {
+        let store = MemoryStore::default();
+        store.set_tba("dev", &seeded_tba()).unwrap();
+
+        let notice =
+            handle_account_switch(&store, "dev", Some("1234567_SB1"), "1234567_SB1").unwrap();
+
+        assert!(notice.is_none(), "same account: no notice");
+        assert!(
+            store.get_tba("dev").unwrap().is_some(),
+            "TBA must survive a re-login that lands in the same account"
+        );
+    }
+
+    #[test]
+    fn handle_account_switch_leaves_tba_alone_for_a_brand_new_alias() {
+        let store = MemoryStore::default();
+
+        let notice = handle_account_switch(&store, "dev", None, "1234567_SB1").unwrap();
+
+        assert!(notice.is_none(), "brand-new alias: no notice");
+        assert!(store.get_tba("dev").unwrap().is_none());
     }
 
     #[test]
