@@ -54,7 +54,7 @@ auth-code with the built-in client ID, then use that access token to drive NetSu
 certificate-rotation API and self-provision M2M — no NetSuite UI steps:
 
 ```bash
-netsuite-cli account add bootstrap --account-id <ID> --flow auth-code  # one browser login (a human must complete it); records the user's entity/role ids
+netsuite-cli account login bootstrap   # one browser login (a human must complete it); the account is discovered from the callback — no --account-id needed; records the user's entity/role ids
 netsuite-cli account cert generate                                     # writes netsuite-m2m-key.pem (secret) + netsuite-m2m-cert.pem
 netsuite-cli account cert upload --cert netsuite-m2m-cert.pem --account bootstrap
 #   → {"certificateId": "..."}  (uploads via the certificate rotation API, mapping the

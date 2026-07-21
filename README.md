@@ -18,7 +18,7 @@ gh release download -R CreativePlanningBusinessServices/netsuite-cli \
 install -m 0755 netsuite-cli "$HOME/.local/bin/"   # any writable PATH dir
 
 # Bootstrap — with the built-in client ID (release builds), no NetSuite UI setup needed:
-netsuite-cli account add bootstrap --account-id <ID> --flow auth-code   # one browser login
+netsuite-cli account login bootstrap        # one browser login — account discovered, no ids needed
 netsuite-cli account cert generate
 netsuite-cli account cert upload --cert netsuite-m2m-cert.pem --account bootstrap
 netsuite-cli account add <alias> --account-id <ID> --flow m2m \
@@ -66,8 +66,11 @@ identifier, not a secret). With a built-in client ID, `--client-id` becomes opti
 [M2M bootstrap](#bootstrap-m2m-from-the-cli-certificate-rotation-api) runs without touching
 the NetSuite UI:
 
-1. `account add <alias> --account-id <ID> --flow auth-code` — browser login using the
-   built-in client ID; this alone is a fully valid way to authenticate the CLI.
+1. `account login <alias>` — browser login using the built-in client ID. You don't even
+   need the account id: NetSuite's login page lets you pick the account and role, and the CLI
+   records whichever one you chose (`--account-id` pins it instead; `account add
+   --flow auth-code` still works as before). This alone is a fully valid way to authenticate
+   the CLI.
 2. Use that login's access token to upload an M2M certificate over NetSuite's certificate
    rotation API (`account cert generate` + `account cert upload`).
 3. `account add <alias> --account-id <ID> --flow m2m --cert-id <id> --key <key.pem>` — done;
