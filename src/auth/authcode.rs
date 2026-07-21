@@ -319,18 +319,20 @@ pub fn resolved_account_id(
         })
 }
 
-/// Whether `candidate` has NetSuite's account-id shape: a nonempty run of ASCII digits,
-/// optionally followed by one underscore and an alphanumeric suffix (e.g. `1234567` or
+/// Whether `candidate` has NetSuite's account-id shape: a nonempty run of ASCII alphanumerics
+/// (covers numeric ids like `1234567` and letter-prefixed test-drive/partner ids like
+/// `TSTDRV1234567`), optionally followed by one underscore and an alphanumeric suffix (e.g.
 /// `1234567_SB1`). The callback's `company` value becomes a URL host
 /// (`crate::account::rest_base`), so this is a security boundary, not just cosmetic validation —
 /// it rejects things like `evil.example/x` that would otherwise redirect the token exchange (auth
-/// code + PKCE verifier) to an attacker-controlled host.
+/// code + PKCE verifier) to an attacker-controlled host: `.` and `/` can't appear in an
+/// alphanumeric run, so there's no way to escape the `*.suitetalk.api.netsuite.com` suffix.
 fn looks_like_netsuite_account_id(candidate: &str) -> bool {
-    let (digits, rest) = match candidate.split_once('_') {
-        Some((digits, suffix)) => (digits, Some(suffix)),
+    let (base, rest) = match candidate.split_once('_') {
+        Some((base, suffix)) => (base, Some(suffix)),
         None => (candidate, None),
     };
-    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+    if base.is_empty() || !base.chars().all(|ch| ch.is_ascii_alphanumeric()) {
         return false;
     }
     match rest {
@@ -501,6 +503,10 @@ mod tests {
         assert_eq!(
             resolved_account_id(None, Some("7654321_RP")).unwrap(),
             "7654321_RP"
+        );
+        assert_eq!(
+            resolved_account_id(None, Some("TSTDRV1234567")).unwrap(),
+            "TSTDRV1234567"
         );
         let error = resolved_account_id(None, None).unwrap_err();
         match error {
