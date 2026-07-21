@@ -80,13 +80,8 @@ pub async fn add_auth_code(
     paste_mode: bool,
 ) -> Result<Value, CliError> {
     let http = reqwest::Client::new();
-    let app_base = domain::app_base(account_id);
-    let token_url = format!(
-        "{}/services/rest/auth/oauth2/v1/token",
-        domain::rest_base(account_id)
-    );
     let login =
-        authcode::run_login_flow(&http, &app_base, &token_url, client_id, port, paste_mode).await?;
+        authcode::run_login_flow(&http, Some(account_id), client_id, port, paste_mode).await?;
     store_auth_code_account(
         config_path,
         store.as_ref(),
@@ -364,6 +359,7 @@ mod tests {
     fn login_outcome(token: TokenResponse) -> LoginOutcome {
         LoginOutcome {
             token,
+            account_id: "1234567_SB1".into(),
             entity: Some("9".into()),
             role: Some("3".into()),
         }

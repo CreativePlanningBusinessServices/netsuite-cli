@@ -294,10 +294,28 @@ impl TokenProvider for AuthCodeProvider {
     }
 }
 
-/// A completed interactive login: the token NetSuite issued plus the entity/role IDs its
-/// callback reported for the user who logged in.
+/// The account a completed login belongs to: a pinned --account-id wins; otherwise the
+/// callback's `company` parameter (present when authorizing via system.netsuite.com) is
+/// required — without it the CLI cannot know which account issued the grant.
+pub fn resolved_account_id(
+    pinned: Option<&str>,
+    company: Option<&str>,
+) -> Result<String, CliError> {
+    pinned.or(company).map(str::to_string).ok_or_else(|| {
+        CliError::Auth(
+            "NetSuite's callback did not report which account was chosen — re-run with \
+             --account-id <id>"
+                .into(),
+        )
+    })
+}
+
+/// A completed interactive login: the token NetSuite issued, the account it landed in
+/// (pinned or discovered), plus the entity/role IDs its callback reported for the user who
+/// logged in.
 pub struct LoginOutcome {
     pub token: TokenResponse,
+    pub account_id: String,
     pub entity: Option<String>,
     pub role: Option<String>,
 }
@@ -306,10 +324,13 @@ pub struct LoginOutcome {
 /// pasted redirect URL (`paste_mode`) or runs a one-shot HTTPS loopback listener to
 /// catch the redirect itself. NetSuite rejects plain `http://` redirect URIs, so the
 /// listener terminates TLS with a throwaway self-signed cert for `localhost`.
+///
+/// With `account_id: None` the authorize URL goes to system.netsuite.com, NetSuite shows its
+/// own account/role chooser during login, and the chosen account arrives in the callback's
+/// `company` parameter — which is why the token URL can only be built after the callback.
 pub async fn run_login_flow(
     http: &reqwest::Client,
-    app_base: &str,
-    token_url: &str,
+    account_id: Option<&str>,
     client_id: &str,
     port: u16,
     paste_mode: bool,
@@ -321,8 +342,12 @@ pub async fn run_login_flow(
         .iter()
         .map(|scope| scope.to_string())
         .collect();
+    let app_base = match account_id {
+        Some(pinned) => crate::account::app_base(pinned),
+        None => "https://system.netsuite.com".to_string(),
+    };
     let url = authorize_url(
-        app_base,
+        &app_base,
         client_id,
         &redirect_uri,
         &scopes,
@@ -339,9 +364,14 @@ pub async fn run_login_flow(
         loopback::listen_for_redirect(port, |query| parse_callback_query(query, &state)).await?
     };
 
+    let resolved = resolved_account_id(account_id, grant.company.as_deref())?;
+    let token_url = format!(
+        "{}/services/rest/auth/oauth2/v1/token",
+        crate::account::rest_base(&resolved)
+    );
     let token = exchange_code(
         http,
-        token_url,
+        &token_url,
         client_id,
         &grant.code,
         &redirect_uri,
@@ -350,6 +380,7 @@ pub async fn run_login_flow(
     .await?;
     Ok(LoginOutcome {
         token,
+        account_id: resolved,
         entity: grant.entity,
         role: grant.role,
     })
@@ -426,5 +457,22 @@ mod tests {
         assert!(parsed.entity.is_none());
         assert!(parsed.role.is_none());
         assert!(parsed.company.is_none());
+    }
+
+    #[test]
+    fn resolved_account_id_prefers_pinned_then_company_then_errors() {
+        assert_eq!(
+            resolved_account_id(Some("1234567"), Some("7654321_SB1")).unwrap(),
+            "1234567"
+        );
+        assert_eq!(
+            resolved_account_id(None, Some("7654321_SB1")).unwrap(),
+            "7654321_SB1"
+        );
+        let error = resolved_account_id(None, None).unwrap_err();
+        match error {
+            CliError::Auth(message) => assert!(message.contains("--account-id")),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
     }
 }
