@@ -182,6 +182,10 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
 - `raw GET /services/rest/record/v1/metadata-catalog --query select=<type>`
   returns a single object; omit `select` to get the `{"items": [...]}` list.
 - HTTP methods parse case-insensitively (`GET` and `get` both work).
+- **Browser logins redirect to `http://localhost:8899/callback`** (plain HTTP loopback). If
+  NetSuite's authorize page rejects the redirect URI instead of showing the login/consent screen,
+  the integration record is missing that exact URI — records set up for an older CLI version have
+  only the `https://` spelling and need the `http://` one added.
 - **SuiteQL on custom records uses `id`, not `internalid`** — `SELECT
   internalid FROM customrecord_...` errors with `Unknown identifier
   'internalid'` (standard records accept both). Use `id` and it silently

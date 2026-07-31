@@ -84,7 +84,8 @@ Builds without an embedded ID (e.g. local `cargo build`) behave exactly as befor
 with exactly:
 
 - **OAuth 2.0 > Authorization Code Grant**, with **Public Client** checked and Redirect URI
-  `https://localhost:8899/callback`;
+  `http://localhost:8899/callback` (keep the older `https://localhost:8899/callback` registered
+  alongside it — CLI versions before this one send the `https` URI, and NetSuite accepts a list);
 - **OAuth 2.0 > Client Credentials (Machine to Machine) Grant**;
 - scopes **REST Web Services**, **RESTlets**, and **SuiteAnalytics Connect** (the CLI's
   auth-code login always requests all three: `rest_webservices`, `restlets`, `suite_analytics`
@@ -124,7 +125,7 @@ in that case). **Setup > Integration > Manage Integrations > New**, then:
 1. Give it a name.
 2. Under **Authentication**, check **Token-Based Authentication** and
    **TBA: Authorization Flow**, and set the TBA **Callback URL** to
-   `https://localhost:8899/callback` (used by saved-search auth; see
+   `http://localhost:8899/callback` (used by saved-search auth; see
    [Saved searches (SOAP)](#saved-searches-soap)). The port must match any
    custom `--port` you pass to `account add`/`account soap-auth` (8899 is the
    default).
@@ -249,7 +250,7 @@ Notes and requirements:
    Services/RESTlets scopes already enabled), check **Public Client** (no client secret — the CLI
    authenticates with PKCE instead), add the **SuiteAnalytics Connect** scope (not part of the
    checklist's baseline, but needed for this flow), and set the **Redirect URI** to
-   `https://localhost:8899/callback` (or `https://localhost:<port>/callback` if you'll pass a
+   `http://localhost:8899/callback` (or `http://localhost:<port>/callback` if you'll pass a
    custom `--port` to `account add`/`account test --reauth`). Save and note the **Client ID**.
 2. Register the account — this opens your default browser for a one-time login:
 
@@ -257,11 +258,17 @@ Notes and requirements:
    netsuite-cli account add dev --account-id 1234567_SB1 --flow auth-code --client-id <Client ID>
    ```
 
-   The CLI runs a short-lived local HTTPS listener on `localhost:8899` to catch the OAuth
-   redirect, using a throwaway self-signed certificate (it has to be HTTPS — NetSuite rejects
-   plain `http://` redirect URIs). **Your browser will show a certificate-warning page for
-   `localhost`** — this is expected; proceed past it (e.g. "Advanced > Proceed to localhost") to
-   complete the login. The listener exits as soon as it catches the redirect.
+   The CLI runs a short-lived local HTTP listener on `localhost:8899` to catch the OAuth
+   redirect — the loopback interface, plain HTTP, as
+   [RFC 8252 §7.3](https://datatracker.ietf.org/doc/html/rfc8252#section-7.3) prescribes for
+   native apps. The redirect never leaves the machine, and the authorization code it carries is
+   bound to the CLI process by PKCE and to the attempt by `state`. The listener exits as soon as
+   it catches the redirect.
+
+   **Upgrading from a CLI version that used `https://localhost:8899/callback`?** Add the `http://`
+   URI to the integration record's Redirect URI list (NetSuite accepts several); leaving the
+   `https://` one registered keeps older binaries working. If the record has only the `https://`
+   URI, NetSuite's authorize page rejects the login before you ever reach the consent screen.
 3. If the machine running `netsuite-cli` can't open a browser or receive the loopback redirect
    (headless box, SSH session, container), use `--paste` instead: it prints the login URL for you
    to open elsewhere, then waits for you to paste the full redirect URL back into the terminal:

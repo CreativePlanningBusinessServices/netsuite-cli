@@ -69,7 +69,7 @@ async fn exchange_sends_pkce_verifier_and_public_client_id() {
         &format!("{}/token", server.uri()),
         "cid",
         "CODE1",
-        "https://localhost:8899/callback",
+        "http://localhost:8899/callback",
         "VERIFIER",
     )
     .await

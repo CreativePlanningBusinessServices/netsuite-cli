@@ -93,7 +93,7 @@ pub async fn add_auth_code(
 }
 
 /// `account login` has no --port flag: the registered redirect URI on the integration record
-/// is https://localhost:8899/callback and OAuth requires an exact match.
+/// is http://localhost:8899/callback and OAuth requires an exact match.
 pub const LOGIN_CALLBACK_PORT: u16 = 8899;
 
 /// One-shot browser login. With `account_id: None` the account is discovered from the OAuth

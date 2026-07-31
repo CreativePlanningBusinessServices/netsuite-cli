@@ -34,7 +34,7 @@ pub async fn run_tba_flow(
     port: u16,
     paste_mode: bool,
 ) -> Result<MintedToken, CliError> {
-    let callback_url = format!("https://localhost:{port}/callback");
+    let callback_url = format!("http://localhost:{port}/callback");
     let request_token = obtain_request_token(
         http,
         restlet_base,
@@ -338,7 +338,7 @@ mod tests {
         let params = [
             (
                 "oauth_callback",
-                "https://localhost:8899/callback".to_string(),
+                "http://localhost:8899/callback".to_string(),
             ),
             ("oauth_consumer_key", "consumerkey123".to_string()),
             ("oauth_nonce", "ABCDEFGHIJKLMNOPQRST".to_string()),
@@ -353,7 +353,7 @@ mod tests {
             "consumersecret789",
             "",
         );
-        assert_eq!(signature, "5sgbCQr3mRLrl1Jgmkg/UnNLwzGofJ5jkktNvRVQlYE=");
+        assert_eq!(signature, "w7UAS/zFLyraWp/eqAb7sVfnHpE0nk4XZFe4YfgRvOk=");
     }
 
     #[test]
