@@ -209,7 +209,8 @@ Both GET variants return a JSON **string** body — NetSuite serializes a RESTle
 *request's* Content-Type, and a bodyless GET sends none. `restlet call` parses it transparently;
 a raw HTTP caller must `JSON.parse()` it itself.
 
-**Create** — POST the definition (`type` required; omit `id` to auto-generate one):
+**Create** — POST the definition (`type` required; omit `id` to auto-generate one; `internalId`
+is rejected on create — it has no meaning until the search is saved):
 ```bash
 netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
   --method POST --data '{
