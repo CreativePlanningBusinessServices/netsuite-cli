@@ -184,10 +184,11 @@ saved-search definitions.
 }
 ```
 `id` is optional on create (omit to let NetSuite generate one) and, along with `type`, immutable
-afterward. `title` is always required. Only `name` is required per column. `filterExpression` is
-always an array of term-arrays and `"AND"`/`"OR"`/`"NOT"` strings — **a bare single term must be
-wrapped**: `[["isinactive","is","F"]]`, not `["isinactive","is","F"]` (the RESTlet returns a
-pointed `{error}` if you forget).
+afterward — describe **omits `id` entirely** (not `null`) for a search with no script id (e.g. a
+private UI-created one); target those with `internalId` instead. `title` is always required. Only
+`name` is required per column. `filterExpression` is always an array of term-arrays and
+`"AND"`/`"OR"`/`"NOT"` strings — **a bare single term must be wrapped**: `[["isinactive","is","F"]]`,
+not `["isinactive","is","F"]` (the RESTlet returns a pointed `{error}` if you forget).
 
 **Describe** — GET with `id` (script id or numeric internal id), no `run`:
 ```bash
@@ -196,7 +197,8 @@ netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy cust
 # → the definition JSON shape above
 ```
 
-**Run** — GET with `run=T`; `pageSize` 5–1000 (default 1000), `pageIndex` 0-based (default 0):
+**Run** — GET with `run=T` or `run=true` (case-insensitive; any other non-empty value errors):
+`pageSize` 5–1000 (default 1000), `pageIndex` 0-based (default 0):
 ```bash
 netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
   --method GET --param id=2846 --param run=T --param pageSize=5 --param pageIndex=0
@@ -218,7 +220,9 @@ netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy cust
 ```
 
 **Update** — PUT the full definition (full-definition replace, not a patch); target with `id` or
-`internalId`:
+`internalId`. `title`, `filterExpression` and `columns` are all **required keys** on PUT — omitting
+either array wipes it (send back the array describe gave you, even unchanged); `isPublic` is the
+only field that's still optional and preserved when omitted:
 ```bash
 netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
   --method PUT --data '{
