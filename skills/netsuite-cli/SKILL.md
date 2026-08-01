@@ -17,7 +17,8 @@ and the repo README.
 | Record type + internal id | `record get <type> <id>` |
 | One sublist line or its subrecord | `record get <type> <id> --sub <sublist>/<lineId>[/<subrecord>]` |
 | Query, aggregate, filter, join | `suiteql "SELECT ..."` |
-| Run an existing saved search as-is, or reach data only exposed via one | `saved-search run <id> --type <recordtype>` |
+| Run, or create/edit, a saved search definition (preferred) | `restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl --method GET\|POST\|PUT ...` — see **Saved searches via RESTlet** below |
+| Run an existing saved search as-is, legacy SOAP fallback | `saved-search run <id> --type <recordtype>` |
 | Unknown record type or field names | `describe --list`, then `describe <type>` |
 | Create / update / delete a record | `record create` / `record update` / `record delete` |
 | Upsert keyed on your own id | `record upsert <type> <externalId>` |
@@ -121,14 +122,12 @@ have that pair, answer `N`; everything except `saved-search run` works without i
   (`record select-options salesOrder 123 --fields item`) for an existing
   record's context.
 - **External ids everywhere:** any id positional accepts `eid:<yourId>`.
-- **`saved-search run` vs `suiteql`:** reach for `saved-search run <id> --type <recordtype>`
-  instead of `suiteql` when you want the saved search's own filters/formulas/columns exactly as
-  the search owner built them, or when the data you need is only exposed via a saved search (no
-  equivalent SuiteQL table/view). Otherwise prefer `suiteql` — it's REST, needs no separate SOAP
-  auth, and is easier to iterate on. `--type` is required and must match the record type the
-  search is defined against; resolve it first by asking the search's owner or checking **Lists >
-  Search > Saved Searches** in the NetSuite UI (the search's record type is right there) rather
-  than guessing.
+- **Saved searches vs `suiteql`:** reach for `restlet call` against `cp_saved_search_rl` (see
+  **Saved searches via RESTlet** below) instead of `suiteql` when you want the saved search's own
+  filters/formulas/columns exactly as the search owner built them, when the data you need is only
+  exposed via a saved search (no equivalent SuiteQL table/view), or when you need to create/edit a
+  definition. Otherwise prefer `suiteql` — it's easier to iterate on. `saved-search run <id> --type
+  <recordtype>` (SOAP) is a legacy fallback only — see the borrowed-time gotcha below.
 
 ## Batch / bulk (record collections)
 
@@ -164,6 +163,92 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
 - **Batch still fires per-record UserEvents** — bundling saves HTTP round-trips,
   not server-side script runs; it does not skip afterSubmit logic.
 
+## Saved searches via RESTlet (preferred)
+
+`cp_saved_search_rl` (`customscript_cp_saved_search_rl` / `customdeploy_cp_saved_search_rl`, same
+ids in prod and SB2) creates, edits, describes, and runs saved searches over a round-trippable
+JSON definition — call it with `restlet call`. It's the go-forward replacement for the SOAP
+`saved-search run` path (see the borrowed-time gotcha below); NetSuite has no native REST API for
+saved-search definitions.
+
+**Definition JSON** (describe's response shape; also the POST/PUT body shape):
+```json
+{
+  "id": "customsearch_erp_referrals",
+  "internalId": 2846,
+  "title": "ERP Referrals",
+  "type": "transaction",
+  "isPublic": true,
+  "filterExpression": [["field", "operator", "value"], "AND", [...]],
+  "columns": [{"name": "entity", "join": "...", "summary": "SUM", "formula": "...", "sort": "ASC", "label": "..."}]
+}
+```
+`id` is optional on create (omit to let NetSuite generate one) and, along with `type`, immutable
+afterward. `title` is always required. Only `name` is required per column. `filterExpression` is
+always an array of term-arrays and `"AND"`/`"OR"`/`"NOT"` strings — **a bare single term must be
+wrapped**: `[["isinactive","is","F"]]`, not `["isinactive","is","F"]` (the RESTlet returns a
+pointed `{error}` if you forget).
+
+**Describe** — GET with `id` (script id or numeric internal id), no `run`:
+```bash
+netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
+  --method GET --param id=2846
+# → the definition JSON shape above
+```
+
+**Run** — GET with `run=T`; `pageSize` 5–1000 (default 1000), `pageIndex` 0-based (default 0):
+```bash
+netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
+  --method GET --param id=2846 --param run=T --param pageSize=5 --param pageIndex=0
+# → {"items":[{"<columnKey>":{"value":...,"text":...}, ...}, ...],
+#     "count":5,"totalRecords":N,"totalPages":N,"pageIndex":0,"hasMore":true}
+```
+Both GET variants return a JSON **string** body — NetSuite serializes a RESTlet response off the
+*request's* Content-Type, and a bodyless GET sends none. `restlet call` parses it transparently;
+a raw HTTP caller must `JSON.parse()` it itself.
+
+**Create** — POST the definition (`type` required; omit `id` to auto-generate one):
+```bash
+netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
+  --method POST --data '{
+    "title": "CP Example", "type": "customer", "isPublic": true,
+    "filterExpression": [["isinactive", "is", "F"]],
+    "columns": [{"name": "entityid", "sort": "ASC"}, {"name": "email"}]
+  }'
+```
+
+**Update** — PUT the full definition (full-definition replace, not a patch); target with `id` or
+`internalId`:
+```bash
+netsuite-cli restlet call --script customscript_cp_saved_search_rl --deploy customdeploy_cp_saved_search_rl \
+  --method PUT --data '{
+    "id": "customsearch_cp_example", "title": "CP Example (renamed)", "type": "customer",
+    "filterExpression": [["isinactive", "is", "F"], "AND", ["email", "isnotempty", ""]],
+    "columns": [{"name": "entityid", "sort": "DESC"}, {"name": "email", "label": "Mail"}]
+  }'
+```
+Describe output is round-trippable straight into PUT with zero edits — every field describe
+returns is one PUT accepts — unless a rare title-lookup failure left describe's `title` null (see
+below), in which case supply your own.
+
+**Title resolution:** `N/search.load().title` is null account-wide — a permanent NetSuite
+platform gap, not staleness. Describe, POST, and PUT responses all resolve the real title via a
+`SELECT name FROM savedsearch WHERE id = ?` SuiteQL lookup layered on top; POST/PUT additionally
+fall back to the caller-supplied title if that lookup ever fails, so their `title` is reliable.
+Describe has no such fallback — on the rare lookup failure it returns `title: null`, and a caller
+PUTing that back must supply its own title like any other required field.
+
+**Limits:** no delete verb (create/describe/run/update only); `id` and `type` are immutable once
+created (PUT with a different `type` returns `{"error": "type cannot be changed — the search's
+type is <actual>"}`); the only editable fields are `title`, `filterExpression`, `columns`, and
+`isPublic` — no scheduling, email alerts, or audience settings.
+
+**Audience:** deployed with `allroles=T` (all internal roles) — SDF rejects scoping this
+deployment's `audslctrole` to a custom role (tried both the uppercase enum-style and lowercase
+scriptid forms of a real custom role; both errored `must not be <value>`, an apparent SDF platform
+limitation on custom-role audience references). Access is gated by OAuth 2.0 client-credential
+auth plus the calling role's own RESTlet execute permission, not audience scoping.
+
 ## Errors: exit code → action
 
 | Exit | Kind | Action |
@@ -186,7 +271,8 @@ netsuite-cli raw DELETE /services/rest/record/v1/<type> --query ids=1,2 --header
   internalid FROM customrecord_...` errors with `Unknown identifier
   'internalid'` (standard records accept both). Use `id` and it silently
   returns nothing on some shapes, so prefer `id` everywhere for custom records.
-- **`saved-search run` is on borrowed time:** it calls NetSuite's legacy SuiteTalk SOAP web
-  services, which NetSuite is sunsetting — no new TBA/SOAP integrations after release 2027.1, and
-  the SOAP endpoints are removed entirely in release 2028.2. Don't build new workflows around it
-  without a `suiteql`/REST fallback plan.
+- **`saved-search run` is on borrowed time — legacy fallback only:** it calls NetSuite's legacy
+  SuiteTalk SOAP web services, which NetSuite is sunsetting — no new TBA/SOAP integrations after
+  release 2027.1, and the SOAP endpoints are removed entirely in release 2028.2. Prefer
+  `restlet call` against `cp_saved_search_rl` (see **Saved searches via RESTlet** above) — it's
+  REST, needs no separate SOAP/TBA auth, and can create/edit definitions, not just run them.
