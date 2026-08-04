@@ -22,7 +22,7 @@ async fn request_token_step_sends_signed_oauth_header_and_parses_form_response()
         &server.uri(),
         "consumerkey123",
         "consumersecret789",
-        "https://localhost:8899/callback",
+        "http://localhost:8899/callback",
     )
     .await
     .unwrap();
@@ -35,7 +35,7 @@ async fn request_token_step_sends_signed_oauth_header_and_parses_form_response()
     for expected in [
         "oauth_consumer_key=\"consumerkey123\"",
         "oauth_signature_method=\"HMAC-SHA256\"",
-        "oauth_callback=\"https%3A%2F%2Flocalhost%3A8899%2Fcallback\"",
+        "oauth_callback=\"http%3A%2F%2Flocalhost%3A8899%2Fcallback\"",
         "oauth_signature=\"",
     ] {
         assert!(
@@ -62,7 +62,7 @@ async fn request_token_without_callback_confirmed_is_rejected() {
         &server.uri(),
         "consumerkey123",
         "consumersecret789",
-        "https://localhost:8899/callback",
+        "http://localhost:8899/callback",
     )
     .await
     .unwrap_err();

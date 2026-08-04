@@ -1,43 +1,37 @@
 use std::io::ErrorKind;
-use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 
 use crate::error::CliError;
 
-// A stalled or malicious local connection that opens the TLS session but never finishes
-// sending its request must not be able to hang `account add` forever.
+// A stalled or malicious local connection that opens the socket but never finishes sending
+// its request must not be able to hang `account add` forever.
 const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Repeated TLS probe connections (e.g. from port scanners or browser cert-warning retries)
-// each reset the per-connection timeout, so the accept loop also needs an overall deadline
-// on the whole login attempt.
+// Repeated stray connections (e.g. from port scanners or a browser prefetch) each reset the
+// per-connection timeout, so the accept loop also needs an overall deadline on the whole
+// login attempt.
 const LOGIN_FLOW_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// One-shot loopback listener for the OAuth redirect, plain HTTP on `127.0.0.1` as RFC 8252
+/// §7.3 prescribes for native apps: the redirect never leaves the machine, and the response
+/// carries no secret of its own — the authorization code it does carry is bound to this
+/// process by PKCE and to this attempt by `state`. Serving TLS here instead would mean a
+/// throwaway self-signed cert and an interstitial browser warning mid-login.
 pub(crate) async fn listen_for_redirect<CallbackValue>(
     port: u16,
     parse_query: impl Fn(&str) -> Result<CallbackValue, CliError>,
 ) -> Result<CallbackValue, CliError> {
-    let acceptor = build_loopback_tls_acceptor()?;
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
         .map_err(|bind_error| {
-            CliError::Network(format!(
-                "cannot bind https://localhost:{port}: {bind_error}"
-            ))
+            CliError::Network(format!("cannot bind http://localhost:{port}: {bind_error}"))
         })?;
-    eprintln!("Waiting for the OAuth redirect on https://localhost:{port}/callback …");
+    eprintln!("Waiting for the OAuth redirect on http://localhost:{port}/callback …");
 
-    match tokio::time::timeout(
-        LOGIN_FLOW_TIMEOUT,
-        accept_callback(listener, acceptor, parse_query),
-    )
-    .await
-    {
+    match tokio::time::timeout(LOGIN_FLOW_TIMEOUT, accept_callback(listener, parse_query)).await {
         Ok(result) => result,
         Err(_) => Err(CliError::Auth(
             "login timed out after 5 minutes; re-run the command (or use --paste)".into(),
@@ -63,22 +57,16 @@ pub(crate) fn read_pasted_redirect<CallbackValue>(
 
 async fn accept_callback<CallbackValue>(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
     parse_query: impl Fn(&str) -> Result<CallbackValue, CliError>,
 ) -> Result<CallbackValue, CliError> {
     loop {
-        let (tcp_stream, _peer_addr) = listener
+        let (mut tcp_stream, _peer_addr) = listener
             .accept()
             .await
             .map_err(|accept_error| CliError::Network(format!("accept failed: {accept_error}")))?;
-        // A failed handshake is typically the browser's cert-warning probe connection —
-        // ignore it and keep accepting rather than aborting the whole login attempt.
-        let Ok(mut tls_stream) = acceptor.accept(tcp_stream).await else {
-            continue;
-        };
 
         let request_head =
-            match tokio::time::timeout(CONNECTION_READ_TIMEOUT, read_request_head(&mut tls_stream))
+            match tokio::time::timeout(CONNECTION_READ_TIMEOUT, read_request_head(&mut tcp_stream))
                 .await
             {
                 Ok(Ok(head)) => head,
@@ -89,7 +77,7 @@ async fn accept_callback<CallbackValue>(
         };
 
         if !request_path.starts_with("/callback") {
-            let _ = tls_stream.write_all(NOT_FOUND_RESPONSE).await;
+            let _ = tcp_stream.write_all(NOT_FOUND_RESPONSE).await;
             continue;
         }
 
@@ -99,40 +87,13 @@ async fn accept_callback<CallbackValue>(
             .unwrap_or("");
         let callback_result = parse_query(query);
 
-        let _ = tls_stream
+        let _ = tcp_stream
             .write_all(callback_response(&callback_result).as_bytes())
             .await;
-        let _ = tls_stream.shutdown().await;
+        let _ = tcp_stream.shutdown().await;
 
         return callback_result;
     }
-}
-
-fn build_loopback_tls_acceptor() -> Result<TlsAcceptor, CliError> {
-    let certified_key =
-        rcgen::generate_simple_self_signed(vec!["localhost".into()]).map_err(|cert_error| {
-            CliError::Auth(format!("cannot generate loopback TLS cert: {cert_error}"))
-        })?;
-    let cert_der: CertificateDer<'static> = certified_key.cert.der().clone();
-    let key_der: PrivateKeyDer<'static> = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        certified_key.key_pair.serialize_der(),
-    ));
-
-    let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
-    let server_config = rustls::ServerConfig::builder_with_provider(crypto_provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|config_error| {
-            CliError::Auth(format!(
-                "cannot select TLS protocol versions: {config_error}"
-            ))
-        })?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .map_err(|config_error| {
-            CliError::Auth(format!("cannot build loopback TLS config: {config_error}"))
-        })?;
-
-    Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
 const MAX_REQUEST_HEAD_BYTES: usize = 8192;
@@ -207,5 +168,70 @@ mod tests {
             "state mismatch in OAuth callback — possible CSRF, aborting".into(),
         )));
         assert!(state_mismatch.contains("Login failed"));
+    }
+
+    /// Ask the OS for a free port, then hand it back — the listener under test takes a port
+    /// number rather than choosing one, and a hardcoded port would collide with whatever else
+    /// the machine is running.
+    async fn free_loopback_port() -> u16 {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        probe.local_addr().unwrap().port()
+    }
+
+    /// The whole point of serving plain HTTP: an ordinary browser request now completes the
+    /// login. Under TLS this path could only be exercised by the live smoke test.
+    #[tokio::test]
+    async fn listener_answers_the_callback_request_and_returns_the_parsed_query() {
+        let port = free_loopback_port().await;
+        let listening = tokio::spawn(listen_for_redirect(port, |query: &str| {
+            Ok(query.to_string())
+        }));
+
+        // The listener binds inside the spawned task, so retry the request until it's up.
+        let mut response = None;
+        for _ in 0..50 {
+            match reqwest::get(format!("http://127.0.0.1:{port}/callback?code=abc123")).await {
+                Ok(ok) => {
+                    response = Some(ok);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let response = response.expect("listener never accepted a connection");
+        assert!(response.status().is_success());
+        assert!(response.text().await.unwrap().contains("Login complete"));
+        assert_eq!(listening.await.unwrap().unwrap(), "code=abc123");
+    }
+
+    /// A stray request (favicon fetch, port scan, browser prefetch) must 404 without ending the
+    /// login attempt — the real redirect can still arrive afterward on the same listener.
+    #[tokio::test]
+    async fn listener_404s_other_paths_and_keeps_waiting_for_the_callback() {
+        let port = free_loopback_port().await;
+        let listening = tokio::spawn(listen_for_redirect(port, |query: &str| {
+            Ok(query.to_string())
+        }));
+
+        let mut stray = None;
+        for _ in 0..50 {
+            match reqwest::get(format!("http://127.0.0.1:{port}/favicon.ico")).await {
+                Ok(ok) => {
+                    stray = Some(ok);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert_eq!(
+            stray.expect("no response to the stray request").status(),
+            404
+        );
+
+        let callback = reqwest::get(format!("http://127.0.0.1:{port}/callback?code=abc123"))
+            .await
+            .unwrap();
+        assert!(callback.status().is_success());
+        assert_eq!(listening.await.unwrap().unwrap(), "code=abc123");
     }
 }

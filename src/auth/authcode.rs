@@ -352,9 +352,10 @@ pub struct LoginOutcome {
 }
 
 /// Interactive login: opens the browser at the authorize URL, then either reads the
-/// pasted redirect URL (`paste_mode`) or runs a one-shot HTTPS loopback listener to
-/// catch the redirect itself. NetSuite rejects plain `http://` redirect URIs, so the
-/// listener terminates TLS with a throwaway self-signed cert for `localhost`.
+/// pasted redirect URL (`paste_mode`) or runs a one-shot HTTP loopback listener to
+/// catch the redirect itself. The redirect URI must match one registered on the
+/// integration record exactly, so a record set up for an older CLI version (which used
+/// `https://localhost:{port}/callback`) needs the `http://` URI added.
 ///
 /// With `account_id: None` the authorize URL goes to system.netsuite.com, NetSuite shows its
 /// own account/role chooser during login, and the chosen account arrives in the callback's
@@ -368,7 +369,7 @@ pub async fn run_login_flow(
 ) -> Result<LoginOutcome, CliError> {
     let pkce = generate_pkce();
     let state = generate_state();
-    let redirect_uri = format!("https://localhost:{port}/callback");
+    let redirect_uri = format!("http://localhost:{port}/callback");
     let scopes: Vec<String> = ["restlets", "rest_webservices", "suite_analytics"]
         .iter()
         .map(|scope| scope.to_string())
@@ -445,7 +446,7 @@ mod tests {
         let url = authorize_url(
             "https://123456-sb1.app.netsuite.com",
             "cid",
-            "https://localhost:8899/callback",
+            "http://localhost:8899/callback",
             &["rest_webservices".into(), "restlets".into()],
             "STATESTATESTATESTATE22",
             "CHALLENGE",
@@ -460,7 +461,7 @@ mod tests {
             "code_challenge=CHALLENGE",
             "state=STATESTATESTATESTATE22",
             "scope=rest_webservices+restlets",
-            "redirect_uri=https%3A%2F%2Flocalhost%3A8899%2Fcallback",
+            "redirect_uri=http%3A%2F%2Flocalhost%3A8899%2Fcallback",
         ] {
             assert!(url.contains(expected), "missing {expected} in {url}");
         }

@@ -535,7 +535,7 @@ pub enum AccountAction {
     #[command(
         after_help = "Example: netsuite-cli account soap-auth demo\n\nRequires TBA + \
         'TBA: Authorization Flow' enabled on the integration record, with callback URL \
-        https://localhost:8899/callback"
+        http://localhost:8899/callback"
     )]
     SoapAuth {
         alias: String,
