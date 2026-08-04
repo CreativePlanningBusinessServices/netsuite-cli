@@ -57,6 +57,54 @@ pub struct KeyringStore;
 
 const KEYRING_SERVICE: &str = "netsuite-cli";
 
+/// Windows Credential Manager caps one credential's blob at CRED_MAX_CREDENTIAL_BLOB_SIZE
+/// (2560) bytes, and the keyring crate stores the password UTF-16 encoded, so a single entry
+/// holds at most 1280 UTF-16 code units. NetSuite auth-code payloads blow through that — a
+/// refresh token alone can exceed it — so on Windows payloads over this budget are split
+/// across `<user>#chunk<i>` entries, with the main entry holding a marker that records the
+/// chunk count. The threshold leaves headroom under the ceiling. macOS and Linux keychains
+/// have no such limit, so there they store the payload in one entry as they always have.
+#[cfg(windows)]
+const MAX_ENTRY_UTF16_UNITS: usize = 1024;
+
+/// What the main entry holds when the payload is chunked. `deny_unknown_fields` plus the
+/// distinctive field name guarantee no real payload (`AccountSecrets`, `CachedToken`,
+/// `TbaSecrets` — all carry other required fields) can ever parse as a marker.
+#[cfg(windows)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkMarker {
+    #[serde(rename = "netsuite-cli-chunk-count")]
+    chunk_count: usize,
+}
+
+#[cfg(windows)]
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Splits on char boundaries, packing each chunk with as many chars as fit in `max_units`
+/// UTF-16 code units. Concatenating the chunks in order reproduces the input exactly.
+#[cfg(windows)]
+fn split_utf16_chunks(payload: &str, max_units: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_units = 0;
+    for character in payload.chars() {
+        let character_units = character.len_utf16();
+        if current_units + character_units > max_units {
+            chunks.push(std::mem::take(&mut current));
+            current_units = 0;
+        }
+        current.push(character);
+        current_units += character_units;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 impl KeyringStore {
     fn entry(user: &str) -> Result<keyring::Entry, CliError> {
         keyring::Entry::new(KEYRING_SERVICE, user).map_err(|keyring_error| {
@@ -65,28 +113,123 @@ impl KeyringStore {
     }
 
     fn read<T: for<'de> Deserialize<'de>>(user: &str) -> Result<Option<T>, CliError> {
-        match Self::entry(user)?.get_password() {
-            Ok(raw) => serde_json::from_str(&raw).map(Some).map_err(|parse_error| {
+        let raw = match Self::entry(user)?.get_password() {
+            Ok(raw) => raw,
+            Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(keyring_error) => {
+                return Err(CliError::Auth(format!(
+                    "keychain read failed: {keyring_error}"
+                )));
+            }
+        };
+        let payload = Self::resolve_payload(user, raw)?;
+        serde_json::from_str(&payload)
+            .map(Some)
+            .map_err(|parse_error| {
                 CliError::Auth(format!("corrupt keychain entry '{user}': {parse_error}"))
-            }),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(keyring_error) => Err(CliError::Auth(format!(
-                "keychain read failed: {keyring_error}"
-            ))),
+            })
+    }
+
+    /// Off Windows nothing ever writes a chunk marker, so the stored entry is the payload.
+    #[cfg(not(windows))]
+    fn resolve_payload(_user: &str, raw: String) -> Result<String, CliError> {
+        Ok(raw)
+    }
+
+    #[cfg(windows)]
+    fn resolve_payload(user: &str, raw: String) -> Result<String, CliError> {
+        match serde_json::from_str::<ChunkMarker>(&raw) {
+            Ok(marker) => Self::read_chunks(user, marker.chunk_count),
+            Err(_) => Ok(raw),
         }
     }
 
+    #[cfg(windows)]
+    fn read_chunks(user: &str, chunk_count: usize) -> Result<String, CliError> {
+        let mut payload = String::new();
+        for chunk_index in 0..chunk_count {
+            let chunk_user = format!("{user}#chunk{chunk_index}");
+            match Self::entry(&chunk_user)?.get_password() {
+                Ok(chunk) => payload.push_str(&chunk),
+                Err(keyring_error) => {
+                    return Err(CliError::Auth(format!(
+                        "keychain read failed for chunk '{chunk_user}': {keyring_error}"
+                    )));
+                }
+            }
+        }
+        Ok(payload)
+    }
+
     fn write<T: Serialize>(user: &str, value: &T) -> Result<(), CliError> {
+        let payload = serde_json::to_string(value).expect("serializable");
+        Self::write_payload(user, &payload)
+    }
+
+    /// Only Windows Credential Manager caps the blob size, so everywhere else the payload
+    /// goes into one entry — no chunk writes, and no chunk sweep probing the keychain.
+    #[cfg(not(windows))]
+    fn write_payload(user: &str, payload: &str) -> Result<(), CliError> {
+        Self::write_entry(user, payload)
+    }
+
+    #[cfg(windows)]
+    fn write_payload(user: &str, payload: &str) -> Result<(), CliError> {
+        if utf16_len(payload) <= MAX_ENTRY_UTF16_UNITS {
+            Self::write_entry(user, payload)?;
+            Self::remove_chunks_from(user, 0)
+        } else {
+            let chunks = split_utf16_chunks(payload, MAX_ENTRY_UTF16_UNITS);
+            let marker = serde_json::to_string(&ChunkMarker {
+                chunk_count: chunks.len(),
+            })
+            .expect("serializable");
+            // Chunks land before the marker so a write that dies partway leaves the main
+            // entry pointing at whatever was stored before, never at missing chunks.
+            for (chunk_index, chunk) in chunks.iter().enumerate() {
+                Self::write_entry(&format!("{user}#chunk{chunk_index}"), chunk)?;
+            }
+            Self::write_entry(user, &marker)?;
+            Self::remove_chunks_from(user, chunks.len())
+        }
+    }
+
+    fn write_entry(user: &str, payload: &str) -> Result<(), CliError> {
         Self::entry(user)?
-            .set_password(&serde_json::to_string(value).expect("serializable"))
+            .set_password(payload)
             .map_err(|keyring_error| {
                 CliError::Auth(format!("keychain write failed: {keyring_error}"))
             })
     }
 
+    /// Deletes chunk entries from `first_chunk_index` up to the first missing one — the
+    /// stale tail left behind when a value shrinks or stops being chunked.
+    #[cfg(windows)]
+    fn remove_chunks_from(user: &str, first_chunk_index: usize) -> Result<(), CliError> {
+        let mut chunk_index = first_chunk_index;
+        loop {
+            let chunk_user = format!("{user}#chunk{chunk_index}");
+            match Self::entry(&chunk_user)?.delete_credential() {
+                Ok(()) => chunk_index += 1,
+                Err(keyring::Error::NoEntry) => return Ok(()),
+                Err(keyring_error) => {
+                    return Err(CliError::Auth(format!(
+                        "keychain delete failed: {keyring_error}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Nothing off Windows ever wrote a chunk entry, so there is none to sweep.
+    #[cfg(not(windows))]
+    fn remove_chunks_from(_user: &str, _first_chunk_index: usize) -> Result<(), CliError> {
+        Ok(())
+    }
+
     fn remove(user: &str) -> Result<(), CliError> {
         match Self::entry(user)?.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Ok(()) | Err(keyring::Error::NoEntry) => Self::remove_chunks_from(user, 0),
             Err(keyring_error) => Err(CliError::Auth(format!(
                 "keychain delete failed: {keyring_error}"
             ))),
@@ -280,5 +423,92 @@ mod tests {
             .unwrap();
         store.delete_tba("demo").unwrap();
         assert!(store.get_tba("demo").unwrap().is_none());
+    }
+
+    /// Only Windows chunks, so only Windows compiles — and runs — these.
+    #[cfg(windows)]
+    mod chunking {
+        use super::*;
+
+        #[test]
+        fn split_utf16_chunks_round_trips_and_respects_the_unit_budget() {
+            let payload = "x".repeat(2500);
+            let chunks = split_utf16_chunks(&payload, 1024);
+            assert_eq!(chunks.len(), 3);
+            assert!(chunks.iter().all(|chunk| utf16_len(chunk) <= 1024));
+            assert_eq!(chunks.concat(), payload);
+
+            // exactly at the budget stays a single chunk
+            let exact = "y".repeat(1024);
+            assert_eq!(split_utf16_chunks(&exact, 1024), vec![exact.clone()]);
+        }
+
+        #[test]
+        fn split_utf16_chunks_counts_utf16_units_not_chars() {
+            // '🔑' is one char but two UTF-16 code units; a budget of 3 units fits one
+            // emoji plus one ASCII char, never two emoji.
+            let payload = "🔑a🔑b";
+            let chunks = split_utf16_chunks(payload, 3);
+            assert_eq!(chunks, vec!["🔑a".to_string(), "🔑b".to_string()]);
+            assert!(chunks.iter().all(|chunk| utf16_len(chunk) <= 3));
+            assert_eq!(chunks.concat(), payload);
+        }
+
+        #[test]
+        fn chunk_marker_is_never_confused_with_real_payloads() {
+            // no stored payload type parses as a marker …
+            let auth_code = serde_json::to_string(&AccountSecrets::AuthCode {
+                client_id: "cid".into(),
+                refresh_token: Some("refresh".into()),
+            })
+            .unwrap();
+            let token = serde_json::to_string(&CachedToken {
+                access_token: "tok".into(),
+                expires_at_epoch: 999,
+            })
+            .unwrap();
+            let tba = serde_json::to_string(&TbaSecrets {
+                consumer_key: "k".into(),
+                consumer_secret: "s".into(),
+                token_id: None,
+                token_secret: None,
+            })
+            .unwrap();
+            for raw in [&auth_code, &token, &tba] {
+                assert!(serde_json::from_str::<ChunkMarker>(raw).is_err());
+            }
+
+            // … and a marker parses as nothing but a marker
+            let marker = serde_json::to_string(&ChunkMarker { chunk_count: 3 }).unwrap();
+            assert!(serde_json::from_str::<AccountSecrets>(&marker).is_err());
+            assert!(serde_json::from_str::<CachedToken>(&marker).is_err());
+            assert!(serde_json::from_str::<TbaSecrets>(&marker).is_err());
+            assert_eq!(
+                serde_json::from_str::<ChunkMarker>(&marker)
+                    .unwrap()
+                    .chunk_count,
+                3
+            );
+        }
+
+        #[test]
+        fn oversized_auth_code_secrets_split_and_reassemble() {
+            // a NetSuite-sized refresh token JWT comfortably exceeds one entry's budget
+            let secrets = AccountSecrets::AuthCode {
+                client_id: "c".repeat(64),
+                refresh_token: Some("r".repeat(3000)),
+            };
+            let payload = serde_json::to_string(&secrets).unwrap();
+            assert!(utf16_len(&payload) > MAX_ENTRY_UTF16_UNITS);
+
+            let chunks = split_utf16_chunks(&payload, MAX_ENTRY_UTF16_UNITS);
+            assert!(chunks.len() > 1);
+            match serde_json::from_str::<AccountSecrets>(&chunks.concat()).unwrap() {
+                AccountSecrets::AuthCode { refresh_token, .. } => {
+                    assert_eq!(refresh_token.unwrap().len(), 3000);
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
     }
 }
