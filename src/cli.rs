@@ -237,7 +237,7 @@ impl RestletMethodArg {
 #[derive(Subcommand)]
 pub enum RestletAction {
     #[command(
-        after_help = "Examples:\n  netsuite-cli restlet call --script 482 --deploy 1 --method GET --param customerId=42\n  netsuite-cli restlet call --script 482 --deploy 1 --method POST --data '{\"foo\":\"bar\"}'"
+        after_help = "Examples:\n  netsuite-cli restlet call --script 482 --deploy 1 --method GET --param customerId=42\n  netsuite-cli restlet call --script 482 --deploy 1 --method POST --data '{\"foo\":\"bar\"}'\n  netsuite-cli restlet call --script 482 --deploy 1 --method PUT --data @payload.json"
     )]
     Call {
         #[arg(long)]
@@ -251,6 +251,8 @@ pub enum RestletAction {
         /// via request.parameters for GET/DELETE (use --data for POST/PUT bodies)
         #[arg(long = "param")]
         param: Vec<String>,
+        /// JSON body for POST/PUT: inline JSON, @path to read it from a file, or - for stdin.
+        /// Use @file for large payloads — inline args are capped by the shell's ARG_MAX (~1MB)
         #[arg(long)]
         data: Option<String>,
     },
