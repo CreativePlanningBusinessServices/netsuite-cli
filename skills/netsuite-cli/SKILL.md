@@ -29,7 +29,7 @@ and the repo README.
 | An endpoint the CLI lacks | `raw <METHOD> /services/rest/...` |
 | Long-running request | `job submit <METHOD> <path>` → `job status <id>` → `job result <id>` |
 | Bulk create/update/delete (≤100 records) | `raw` batch collection — see **Batch** below (NOT `job submit`) |
-| Deployed RESTlet script | `restlet call --script <N> --deploy <N> --method <M>` |
+| Deployed RESTlet script | `restlet call --script <N> --deploy <N> --method <M>` (`--data` takes inline JSON, `@file.json`, or `-`) |
 
 ## Bootstrap (once per machine + account)
 
@@ -112,7 +112,10 @@ have that pair, answer `N`; everything except `saved-search run` works without i
   with `record get <type> <id> --sub addressbook/24/addressbookaddress`
   (`--sub addressbook/24` for just the line), or inline everything with
   `record get ... --expand-sub-resources`.
-- **Data input:** `--data '<json>'`, `--data @file.json`, or `--data -` (stdin).
+- **Data input:** `--data '<json>'`, `--data @file.json`, or `--data -` (stdin) — the same
+  three forms everywhere `--data` appears (`record`, `raw`, `job submit`, `restlet call`).
+  Prefer `@file` for large payloads (inline args hit the shell's ARG_MAX ~1MB); size limits
+  beyond that are per-RESTlet/per-endpoint, not CLI-side.
 - **Forms preview, never write:** `create-form` / `edit-form` / `transform --form`
   return the record as NetSuite would default it, without saving — use before a
   risky create or transform.

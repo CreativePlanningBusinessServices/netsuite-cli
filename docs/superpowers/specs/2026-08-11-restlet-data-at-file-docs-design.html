@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>restlet call --data @file — Documentation Spec</title>
+<style>
+  :root {
+    --ink: #1f2430; --muted: #5b6472; --accent: #0f6b54; --accent-soft: #e6f2ee;
+    --border: #d9dee6; --bg: #fafbfc; --card: #ffffff; --code-bg: #f2f4f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2.5rem 1.5rem 4rem; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin: 0 0 .25rem; }
+  .subtitle { color: var(--muted); margin: 0 0 2rem; }
+  h2 { font-size: 1.2rem; margin: 2.25rem 0 .75rem; padding-bottom: .3rem; border-bottom: 2px solid var(--accent-soft); }
+  code { background: var(--code-bg); border-radius: 4px; padding: .1em .35em; font: .875em/1.5 "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; margin: 0 0 1rem; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 0 0 1rem; font-size: .93rem; }
+  th, td { border: 1px solid var(--border); padding: .45rem .7rem; text-align: left; vertical-align: top; }
+  th { background: var(--accent-soft); }
+  .decision { background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 6px; padding: .75rem 1rem; margin: 0 0 .75rem; }
+  .decision strong { color: var(--accent); }
+  .choice-panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem 1.5rem; margin: 1.5rem 0; text-align: center; }
+  .choice-panel a { display: inline-block; margin: .25rem .4rem; padding: .6rem 1.4rem; border-radius: 8px; text-decoration: none; font-weight: 600; border: 1px solid var(--border); color: var(--ink); }
+  .choice-panel a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+</style>
+</head>
+<body>
+<main>
+<h1>restlet call <code>--data @file</code> — Documentation Spec</h1>
+<p class="subtitle">2026-08-11 · branch <code>docs/restlet-data-at-file</code> · follow-up to the CP File Cabinet RESTlet (sdf repo PRs #85/#86)</p>
+
+<div class="choice-panel">
+  <p><strong>Review this spec, then choose:</strong></p>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve" target="_blank">Approve — write the implementation plan</a>
+  <a href="http://127.0.0.1:8137/pick?c=changes&amp;l=Changes" target="_blank">Changes needed — I'll describe them in chat</a>
+</div>
+
+<h2>Problem</h2>
+<p>
+Large RESTlet payloads (e.g. File Cabinet uploads through <code>cp_file_cabinet_rl</code>) were
+believed to be capped at ~700KB binary / ~1MB text because <code>--data</code> was assumed to be
+inline-only, bounded by the shell's ARG_MAX. That belief is wrong: <code>restlet call --data</code>
+already routes through the shared <code>read_data_arg</code> helper (<code>cli.rs:895</code>),
+which supports <code>@path</code> (read from file) and <code>-</code> (stdin) — the same forms the
+<code>record</code> commands document. Nothing in <code>restlet call</code>'s help or examples
+says so, and downstream docs propagated the false ceiling.
+</p>
+
+<h2>Empirical findings (sb2, 2026-08-11)</h2>
+<table>
+<tr><th>Probe</th><th>Result</th></tr>
+<tr><td>2.5MB text upload via <code>--data @file</code></td><td>Created; downloaded byte-identical</td></tr>
+<tr><td>9.9MB text upload (just under the RESTlet's 10MB decoded cap)</td><td>Created, size 9,900,000</td></tr>
+<tr><td>7MB binary upload (9.3MB base64 JSON body)</td><td>Created; downloaded byte-identical</td></tr>
+<tr><td>11MB body (over the RESTlet cap)</td><td>NetSuite accepted the request; <code>cp_file_cabinet_rl</code>'s own cap error came back — <strong>the per-RESTlet cap is the binding limit, platform ceiling ≥ 11MB</strong></td></tr>
+</table>
+
+<h2>Decisions</h2>
+<div class="decision"><strong>No new flag.</strong> <code>--data-file</code> is rejected as a redundant synonym; <code>@path</code> is the repo's established convention. This change is documentation and help text only — zero behavior change.</div>
+<div class="decision"><strong>Scope: <code>restlet call</code> only</strong> in the CLI. <code>raw</code>/<code>job submit</code> use the same helper and inherit the behavior, but their help is untouched (the shipped skill's generic "Data input" line covers the forms).</div>
+
+<h2>Changes</h2>
+<p><strong>1. <code>src/cli.rs</code> — <code>RestletAction::Call</code>'s <code>data</code> arg</strong> gains a doc comment (currently none):</p>
+<pre><code>/// JSON body for POST/PUT: inline JSON, @path to read it from a file, or - for stdin.
+/// Use @file for large payloads — inline args are capped by the shell's ARG_MAX (~1MB).
+#[arg(long)]
+data: Option&lt;String&gt;,</code></pre>
+<p>and the subcommand's <code>after_help</code> gains one example line:</p>
+<pre><code>netsuite-cli restlet call --script 482 --deploy 1 --method PUT --data @payload.json</code></pre>
+<p><strong>2. <code>skills/netsuite-cli/SKILL.md</code></strong> — the RESTlet row / section notes that <code>--data</code> accepts the same three input forms everywhere it appears (<code>record</code>, <code>raw</code>, <code>job submit</code>, <code>restlet call</code>), and that payload size limits are per-RESTlet, not CLI-side (platform accepts ≥11MB request bodies). No CP-specific content — the documentation split stands.</p>
+<p><strong>3. Out-of-repo (not part of this PR):</strong> the local <code>cp-file-cabinet</code> skill's size-limits section replaces the ARG_MAX claim with the verified limits (10MB decoded cap enforced by the RESTlet; <code>--data @file</code> for anything large; 9.9MB text / 7MB binary verified), and the paired memory file gets a one-line correction.</p>
+
+<h2>Testing &amp; rollout</h2>
+<ul>
+  <li><code>read_data_arg</code>'s <code>@file</code>/stdin behavior is already unit-tested (<code>commands/mod.rs</code> tests). New tests: none needed for a docs change; the plan checks whether any help-snapshot tests exist and updates them if so.</li>
+  <li><code>cargo build</code> + <code>cargo test</code> green; patch version bump per repo convention.</li>
+  <li>PR against <code>main</code>, then <code>pr-review-loop</code>; local skill/memory edits after merge.</li>
+</ul>
+
+<h2>Out of scope</h2>
+<ul>
+  <li>A <code>--data-file</code> flag; any behavior change to <code>read_data_arg</code>; raw/job-submit help text; chunked-transfer support (the 10MB per-RESTlet cap makes it moot for File Cabinet).</li>
+</ul>
+
+<div class="choice-panel">
+  <p><strong>Ready to proceed?</strong></p>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=approve&amp;l=Approve" target="_blank">Approve — write the implementation plan</a>
+  <a href="http://127.0.0.1:8137/pick?c=changes&amp;l=Changes" target="_blank">Changes needed — I'll describe them in chat</a>
+</div>
+</main>
+</body>
+</html>
