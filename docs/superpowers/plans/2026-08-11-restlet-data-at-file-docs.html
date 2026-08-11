@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>restlet call --data @file docs — Implementation Plan</title>
+<style>
+  :root {
+    --ink: #1f2430; --muted: #5b6472; --accent: #0f6b54; --accent-soft: #e6f2ee;
+    --border: #d9dee6; --bg: #fafbfc; --card: #ffffff; --code-bg: #f2f4f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 2.5rem 1.5rem 4rem; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 1.8rem; margin: 0 0 .25rem; }
+  .subtitle { color: var(--muted); margin: 0 0 2rem; }
+  h2 { font-size: 1.2rem; margin: 2.25rem 0 .75rem; padding-bottom: .3rem; border-bottom: 2px solid var(--accent-soft); }
+  code { background: var(--code-bg); border-radius: 4px; padding: .1em .35em; font: .85em/1.5 "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; margin: 0 0 1rem; font-size: .83rem; }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  .callout { background: #fff7e6; border: 1px solid #e6c576; border-radius: 8px; padding: .85rem 1rem; margin: 0 0 1rem; }
+  .task { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.1rem 1.4rem; margin: 0 0 1.75rem; }
+  .task h3 { margin-top: 0; font-size: 1.1rem; color: var(--accent); }
+  .step { list-style: none; margin-left: -1.2rem; }
+  .step::before { content: "[ ] "; font-family: ui-monospace, monospace; color: var(--accent); font-weight: 700; }
+  .choice-panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 1.25rem 1.5rem; margin: 1.5rem 0; text-align: center; }
+  .choice-panel a { display: inline-block; margin: .25rem .4rem; padding: .6rem 1.4rem; border-radius: 8px; text-decoration: none; font-weight: 600; border: 1px solid var(--border); color: var(--ink); }
+  .choice-panel a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+</style>
+</head>
+<body>
+<main>
+<h1>restlet call <code>--data @file</code> docs — Implementation Plan</h1>
+<p class="subtitle">2026-08-11 · repo <code>~/projects/creativeplanning/netsuite-cli</code> · branch <code>docs/restlet-data-at-file</code> · spec: <code>docs/superpowers/specs/2026-08-11-restlet-data-at-file-docs-design.html</code></p>
+
+<div class="callout"><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: <code>superpowers:subagent-driven-development</code> (recommended) or <code>superpowers:executing-plans</code>. Steps use <code>[ ]</code> checkboxes.</div>
+
+<p><strong>Goal:</strong> Document the existing <code>@file</code>/<code>-</code> input forms on <code>restlet call --data</code> (CLI help + shipped skill), bump the patch version, and correct the out-of-repo cp-file-cabinet skill/memory that claim a false ARG_MAX upload ceiling.</p>
+<p><strong>Architecture:</strong> Documentation-only — zero behavior change. The <code>@file</code>/stdin support already exists via <code>read_data_arg</code> and is unit-tested; this adds the words that make it discoverable, with limits backed by the spec's live probes (platform accepts ≥11MB bodies; per-RESTlet caps bind).</p>
+<p><strong>Tech stack:</strong> Rust + clap 4.5 derive (doc comments become help text); markdown skill file; GitHub Actions CI (<code>cargo test --locked</code>, <code>cargo fmt --check</code>, <code>cargo clippy --all-targets -- -D warnings</code>).</p>
+
+<h2>Global constraints</h2>
+<ul>
+  <li><strong>Zero behavior change</strong> — only doc comments, help strings, markdown, and the version number may change. No edits to <code>read_data_arg</code>, <code>restlet.rs</code>, or any logic.</li>
+  <li>TDD does not apply (documentation change — the brainstorm-approved spec is the authority); every task still ends with the full local CI parity run: <code>cargo test --locked && cargo fmt --check && cargo clippy --all-targets -- -D warnings</code>.</li>
+  <li>Work from <code>/Users/jonlamb/projects/creativeplanning/netsuite-cli</code> on branch <code>docs/restlet-data-at-file</code> (exists; holds the spec commit <code>2e800d7</code>).</li>
+  <li>End every commit message with<br><code>Co-Authored-By: Claude Fable 5 &lt;noreply@anthropic.com&gt;</code></li>
+  <li>The shipped skill must stay CP-free (no CP account ids, no cp_* RESTlet names) — the documentation split is policy.</li>
+</ul>
+
+<h2>File structure</h2>
+<ul>
+  <li>Modify <code>src/cli.rs</code> (RestletAction::Call block, currently lines 238–257): doc comment + after_help example.</li>
+  <li>Modify <code>skills/netsuite-cli/SKILL.md</code>: quick-reference row (line 32) + generic data-input note.</li>
+  <li>Modify <code>Cargo.toml</code> (+<code>Cargo.lock</code> via build): 0.9.0 → 0.9.1.</li>
+  <li>Out-of-repo (Task 4): <code>~/.claude/skills/cp-file-cabinet/SKILL.md</code> Size-limits section; <code>~/.claude/projects/-Users-jonlamb-projects-creativeplanning-creative-planning/memory/reference_cp_file_cabinet_rl.md</code>.</li>
+</ul>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h3>Task 1: CLI help text</h3>
+<p><strong>Files:</strong> Modify <code>src/cli.rs:238-257</code></p>
+<ul>
+<li class="step"><strong>Step 1: Edit the <code>RestletAction::Call</code> block.</strong> Replace the <code>after_help</code> string and the bare <code>data</code> arg so the block reads exactly:
+<pre><code>pub enum RestletAction {
+    #[command(
+        after_help = "Examples:\n  netsuite-cli restlet call --script 482 --deploy 1 --method GET --param customerId=42\n  netsuite-cli restlet call --script 482 --deploy 1 --method POST --data '{\"foo\":\"bar\"}'\n  netsuite-cli restlet call --script 482 --deploy 1 --method PUT --data @payload.json"
+    )]
+    Call {
+        #[arg(long)]
+        script: String,
+        #[arg(long)]
+        deploy: String,
+        /// Required; no default, to avoid surprising an agent about side effects
+        #[arg(long, value_enum, ignore_case = true)]
+        method: RestletMethodArg,
+        /// Repeatable key=value param sent as a query parameter; RESTlets read these
+        /// via request.parameters for GET/DELETE (use --data for POST/PUT bodies)
+        #[arg(long = "param")]
+        param: Vec&lt;String&gt;,
+        /// JSON body for POST/PUT: inline JSON, @path to read it from a file, or - for stdin.
+        /// Use @file for large payloads — inline args are capped by the shell's ARG_MAX (~1MB)
+        #[arg(long)]
+        data: Option&lt;String&gt;,
+    },
+}</code></pre>
+(The only changes vs current: the third example line in <code>after_help</code>, and the two doc-comment lines above <code>data</code>.)</li>
+<li class="step"><strong>Step 2: Verify the help renders.</strong> Run <code>cargo run -q -- restlet call --help</code>. Expected: the <code>--data</code> entry shows "inline JSON, @path to read it from a file, or - for stdin" and the Examples block ends with the <code>--data @payload.json</code> line.</li>
+<li class="step"><strong>Step 3: Full CI parity run.</strong> <code>cargo test --locked && cargo fmt --check && cargo clippy --all-targets -- -D warnings</code>. Expected: all green (no snapshot/help tests exist in <code>tests/</code> — verified at planning time; if one fails on help text, update the snapshot to the new text, never the code).</li>
+<li class="step"><strong>Step 4: Commit.</strong> <code>git add src/cli.rs && git commit -m "docs: document @file and stdin input on restlet call --data"</code> (+ trailer).</li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h3>Task 2: Shipped skill</h3>
+<p><strong>Files:</strong> Modify <code>skills/netsuite-cli/SKILL.md</code> (quick-reference row at line 32; "Data input" bullet at line 115)</p>
+<ul>
+<li class="step"><strong>Step 1: Edit the quick-reference row</strong> (line 32) from:
+<pre><code>| Deployed RESTlet script | `restlet call --script &lt;N&gt; --deploy &lt;N&gt; --method &lt;M&gt;` |</code></pre>
+to:
+<pre><code>| Deployed RESTlet script | `restlet call --script &lt;N&gt; --deploy &lt;N&gt; --method &lt;M&gt;` (`--data` takes inline JSON, `@file.json`, or `-`) |</code></pre></li>
+<li class="step"><strong>Step 2: Generalize the Data-input bullet</strong> (line 115) from:
+<pre><code>- **Data input:** `--data '&lt;json&gt;'`, `--data @file.json`, or `--data -` (stdin).</code></pre>
+to:
+<pre><code>- **Data input:** `--data '&lt;json&gt;'`, `--data @file.json`, or `--data -` (stdin) — the same
+  three forms everywhere `--data` appears (`record`, `raw`, `job submit`, `restlet call`).
+  Prefer `@file` for large payloads (inline args hit the shell's ARG_MAX ~1MB); size limits
+  beyond that are per-RESTlet/per-endpoint, not CLI-side.</code></pre></li>
+<li class="step"><strong>Step 3: CP-free check.</strong> <code>grep -in "cp_\|6967599\|creative" skills/netsuite-cli/SKILL.md</code> — expected: no new hits (policy: shipped skill stays CP-free).</li>
+<li class="step"><strong>Step 4: Commit.</strong> <code>git add skills/netsuite-cli/SKILL.md && git commit -m "docs: note --data @file/- forms apply to restlet call in shipped skill"</code> (+ trailer).</li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h3>Task 3: Version bump, PR, review loop</h3>
+<p><strong>Files:</strong> Modify <code>Cargo.toml:3</code> (<code>version = "0.9.0"</code> → <code>"0.9.1"</code>); <code>Cargo.lock</code> updates via build</p>
+<ul>
+<li class="step"><strong>Step 1: Bump.</strong> Edit <code>Cargo.toml</code> version to <code>0.9.1</code>; run <code>cargo build</code> so <code>Cargo.lock</code> picks it up; run the full CI parity trio again.</li>
+<li class="step"><strong>Step 2: Commit + push.</strong> <code>git add Cargo.toml Cargo.lock && git commit -m "chore: bump version to 0.9.1"</code> (+ trailer); <code>git push -u origin docs/restlet-data-at-file</code>.</li>
+<li class="step"><strong>Step 3: Open the PR</strong> against <code>main</code>, title <code>docs: document restlet call --data @file support</code>, body summarizing: feature already existed via read_data_arg; live-verified 2.5MB/9.9MB text + 7MB binary round-trips; 11MB body accepted by platform (per-RESTlet caps bind); spec committed in-repo. End body with the standard generated-with footer.</li>
+<li class="step"><strong>Step 4: pr-review-loop</strong> to green (CI: test/fmt/clippy; triage any automated-reviewer threads).</li>
+</ul>
+</div>
+
+<!-- ==================================================================== -->
+<div class="task">
+<h3>Task 4: Out-of-repo doc corrections (local skill + memory)</h3>
+<p><strong>Files:</strong> Modify <code>~/.claude/skills/cp-file-cabinet/SKILL.md</code> (Size limits section, lines 162–169); modify <code>~/.claude/projects/-Users-jonlamb-projects-creativeplanning-creative-planning/memory/reference_cp_file_cabinet_rl.md</code>. Not part of the PR — no repo commits.</p>
+<ul>
+<li class="step"><strong>Step 1: Replace the Size-limits section body</strong> (currently the false ARG_MAX ceiling) with:
+<pre><code>Platform cap on both `getContents()` (download) and `file.create()`/save (upload) is **10MB**
+decoded (`MAX_CONTENT_BYTES`) — and it is the binding limit: NetSuite accepts RESTlet request
+bodies of at least 11MB (probed 2026-08-11), so the RESTlet's own cap errors first. For anything
+beyond trivial size, pass the body as a file: `--data @payload.json` (or `--data -` for stdin) —
+verified round-trip clean at 9.9MB text and 7MB binary (9.3MB base64 body). Inline `--data '...'`
+alone is capped by shell ARG_MAX (~1MB), so prefer `@file` habitually for uploads. Downloads
+aren't argument-bound; read up to the 10MB cap freely.</code></pre></li>
+<li class="step"><strong>Step 2: Correct the memory file.</strong> In <code>reference_cp_file_cabinet_rl.md</code>, append:
+<pre><code>**Upload size (corrected 2026-08-11):** `restlet call --data @file.json` streams from disk — the
+old ~700KB/1MB ARG_MAX ceiling only applies to inline `--data`. Verified 9.9MB text / 7MB binary
+round-trips; the RESTlet's 10MB decoded cap is the binding limit (platform accepts ≥11MB bodies).</code></pre></li>
+<li class="step"><strong>Step 3: Sanity grep.</strong> <code>grep -n "data-file\|700KB" ~/.claude/skills/cp-file-cabinet/SKILL.md</code> — expected: no hits remain (the "until netsuite-cli grows a --data-file flag" sentence must be gone).</li>
+</ul>
+</div>
+
+<h2>Plan self-review (done at authoring time)</h2>
+<ul>
+  <li>Spec coverage: CLI doc comment + example → Task 1; shipped-skill note → Task 2; version bump + PR + loop → Task 3; out-of-repo corrections → Task 4. "No new flag / no behavior change" enforced by the global constraint. No gaps.</li>
+  <li>Placeholders: none — every edit shows exact old→new text.</li>
+  <li>Consistency: help wording, skill wording, and limits all match the spec's findings table.</li>
+</ul>
+
+<div class="choice-panel">
+  <p><strong>Plan is ready. How should we execute?</strong></p>
+  <a class="primary" href="http://127.0.0.1:8137/pick?c=inline&amp;l=Inline" target="_blank">Inline (recommended for this size) — 4 small doc tasks in this session</a>
+  <a href="http://127.0.0.1:8137/pick?c=subagent&amp;l=Subagent-Driven" target="_blank">Subagent-driven — fresh subagent per task with reviews</a>
+</div>
+</main>
+</body>
+</html>
