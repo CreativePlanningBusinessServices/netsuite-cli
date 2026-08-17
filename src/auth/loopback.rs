@@ -136,8 +136,8 @@ fn callback_response_body<CallbackValue>(
     callback_result: &Result<CallbackValue, CliError>,
 ) -> &'static str {
     match callback_result {
-        Ok(_) => "<html><body>Login complete \u{2014} return to your terminal.</body></html>",
-        Err(_) => "<html><body>Login failed \u{2014} return to your terminal.</body></html>",
+        Ok(_) => "<html><body>Login complete. Return to your terminal.</body></html>",
+        Err(_) => "<html><body>Login failed. Return to your terminal.</body></html>",
     }
 }
 
