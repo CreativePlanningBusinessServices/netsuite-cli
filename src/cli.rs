@@ -521,7 +521,7 @@ pub enum AccountAction {
     SetDefault { alias: String },
     /// Remove an account alias and its stored secrets
     Remove { alias: String },
-    /// Verify stored credentials by calling the metadata catalog
+    /// Verify stored credentials with a lightweight server-time call
     Test {
         #[arg(long)]
         alias: Option<String>,
