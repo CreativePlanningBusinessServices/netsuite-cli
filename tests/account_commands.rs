@@ -6,7 +6,7 @@ use netsuite_cli::config::{AuthFlow, Config};
 use netsuite_cli::error::CliError;
 use netsuite_cli::secrets::{AccountSecrets, MemoryStore, SecretStore, TbaSecrets};
 use std::sync::Arc;
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn key_pem() -> String {
@@ -294,14 +294,12 @@ fn set_default_validates_alias_exists() {
 }
 
 #[tokio::test]
-async fn test_calls_metadata_catalog_with_customer_select_and_returns_ok() {
+async fn test_calls_server_time_and_returns_ok() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/services/rest/record/v1/metadata-catalog"))
-        .and(query_param("select", "customer"))
-        .and(header("Accept", "application/json"))
+        .and(path("/services/rest/system/v1/serverTime"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "items": [{"name": "customer", "links": []}]
+            "serverTime": "2026-01-01T00:00:00.000Z"
         })))
         .mount(&server)
         .await;
@@ -314,7 +312,7 @@ async fn test_calls_metadata_catalog_with_customer_select_and_returns_ok() {
 async fn test_propagates_api_error_on_failure() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/services/rest/record/v1/metadata-catalog"))
+        .and(path("/services/rest/system/v1/serverTime"))
         .respond_with(ResponseTemplate::new(400))
         .mount(&server)
         .await;

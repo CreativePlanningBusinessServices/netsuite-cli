@@ -365,16 +365,13 @@ pub fn set_default(config_path: &Path, alias: &str) -> Result<Value, CliError> {
     Ok(json!({"default": alias}))
 }
 
+/// Verifies credentials against `system/v1/serverTime` rather than the record metadata catalog:
+/// the catalog is a schema-discovery API that NetSuite recomputes per request (measured 1.4-5.3s
+/// against live accounts, versus ~0.3s here). serverTime also needs no record-level permission, so
+/// a minimally-scoped integration role fails here only when the credentials are genuinely bad,
+/// instead of when the role happens to lack customer read access.
 pub async fn test(client: &NsClient, alias: &str) -> Result<Value, CliError> {
-    client
-        .request(
-            reqwest::Method::GET,
-            "/services/rest/record/v1/metadata-catalog",
-            &[("select", "customer".to_string())],
-            &[("Accept", "application/json")],
-            None,
-        )
-        .await?;
+    crate::commands::system::server_time(client).await?;
     Ok(json!({"alias": alias, "ok": true}))
 }
 
